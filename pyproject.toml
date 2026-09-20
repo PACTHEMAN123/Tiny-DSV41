@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsv41-train"
+version = "0.1.0"
+description = "Minimal causal-LM training loop for a tiny DeepSeek V4.1 model"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.4",
+]
+
+[tool.setuptools.packages.find]
+include = ["dsv41_train*"]
