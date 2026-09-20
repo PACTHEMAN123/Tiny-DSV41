@@ -17,6 +17,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from .config import DeepSeekV41Config
+from .moe import RoutedExperts, SparseMoE, TokenDispatcher, TopKRouter
+from .parallel import ContextParallel
 
 
 class RMSNorm(nn.Module):
@@ -232,7 +234,13 @@ class SparseIndexer(nn.Module):
 
 
 class CompressedAttention(nn.Module):
-    def __init__(self, config: DeepSeekV41Config, layer_id: int, rotary: RotaryEmbedding) -> None:
+    def __init__(
+        self,
+        config: DeepSeekV41Config,
+        layer_id: int,
+        rotary: RotaryEmbedding,
+        context_parallel: ContextParallel,
+    ) -> None:
         super().__init__()
         self.config = config
         self.layer_id = layer_id
@@ -241,6 +249,7 @@ class CompressedAttention(nn.Module):
         self.head_dim = config.head_dim
         self.dropout = config.attention_dropout
         self.rotary = rotary
+        self.context_parallel = context_parallel
         self.q_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = RMSNorm(config.q_lora_rank, config.rms_norm_eps)
         self.q_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
@@ -270,14 +279,20 @@ class CompressedAttention(nn.Module):
         query = self.q_b(q_residual).view(batch, length, self.num_heads, self.head_dim)
         query = apply_rope(query, cos, sin).transpose(1, 2)
         kv = apply_rope(self.kv_norm(self.kv_proj(x)), cos, sin).unsqueeze(1)
+        kv = self.context_parallel.gather(kv, dim=2)
 
         selected = selected_valid = None
         if compressed:
             latent = None
             group_positions = positions[:, :0]
             if self.compressor is not None:
-                latent, group_positions, query_lengths = self.compressor(x, positions, token_mask)
-                shared["compress_lengths"] = query_lengths // self.ratio
+                full_x = self.context_parallel.gather(x)
+                full_positions = self.context_parallel.gather(positions)
+                full_token_mask = self.context_parallel.gather(token_mask)
+                latent, group_positions, query_lengths = self.compressor(
+                    full_x, full_positions, full_token_mask
+                )
+                shared["compress_lengths"] = self.context_parallel.shard(query_lengths) // self.ratio
                 shared["compressed_kv"] = None
                 shared["index_keys"] = None
                 shared["topk_indices"] = None
@@ -329,99 +344,6 @@ class CompressedAttention(nn.Module):
                 "bhsk,bskd->bhsd", probabilities[..., window:], selected.to(probabilities.dtype)
             )
         return output.transpose(1, 2).contiguous()
-
-
-def _activation(name: str, x: torch.Tensor) -> torch.Tensor:
-    if name == "sqrtsoftplus":
-        return torch.sqrt(F.softplus(x))
-    if name == "softmax":
-        return torch.softmax(x, dim=-1)
-    return torch.sigmoid(x)
-
-
-class TopKRouter(nn.Module):
-    def __init__(self, config: DeepSeekV41Config) -> None:
-        super().__init__()
-        self.topk = config.num_experts_per_tok
-        self.num_experts = config.n_routed_experts
-        self.score_name = config.scoring_func
-        self.temperature = config.gate_temp
-        self.normalize = config.norm_topk_prob
-        self.scale = config.routed_scaling_factor
-        self.weight = nn.Parameter(torch.empty(self.num_experts, config.hidden_size))
-        self.register_buffer("selection_bias", torch.zeros(self.num_experts))
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits = F.linear(x.flatten(0, 1).float(), self.weight.float()) / self.temperature
-        scores = _activation(self.score_name, logits)
-        indices = (scores + self.selection_bias).topk(self.topk, dim=-1).indices
-        weights = scores.gather(1, indices)
-        if self.normalize and self.topk > 1:
-            weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
-        return logits, weights * self.scale, indices
-
-
-def _clamped_swiglu(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor:
-    gate, up = gate.float(), up.float()
-    if limit > 0:
-        gate = gate.clamp(max=limit)
-        up = up.clamp(-limit, limit)
-    return F.silu(gate) * up
-
-
-class RoutedExperts(nn.Module):
-    def __init__(self, config: DeepSeekV41Config) -> None:
-        super().__init__()
-        self.num_experts = config.n_routed_experts
-        self.intermediate = config.moe_intermediate_size
-        self.limit = config.swiglu_limit
-        self.gate_up = nn.Parameter(
-            torch.empty(self.num_experts, 2 * self.intermediate, config.hidden_size)
-        )
-        self.down = nn.Parameter(
-            torch.empty(self.num_experts, config.hidden_size, self.intermediate)
-        )
-
-    def forward(
-        self, x: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor
-    ) -> torch.Tensor:
-        output = torch.zeros_like(x, dtype=torch.float32)
-        for expert_id in indices.unique():
-            token_ids, topk_ids = torch.where(indices == expert_id)
-            current = x[token_ids]
-            gate, up = F.linear(current, self.gate_up[expert_id]).chunk(2, dim=-1)
-            current = _clamped_swiglu(gate, up, self.limit)
-            current = current * weights[token_ids, topk_ids, None]
-            current = F.linear(current.to(x.dtype), self.down[expert_id])
-            output.index_add_(0, token_ids, current.float())
-        return output
-
-
-class SharedExpert(nn.Module):
-    def __init__(self, config: DeepSeekV41Config) -> None:
-        super().__init__()
-        self.gate = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False)
-        self.up = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False)
-        self.down = nn.Linear(config.moe_intermediate_size, config.hidden_size, bias=False)
-        self.limit = config.swiglu_limit
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(_clamped_swiglu(self.gate(x), self.up(x), self.limit).to(x.dtype))
-
-
-class SparseMoE(nn.Module):
-    def __init__(self, config: DeepSeekV41Config) -> None:
-        super().__init__()
-        self.router = TopKRouter(config)
-        self.routed = RoutedExperts(config)
-        self.shared = SharedExpert(config)
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        shape = x.shape
-        flat = x.flatten(0, 1)
-        logits, weights, indices = self.router(x)
-        output = self.routed(flat, indices, weights) + self.shared(flat).float()
-        return output.to(x.dtype).view(shape), logits
 
 
 def _is_prime(value: int) -> bool:
@@ -528,11 +450,18 @@ class Engram(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, config: DeepSeekV41Config, layer_id: int, rotary: RotaryEmbedding) -> None:
+    def __init__(
+        self,
+        config: DeepSeekV41Config,
+        layer_id: int,
+        rotary: RotaryEmbedding,
+        context_parallel: ContextParallel,
+        token_dispatcher: TokenDispatcher,
+    ) -> None:
         super().__init__()
         self.layer_id = layer_id
-        self.attention = CompressedAttention(config, layer_id, rotary)
-        self.moe = SparseMoE(config)
+        self.attention = CompressedAttention(config, layer_id, rotary, context_parallel)
+        self.moe = SparseMoE(config, token_dispatcher)
         self.input_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.engram = Engram(config) if layer_id in config.engram_layer_ids else None
@@ -583,13 +512,27 @@ class DecoderLayer(nn.Module):
 
 
 class DeepSeekV41Model(nn.Module):
-    def __init__(self, config: DeepSeekV41Config) -> None:
+    def __init__(
+        self,
+        config: DeepSeekV41Config,
+        context_parallel: ContextParallel | None = None,
+        token_dispatcher: TokenDispatcher | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
+        self.context_parallel = context_parallel or ContextParallel()
+        token_dispatcher = token_dispatcher or TokenDispatcher()
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.rotary = RotaryEmbedding(config)
         self.layers = nn.ModuleList(
-            DecoderLayer(config, layer_id, self.rotary) for layer_id in range(config.num_hidden_layers)
+            DecoderLayer(
+                config,
+                layer_id,
+                self.rotary,
+                self.context_parallel,
+                token_dispatcher,
+            )
+            for layer_id in range(config.num_hidden_layers)
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.hash = NgramHash(config) if config.engram_layer_ids else None
@@ -605,22 +548,29 @@ class DeepSeekV41Model(nn.Module):
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, sequence]")
-        batch, length = input_ids.shape
-        if length > self.config.max_position_embeddings:
+        batch, global_length = input_ids.shape
+        if global_length > self.config.max_position_embeddings:
             raise ValueError("sequence is longer than max_position_embeddings")
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
         else:
             attention_mask = attention_mask.bool()
 
-        positions = (attention_mask.long().cumsum(-1) - 1).clamp_min(0)
+        global_positions = (attention_mask.long().cumsum(-1) - 1).clamp_min(0)
+        causal_mask = self._causal_mask(attention_mask, self.embedding.weight.dtype)
+        hashes = self.hash(input_ids, attention_mask) if self.hash is not None else None
+
+        input_ids = self.context_parallel.shard(input_ids)
+        positions = self.context_parallel.shard(global_positions)
+        attention_mask = self.context_parallel.shard(attention_mask)
         hidden = self.embedding(input_ids)
+        length = hidden.shape[1]
         streams = hidden.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
-        causal_mask = self._causal_mask(attention_mask, hidden.dtype)
+        causal_mask = causal_mask.to(hidden.dtype)
 
         engram_rows: dict[int, torch.Tensor] = {}
-        if self.hash is not None:
-            hashes = self.hash(input_ids, attention_mask)
+        if hashes is not None:
+            hashes = self.context_parallel.shard(hashes)
             for index, layer_id in enumerate(self.config.engram_layer_ids):
                 engram_rows[layer_id] = self.engram_tables[str(layer_id)](hashes[:, :, index])
 
@@ -645,11 +595,13 @@ class DeepSeekV41Model(nn.Module):
 
     def _causal_mask(self, token_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         length = token_mask.shape[1]
-        positions = torch.arange(length, device=token_mask.device)
-        distance = positions[:, None] - positions[None, :]
+        key_positions = torch.arange(length, device=token_mask.device)
+        query_positions = self.context_parallel.shard(key_positions, dim=0)
+        query_mask = self.context_parallel.shard(token_mask)
+        distance = query_positions[:, None] - key_positions[None, :]
         allowed = (distance >= 0) & (distance < self.config.sliding_window)
-        allowed = allowed.view(1, 1, length, length)
-        allowed = allowed & token_mask[:, None, None, :] & token_mask[:, None, :, None]
+        allowed = allowed.view(1, 1, query_positions.numel(), length)
+        allowed = allowed & token_mask[:, None, None, :] & query_mask[:, None, :, None]
         return torch.zeros((), dtype=dtype, device=token_mask.device).expand_as(allowed).masked_fill(
             ~allowed, torch.finfo(dtype).min
         )
@@ -660,6 +612,7 @@ def load_balancing_loss(
     num_experts: int,
     topk: int,
     attention_mask: torch.Tensor | None,
+    context_parallel: ContextParallel | None = None,
 ) -> torch.Tensor:
     device = router_logits[0].device
     assignments = torch.zeros(num_experts, device=device)
@@ -677,6 +630,10 @@ def load_balancing_loss(
             assignments.scatter_add_(0, selected.flatten(), mask.repeat_interleave(topk))
             probabilities += (probs * mask.unsqueeze(-1)).sum(0)
             total += mask.sum()
+    if context_parallel is not None:
+        assignments = context_parallel.sum(assignments)
+        probabilities = context_parallel.sum(probabilities, autograd=True)
+        total = context_parallel.sum(total)
     return num_experts * ((assignments / total) * (probabilities / total)).sum()
 
 
@@ -689,10 +646,16 @@ class CausalLMOutput:
 
 
 class DeepSeekV41ForCausalLM(nn.Module):
-    def __init__(self, config: DeepSeekV41Config) -> None:
+    def __init__(
+        self,
+        config: DeepSeekV41Config,
+        context_parallel: ContextParallel | None = None,
+        token_dispatcher: TokenDispatcher | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
-        self.model = DeepSeekV41Model(config)
+        self.context_parallel = context_parallel or ContextParallel()
+        self.model = DeepSeekV41Model(config, self.context_parallel, token_dispatcher)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._initialize)
 
@@ -712,8 +675,14 @@ class DeepSeekV41ForCausalLM(nn.Module):
             nn.init.normal_(module.weight, std=std)
             nn.init.zeros_(module.selection_bias)
         elif isinstance(module, RoutedExperts):
-            nn.init.normal_(module.gate_up, std=std)
-            nn.init.normal_(module.down, std=std)
+            if module.num_experts == module.global_num_experts:
+                nn.init.normal_(module.gate_up, std=std)
+                nn.init.normal_(module.down, std=std)
+            else:
+                generator = torch.Generator(device=module.gate_up.device)
+                generator.manual_seed(torch.initial_seed() + module.expert_start)
+                nn.init.normal_(module.gate_up, std=std, generator=generator)
+                nn.init.normal_(module.down, std=std, generator=generator)
 
     def forward(
         self,
@@ -721,24 +690,34 @@ class DeepSeekV41ForCausalLM(nn.Module):
         attention_mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
     ) -> CausalLMOutput:
-        hidden, router_logits = self.model(input_ids, attention_mask)
+        token_mask = (
+            torch.ones_like(input_ids, dtype=torch.bool)
+            if attention_mask is None
+            else attention_mask.bool()
+        )
+        hidden, router_logits = self.model(input_ids, token_mask)
         logits = self.lm_head(hidden)
         loss = None
         if labels is not None:
-            targets = labels[:, 1:].clone()
-            if attention_mask is not None:
-                targets.masked_fill_(~attention_mask[:, 1:].bool(), -100)
-            loss = F.cross_entropy(
-                logits[:, :-1].float().reshape(-1, self.config.vocab_size),
+            targets = torch.full_like(labels, -100)
+            targets[:, :-1] = labels[:, 1:]
+            targets[:, :-1].masked_fill_(~token_mask[:, 1:], -100)
+            targets = self.context_parallel.shard(targets)
+            loss_sum = F.cross_entropy(
+                logits.float().reshape(-1, self.config.vocab_size),
                 targets.reshape(-1),
                 ignore_index=-100,
+                reduction="sum",
             )
+            loss = self.context_parallel.mean_loss(loss_sum, (targets != -100).sum())
 
+        local_token_mask = self.context_parallel.shard(token_mask)
         aux_loss = load_balancing_loss(
             router_logits,
             self.config.n_routed_experts,
             self.config.num_experts_per_tok,
-            attention_mask,
+            local_token_mask,
+            self.context_parallel,
         )
         if loss is not None:
             loss = loss + self.config.router_aux_loss_coef * aux_loss

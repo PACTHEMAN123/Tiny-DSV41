@@ -2,7 +2,12 @@ import unittest
 
 import torch
 
-from dsv41_train import DeepSeekV41Config, DeepSeekV41ForCausalLM
+from dsv41_train import (
+    ContextParallel,
+    DeepSeekV41Config,
+    DeepSeekV41ForCausalLM,
+    TokenDispatcher,
+)
 
 
 class ModelTest(unittest.TestCase):
@@ -51,6 +56,25 @@ class ModelTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(output.loss))
         output.loss.backward()
         self.assertIsNotNone(model.model.embedding.weight.grad)
+
+    def test_explicit_local_parallel_primitives(self):
+        dispatcher = TokenDispatcher()
+        x = torch.arange(12, dtype=torch.float32).view(3, 4)
+        expert_ids = torch.tensor([[0, 1], [1, 0], [0, 1]])
+        weights = torch.ones(3, 2)
+
+        routed, routed_ids, routed_weights, metadata = dispatcher.dispatch(
+            x, expert_ids, weights
+        )
+        combined = dispatcher.combine(routed * routed_weights[:, None], metadata)
+
+        self.assertEqual(dispatcher.expert_range(2), (0, 2))
+        self.assertTrue(torch.equal(routed_ids, expert_ids.flatten()))
+        self.assertTrue(torch.equal(combined, x * 2))
+
+        cp = ContextParallel()
+        self.assertIs(cp.shard(x), x)
+        self.assertIs(cp.gather(x), x)
 
 
 if __name__ == "__main__":

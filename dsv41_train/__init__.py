@@ -2,10 +2,17 @@
 
 from .config import DeepSeekV41Config
 from .model import CausalLMOutput, DeepSeekV41ForCausalLM, DeepSeekV41Model
+from .moe import AllToAllTokenDispatcher, TokenDispatcher
+from .parallel import ContextParallel, FSDP, ParallelMeshes
 
 __all__ = [
+    "AllToAllTokenDispatcher",
     "CausalLMOutput",
+    "ContextParallel",
     "DeepSeekV41Config",
     "DeepSeekV41ForCausalLM",
     "DeepSeekV41Model",
+    "FSDP",
+    "ParallelMeshes",
+    "TokenDispatcher",
 ]
