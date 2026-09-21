@@ -24,5 +24,5 @@ The explicit IPv4 rendezvous avoids relying on the container hostname, which
 may not be registered in DNS or `/etc/hosts`. Choose another unused local port
 if `29500` is already occupied.
 
-Do not pass `--device` to a distributed run. Distributed checkpoints are
-written to `outputs/final/checkpoint/`.
+Do not pass `--device` to a distributed run. Single-device and distributed
+runs both write DCP checkpoints to `outputs/final/checkpoint/step-N/`.

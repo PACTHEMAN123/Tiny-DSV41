@@ -8,7 +8,14 @@ from typing import Iterable
 import torch
 import torch.distributed as dist
 
-from dsv41_train import DeepSeekV41Config, DeepSeekV41ForCausalLM, FSDP, ParallelMeshes
+from dsv41_train import (
+    CheckpointManager,
+    DeepSeekV41Config,
+    DeepSeekV41ForCausalLM,
+    FSDP,
+    ParallelMeshes,
+    TrainingState,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -126,53 +133,6 @@ def distributed_mean(value: torch.Tensor, runtime: Runtime) -> float:
     return value.item()
 
 
-def save_checkpoint(
-    output_dir: Path,
-    config: DeepSeekV41Config,
-    model: DeepSeekV41ForCausalLM,
-    optimizer: torch.optim.Optimizer,
-    step: int,
-    runtime: Runtime,
-) -> Path:
-    if not runtime.distributed:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_path = output_dir / "checkpoint.pt"
-        torch.save(
-            {
-                "config": config.to_dict(),
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "step": step,
-            },
-            checkpoint_path,
-        )
-        return checkpoint_path
-
-    if runtime.is_main:
-        output_dir.mkdir(parents=True, exist_ok=True)
-    dist.barrier()
-
-    import torch.distributed.checkpoint as dcp
-    from torch.distributed.checkpoint.state_dict import get_state_dict
-
-    model_state, optimizer_state = get_state_dict(model, optimizer)
-    checkpoint_path = output_dir / "checkpoint"
-    dcp.save(
-        {"model": model_state, "optimizer": optimizer_state},
-        checkpoint_id=str(checkpoint_path),
-    )
-    if runtime.is_main:
-        metadata = {
-            "config": config.to_dict(),
-            "step": step,
-            "world_size": runtime.world_size,
-        }
-        (output_dir / "metadata.json").write_text(
-            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
-        )
-    return checkpoint_path
-
-
 def validate_args(args: argparse.Namespace) -> None:
     if args.steps < 1 or args.batch_size < 1 or args.log_every < 1:
         raise ValueError("steps, batch-size, and log-every must be positive")
@@ -195,6 +155,15 @@ def train(args: argparse.Namespace, runtime: Runtime) -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     batch_generator = torch.Generator(device=runtime.device)
     batch_generator.manual_seed(args.seed + runtime.rank)
+    checkpointer = CheckpointManager(
+        ROOT / args.output_dir / "checkpoint",
+        TrainingState(
+            model,
+            optimizer,
+            model_config=config.to_dict(),
+            data_generator=batch_generator,
+        ),
+    )
 
     if runtime.is_main:
         print(
@@ -252,14 +221,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> None:
                     flush=True,
                 )
 
-    checkpoint_path = save_checkpoint(
-        ROOT / args.output_dir,
-        config,
-        model,
-        optimizer,
-        args.steps,
-        runtime,
-    )
+    checkpoint_path = checkpointer.save(args.steps)
     if runtime.is_main:
         print(f"saved checkpoint to {checkpoint_path}", flush=True)
 
