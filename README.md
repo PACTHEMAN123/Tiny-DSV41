@@ -11,8 +11,18 @@ Four-GPU FSDP training:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-torchrun --standalone --nproc-per-node=4 train.py --steps 20
+torchrun \
+  --nnodes=1 \
+  --node-rank=0 \
+  --nproc-per-node=4 \
+  --master-addr=127.0.0.1 \
+  --master-port=29500 \
+  train.py --steps 20
 ```
+
+The explicit IPv4 rendezvous avoids relying on the container hostname, which
+may not be registered in DNS or `/etc/hosts`. Choose another unused local port
+if `29500` is already occupied.
 
 Do not pass `--device` to a distributed run. Distributed checkpoints are
 written to `outputs/final/checkpoint/`.
