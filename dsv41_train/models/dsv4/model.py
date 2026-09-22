@@ -17,8 +17,9 @@ import torch.nn.functional as F
 from torch import nn
 
 from .config import DeepSeekV41Config
-from .moe import RoutedExperts, SparseMoE, TokenDispatcher, TopKRouter
-from .parallel import ContextParallel
+from .moe import RoutedExperts, SparseMoE, TopKRouter
+from ...dispatch import TokenDispatcher
+from ...parallel import ContextParallel
 
 
 class RMSNorm(nn.Module):

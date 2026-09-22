@@ -1,40 +1,19 @@
 import argparse
 import json
-import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 import torch
 import torch.distributed as dist
 
-from dsv41_train import (
-    CheckpointManager,
-    DeepSeekV41Config,
-    DeepSeekV41ForCausalLM,
-    FSDP,
-    ParallelMeshes,
-    TrainingState,
-)
+from dsv41_train.checkpoint import CheckpointManager, TrainingState
+from dsv41_train.models.dsv4 import DeepSeekV41Config, DeepSeekV41ForCausalLM
+from dsv41_train.models.dsv4.parallel import apply_fsdp2
+from dsv41_train.parallel import ParallelMeshes
+from dsv41_train.runtime import Runtime, distributed_mean, initialize_runtime
 
 
 ROOT = Path(__file__).resolve().parent
-
-
-@dataclass(frozen=True)
-class Runtime:
-    device: torch.device
-    rank: int = 0
-    local_rank: int = 0
-    world_size: int = 1
-
-    @property
-    def distributed(self) -> bool:
-        return self.world_size > 1
-
-    @property
-    def is_main(self) -> bool:
-        return self.rank == 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,49 +34,6 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     return parser.parse_args()
-
-
-def choose_device(name: str) -> torch.device:
-    if name != "auto":
-        return torch.device(name)
-    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-
-def initialize_runtime(device_name: str, local_rank_arg: int | None = None) -> Runtime:
-    """Bind one torchrun process to one GPU and initialize NCCL."""
-
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size < 1:
-        raise ValueError("WORLD_SIZE must be positive")
-    if world_size == 1:
-        return Runtime(device=choose_device(device_name))
-
-    if device_name not in {"auto", "cuda"}:
-        raise ValueError("distributed training assigns devices automatically; omit --device")
-    if not dist.is_available():
-        raise RuntimeError("this PyTorch build does not provide torch.distributed")
-    if not torch.cuda.is_available():
-        raise RuntimeError("multi-process training requires CUDA and the NCCL backend")
-    local_rank_value = os.environ.get("LOCAL_RANK")
-    if local_rank_value is None and local_rank_arg is None:
-        raise RuntimeError("WORLD_SIZE is set but LOCAL_RANK is missing; launch with torchrun")
-
-    local_rank = int(local_rank_value) if local_rank_value is not None else local_rank_arg
-    assert local_rank is not None
-    device_count = torch.cuda.device_count()
-    if not 0 <= local_rank < device_count:
-        raise RuntimeError(
-            f"LOCAL_RANK {local_rank} is outside the {device_count} visible CUDA devices"
-        )
-
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
-    return Runtime(
-        device=torch.device("cuda", local_rank),
-        rank=dist.get_rank(),
-        local_rank=local_rank,
-        world_size=dist.get_world_size(),
-    )
 
 
 def make_batch(
@@ -125,14 +61,6 @@ def clip_grad_norm(parameters: Iterable[torch.Tensor], max_norm: float) -> torch
     return grad_norm.detach().float()
 
 
-def distributed_mean(value: torch.Tensor, runtime: Runtime) -> float:
-    value = value.detach().float()
-    if runtime.distributed:
-        dist.all_reduce(value, op=dist.ReduceOp.SUM)
-        value /= runtime.world_size
-    return value.item()
-
-
 def validate_args(args: argparse.Namespace) -> None:
     if args.steps < 1 or args.batch_size < 1 or args.log_every < 1:
         raise ValueError("steps, batch-size, and log-every must be positive")
@@ -150,7 +78,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> None:
 
     if runtime.distributed:
         meshes = ParallelMeshes.build(device_type=runtime.device.type)
-        model = FSDP(meshes).apply(model)
+        apply_fsdp2(model, meshes)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     batch_generator = torch.Generator(device=runtime.device)

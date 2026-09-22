@@ -1,4 +1,4 @@
-"""Device meshes, context parallelism, and FSDP application."""
+"""Model-independent device meshes and context-parallel collectives."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
 
 if TYPE_CHECKING:
-    from torch import nn
     from torch.distributed.device_mesh import DeviceMesh
 
 
@@ -65,16 +64,21 @@ class ParallelMeshes:
         if ep < 1 or world_size % ep:
             raise ValueError(f"ep ({ep}) must divide world size ({world_size})")
 
-        fsdp_mesh = init_device_mesh(device_type, (world_size,), mesh_dim_names=("fsdp",))
-
         dense = cp_mesh = None
         if cp > 1:
             dense = init_device_mesh(
                 device_type,
                 (world_size // cp, cp),
-                mesh_dim_names=("data", "cp"),
+                mesh_dim_names=("fsdp", "cp"),
             )
+            fsdp_mesh = dense["fsdp"]
             cp_mesh = dense["cp"]
+        else:
+            fsdp_mesh = init_device_mesh(
+                device_type,
+                (world_size,),
+                mesh_dim_names=("fsdp",),
+            )
 
         sparse = ep_mesh = expert_fsdp_mesh = None
         if ep > 1:
@@ -143,43 +147,7 @@ class ContextParallel:
         return backward_loss + (value - backward_loss.detach())
 
 
-class FSDP:
-    """Apply FSDP after the model has declared its CP and EP behavior."""
-
-    def __init__(self, meshes: ParallelMeshes, *, reshard_after_forward: bool = True) -> None:
-        self.meshes = meshes
-        self.reshard_after_forward = reshard_after_forward
-
-    def apply(self, model: nn.Module) -> nn.Module:
-        try:
-            from torch.distributed.fsdp import fully_shard
-        except ImportError:
-            from torch.distributed._composable.fsdp import fully_shard
-
-        decoder = getattr(model, "model", model)
-        layers = getattr(decoder, "layers", None)
-        if layers is None:
-            raise TypeError("FSDP expects a model with a .layers collection")
-
-        for layer in layers:
-            if self.meshes.ep is not None:
-                assert self.meshes.expert_fsdp is not None
-                fully_shard(
-                    layer.moe.routed,
-                    mesh=self.meshes.expert_fsdp,
-                    reshard_after_forward=self.reshard_after_forward,
-                )
-            fully_shard(
-                layer,
-                mesh=self.meshes.fsdp,
-                reshard_after_forward=self.reshard_after_forward,
-            )
-        fully_shard(model, mesh=self.meshes.fsdp)
-        return model
-
-
 __all__ = [
     "ContextParallel",
-    "FSDP",
     "ParallelMeshes",
 ]

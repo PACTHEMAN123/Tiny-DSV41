@@ -6,6 +6,7 @@ from unittest.mock import patch
 import torch
 
 import train
+from dsv41_train import runtime as training_runtime
 
 
 class TrainTest(unittest.TestCase):
@@ -23,13 +24,13 @@ class TrainTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be positive"):
             train.validate_args(args)
 
-    @patch("train.dist.get_world_size", return_value=4)
-    @patch("train.dist.get_rank", return_value=2)
-    @patch("train.dist.init_process_group")
-    @patch("train.dist.is_available", return_value=True)
-    @patch("train.torch.cuda.set_device")
-    @patch("train.torch.cuda.device_count", return_value=4)
-    @patch("train.torch.cuda.is_available", return_value=True)
+    @patch("dsv41_train.runtime.dist.get_world_size", return_value=4)
+    @patch("dsv41_train.runtime.dist.get_rank", return_value=2)
+    @patch("dsv41_train.runtime.dist.init_process_group")
+    @patch("dsv41_train.runtime.dist.is_available", return_value=True)
+    @patch("dsv41_train.runtime.torch.cuda.set_device")
+    @patch("dsv41_train.runtime.torch.cuda.device_count", return_value=4)
+    @patch("dsv41_train.runtime.torch.cuda.is_available", return_value=True)
     def test_torchrun_environment_binds_the_local_gpu(
         self,
         _is_available,
@@ -42,7 +43,7 @@ class TrainTest(unittest.TestCase):
     ):
         environment = {"WORLD_SIZE": "4", "LOCAL_RANK": "2", "RANK": "2"}
         with patch.dict(os.environ, environment, clear=True):
-            runtime = train.initialize_runtime("auto")
+            runtime = training_runtime.initialize_runtime("auto")
 
         self.assertEqual(runtime.device, torch.device("cuda:2"))
         self.assertEqual(runtime.rank, 2)
@@ -53,7 +54,29 @@ class TrainTest(unittest.TestCase):
     def test_distributed_training_rejects_a_pinned_device(self):
         with patch.dict(os.environ, {"WORLD_SIZE": "4"}, clear=True):
             with self.assertRaisesRegex(ValueError, "assigns devices automatically"):
-                train.initialize_runtime("cuda:0")
+                training_runtime.initialize_runtime("cuda:0")
+
+    def test_cpu_training_needs_no_process_group(self):
+        with patch.dict(os.environ, {}, clear=True):
+            runtime = training_runtime.initialize_runtime("cpu")
+        self.assertEqual(runtime.device, torch.device("cpu"))
+        self.assertFalse(runtime.distributed)
+
+    @patch("dsv41_train.runtime.torch.cuda.is_available", return_value=True)
+    def test_single_rank_fsdp_requires_torchrun(self, _cuda_available):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "launch with torchrun"):
+                training_runtime.initialize_runtime(require_distributed=True)
+
+    def test_metric_reduction_does_not_modify_the_loss(self):
+        runtime = training_runtime.Runtime(torch.device("cpu"), world_size=2)
+        value = torch.tensor(3.0, requires_grad=True)
+        with patch(
+            "dsv41_train.runtime.dist.all_reduce",
+            side_effect=lambda tensor, **_: tensor.mul_(2),
+        ):
+            self.assertEqual(training_runtime.distributed_mean(value, runtime), 3.0)
+        self.assertEqual(value.item(), 3.0)
 
 
 if __name__ == "__main__":

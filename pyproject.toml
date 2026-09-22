@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dsv41-train"
 version = "0.1.0"
-description = "Minimal causal-LM training loop for a tiny DeepSeek V4.1 model"
+description = "Native PyTorch training for DeepSeek V4.1 and Qwen3 MoE models"
 requires-python = ">=3.10"
 dependencies = [
   "torch>=2.4",
@@ -13,3 +13,6 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["dsv41_train*"]
+
+[tool.setuptools.package-data]
+dsv41_train = ["models/*/*.json"]

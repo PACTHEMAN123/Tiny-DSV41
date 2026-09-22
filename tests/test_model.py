@@ -1,16 +1,45 @@
 import unittest
+from unittest.mock import Mock, call, patch
 
 import torch
 
-from dsv41_train import (
-    ContextParallel,
-    DeepSeekV41Config,
-    DeepSeekV41ForCausalLM,
-    TokenDispatcher,
-)
+from dsv41_train.dispatch import TokenDispatcher
+from dsv41_train.models.dsv4 import DeepSeekV41Config, DeepSeekV41ForCausalLM
+from dsv41_train.models.dsv4.parallel import apply_fsdp2
+from dsv41_train.parallel import ContextParallel, ParallelMeshes
 
 
 class ModelTest(unittest.TestCase):
+    def test_dsv4_fsdp_wraps_experts_before_layers_and_root(self):
+        with torch.device("meta"):
+            model = DeepSeekV41ForCausalLM(DeepSeekV41Config.tiny())
+        for expert_parallel in (False, True):
+            for target in (model, model.model):
+                with self.subTest(expert_parallel=expert_parallel, target=type(target).__name__):
+                    meshes = ParallelMeshes(
+                        fsdp=Mock(), cp=None,
+                        ep=Mock() if expert_parallel else None,
+                        expert_fsdp=Mock() if expert_parallel else None,
+                    )
+                    try:
+                        from torch.distributed.fsdp import fully_shard
+                    except ImportError:
+                        shard_path = "torch.distributed._composable.fsdp.fully_shard"
+                    else:
+                        shard_path = "torch.distributed.fsdp.fully_shard"
+                    with patch(shard_path) as shard:
+                        apply_fsdp2(target, meshes, reshard_after_forward=False)
+                    expected = []
+                    for layer in model.model.layers:
+                        if expert_parallel:
+                            expected.append(call(
+                                layer.moe.routed, mesh=meshes.expert_fsdp,
+                                reshard_after_forward=False,
+                            ))
+                        expected.append(call(layer, mesh=meshes.fsdp, reshard_after_forward=False))
+                    expected.append(call(target, mesh=meshes.fsdp))
+                    self.assertEqual(shard.call_args_list, expected)
+
     def test_forward_and_backward(self):
         config = DeepSeekV41Config(
             vocab_size=32,
