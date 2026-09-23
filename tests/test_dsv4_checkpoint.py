@@ -46,13 +46,16 @@ class DSV4CheckpointTest(unittest.TestCase):
                 json.dumps(config.to_dict()), encoding="utf-8"
             )
 
-            prefix = _prefix_config(folder, 20)
+            prefix = _prefix_config(folder, config.num_hidden_layers)
 
-            self.assertEqual(prefix.num_hidden_layers, 20)
+            self.assertEqual(prefix.num_hidden_layers, config.num_hidden_layers)
             self.assertEqual(prefix.engram_layer_ids, [1, 14])
             self.assertEqual(prefix.engram_num_embeddings, [100, 200])
-            with self.assertRaisesRegex(NotImplementedError, "twenty"):
-                _prefix_config(folder, 21)
+            self.assertEqual(
+                prefix.candidate_source_layer_id, config.candidate_source_layer_id
+            )
+            with self.assertRaisesRegex(NotImplementedError, "40"):
+                _prefix_config(folder, config.num_hidden_layers + 1)
 
     def test_reads_an_indexed_safetensors_file_without_safetensors_package(self):
         with tempfile.TemporaryDirectory() as temporary:

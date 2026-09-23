@@ -12,7 +12,11 @@ import torch
 import torch.distributed as dist
 
 from dsv41_train.models.dsv4 import load_dsv41_backbone_window
-from dsv41_train.models.dsv4.parallel import apply_fsdp2, build_parallelism
+from dsv41_train.models.dsv4.parallel import (
+    apply_fsdp2_layer,
+    apply_fsdp2_root,
+    build_parallelism,
+)
 from dsv41_train.runtime import Runtime, distributed_mean, initialize_runtime, local_tensor
 
 
@@ -91,6 +95,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         engram_mesh=meshes.engram,
         num_layers=args.num_layers,
         sparse_engram_gradients=args.optimizer == "sgd",
+        layer_loaded=lambda layer: apply_fsdp2_layer(layer, meshes),
     )
     model.train()
     loaded_at = time.perf_counter()
@@ -116,7 +121,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         + global_engram_parameters
     )
 
-    apply_fsdp2(model, meshes)
+    apply_fsdp2_root(model, meshes)
     sharded_at = time.perf_counter()
     tracked = model.model.layers[0].attention_hc.fn
     before = local_tensor(tracked).detach().float().clone()

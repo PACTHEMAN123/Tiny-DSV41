@@ -6,7 +6,7 @@ import torch.distributed as dist
 
 from ...dispatch import AllToAllTokenDispatcher, TokenDispatcher
 from ...parallel import ContextParallel, ParallelMeshes
-from .model import DeepSeekV41ForCausalLM, DeepSeekV41Model
+from .model import DecoderLayer, DeepSeekV41ForCausalLM, DeepSeekV41Model
 
 
 def build_parallelism(
@@ -34,16 +34,45 @@ def build_parallelism(
     return meshes, ContextParallel(meshes.cp), dispatcher
 
 
-def apply_fsdp2(
+def _fully_shard():
+    try:
+        from torch.distributed.fsdp import fully_shard
+    except ImportError:
+        from torch.distributed._composable.fsdp import fully_shard
+    return fully_shard
+
+
+def apply_fsdp2_layer(
+    layer: DecoderLayer,
+    meshes: ParallelMeshes,
+    *,
+    reshard_after_forward: bool = True,
+) -> None:
+    fully_shard = _fully_shard()
+    if meshes.ep is not None:
+        assert meshes.expert_fsdp is not None
+        layer.moe.routed.set_gradient_group(meshes.expert_fsdp.get_group())
+        fully_shard(
+            layer.moe.routed,
+            mesh=meshes.expert_fsdp,
+            reshard_after_forward=reshard_after_forward,
+        )
+    for fp32_module in (layer.attention_hc, layer.moe_hc, layer.attention.sinks):
+        fully_shard(
+            fp32_module,
+            mesh=meshes.fsdp,
+            reshard_after_forward=reshard_after_forward,
+        )
+    fully_shard(layer, mesh=meshes.fsdp, reshard_after_forward=reshard_after_forward)
+
+
+def apply_fsdp2_root(
     model: DeepSeekV41ForCausalLM | DeepSeekV41Model,
     meshes: ParallelMeshes,
     *,
     reshard_after_forward: bool = True,
 ) -> None:
-    try:
-        from torch.distributed.fsdp import fully_shard
-    except ImportError:
-        from torch.distributed._composable.fsdp import fully_shard
+    fully_shard = _fully_shard()
 
     decoder = model.model if isinstance(model, DeepSeekV41ForCausalLM) else model
     engram_fsdp = (
@@ -59,26 +88,35 @@ def apply_fsdp2(
                 mesh=engram_fsdp,
                 reshard_after_forward=reshard_after_forward,
             )
-    for layer in decoder.layers:
-        if meshes.ep is not None:
-            assert meshes.expert_fsdp is not None
-            layer.moe.routed.set_gradient_group(meshes.expert_fsdp.get_group())
-            fully_shard(
-                layer.moe.routed,
-                mesh=meshes.expert_fsdp,
-                reshard_after_forward=reshard_after_forward,
-            )
-        for fp32_module in (layer.attention_hc, layer.moe_hc, layer.attention.sinks):
-            fully_shard(
-                fp32_module,
-                mesh=meshes.fsdp,
-                reshard_after_forward=reshard_after_forward,
-            )
-        fully_shard(layer, mesh=meshes.fsdp, reshard_after_forward=reshard_after_forward)
     root_options = {"mesh": meshes.fsdp}
     if ignored_params:
         root_options["ignored_params"] = ignored_params
     fully_shard(model, **root_options)
 
 
-__all__ = ["apply_fsdp2", "build_parallelism"]
+def apply_fsdp2(
+    model: DeepSeekV41ForCausalLM | DeepSeekV41Model,
+    meshes: ParallelMeshes,
+    *,
+    reshard_after_forward: bool = True,
+) -> None:
+    decoder = model.model if isinstance(model, DeepSeekV41ForCausalLM) else model
+    for layer in decoder.layers:
+        apply_fsdp2_layer(
+            layer,
+            meshes,
+            reshard_after_forward=reshard_after_forward,
+        )
+    apply_fsdp2_root(
+        model,
+        meshes,
+        reshard_after_forward=reshard_after_forward,
+    )
+
+
+__all__ = [
+    "apply_fsdp2",
+    "apply_fsdp2_layer",
+    "apply_fsdp2_root",
+    "build_parallelism",
+]

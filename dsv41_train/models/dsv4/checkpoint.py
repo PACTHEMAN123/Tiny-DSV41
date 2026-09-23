@@ -6,6 +6,7 @@ import json
 import math
 import mmap
 import struct
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
@@ -13,7 +14,7 @@ import torch
 from ...dispatch import TokenDispatcher
 from ...parallel import ContextParallel
 from .config import DeepSeekV41Config
-from .model import DeepSeekV41ForCausalLM, NgramHash
+from .model import DecoderLayer, DeepSeekV41ForCausalLM, NgramHash
 
 try:
     from torch.distributed.device_mesh import DeviceMesh
@@ -244,9 +245,9 @@ def dequantize_fp4_rows(
 
 def _prefix_config(folder: Path, num_layers: int) -> DeepSeekV41Config:
     full = DeepSeekV41Config.from_json(folder / "config.json")
-    if not 1 <= num_layers <= 20:
+    if not 1 <= num_layers <= full.num_hidden_layers:
         raise NotImplementedError(
-            "a full checkpoint prefix supports one to twenty real layers"
+            f"a full checkpoint prefix supports one to {full.num_hidden_layers} real layers"
         )
     values = full.to_dict()
     values["num_hidden_layers"] = num_layers
@@ -255,7 +256,10 @@ def _prefix_config(folder: Path, num_layers: int) -> DeepSeekV41Config:
     values["index_source_layer_ids"] = [
         x for x in full.index_source_layer_ids if x < num_layers
     ]
-    values["candidate_source_layer_id"] = -1
+    candidate_source = full.candidate_source_layer_id
+    values["candidate_source_layer_id"] = (
+        candidate_source if 0 <= candidate_source < num_layers else -1
+    )
     engram = [
         (layer_id, rows)
         for layer_id, rows in zip(full.engram_layer_ids, full.engram_num_embeddings)
@@ -277,6 +281,7 @@ def load_dsv41_backbone_window(
     token_dispatcher: TokenDispatcher | None = None,
     engram_mesh: DeviceMesh | None = None,
     sparse_engram_gradients: bool = False,
+    layer_loaded: Callable[[DecoderLayer], None] | None = None,
 ) -> DeepSeekV41ForCausalLM:
     """Load a trainable prefix or source-anchored layer window."""
 
@@ -306,8 +311,23 @@ def load_dsv41_backbone_window(
         )
 
     target_device = torch.device(device)
-    state: dict[str, torch.Tensor] = {}
-
+    rotary = model.model.rotary
+    rotary.main = (
+        1.0
+        / (
+            config.rope_theta
+            ** (torch.arange(0, config.qk_rope_head_dim, 2, device=target_device).float()
+                / config.qk_rope_head_dim)
+        )
+    )
+    rotary.compressed = (
+        1.0
+        / (
+            config.compress_rope_theta
+            ** (torch.arange(0, config.qk_rope_head_dim, 2, device=target_device).float()
+                / config.qk_rope_head_dim)
+        )
+    )
     with ShardedSafeTensorReader(folder) as checkpoint:
 
         def read(name: str) -> torch.Tensor:
@@ -318,63 +338,52 @@ def load_dsv41_backbone_window(
                 read(f"{name}.weight"), read(f"{name}.scale"), dtype=dtype
             )
 
-        state.update(
-            {
-                "model.embedding.weight": read("embed.weight").to(dtype),
-                "model.norm.weight": read("norm.weight").to(dtype),
-                "lm_head.weight": read("head.weight").to(dtype),
-            }
-        )
+        def assign(module: torch.nn.Module, state: dict[str, torch.Tensor]) -> None:
+            result = module.load_state_dict(state, strict=True, assign=True)
+            if result.missing_keys or result.unexpected_keys:
+                raise RuntimeError(
+                    f"checkpoint mismatch: missing={result.missing_keys[:5]}, "
+                    f"unexpected={result.unexpected_keys[:5]}"
+                )
 
-        for local_layer_id, layer in enumerate(model.model.layers):
+        assign(model.model.embedding, {"weight": read("embed.weight").to(dtype)})
+        assign(model.model.norm, {"weight": read("norm.weight").to(dtype)})
+        assign(model.lm_head, {"weight": read("head.weight").to(dtype)})
+
+        for layer in model.model.layers:
             layer_id = layer.layer_id
             source = f"layers.{layer_id}"
-            target = f"model.layers.{local_layer_id}"
-            state.update(
-                {
-                    f"{target}.attention_hc.base": read(f"{source}.hc_attn_base"),
-                    f"{target}.attention_hc.fn": read(f"{source}.hc_attn_fn"),
-                    f"{target}.attention_hc.scale": read(f"{source}.hc_attn_scale"),
-                    f"{target}.moe_hc.base": read(f"{source}.hc_ffn_base"),
-                    f"{target}.moe_hc.fn": read(f"{source}.hc_ffn_fn"),
-                    f"{target}.moe_hc.scale": read(f"{source}.hc_ffn_scale"),
-                    f"{target}.attention.sinks.weight": read(f"{source}.attn.attn_sink"),
-                    f"{target}.attention.q_a.weight": fp8(f"{source}.attn.wq_a"),
-                    f"{target}.attention.q_norm.weight": read(
-                        f"{source}.attn.q_norm.weight"
-                    ).to(dtype),
-                    f"{target}.attention.q_b.weight": fp8(f"{source}.attn.wq_b"),
-                    f"{target}.attention.kv_proj.weight": fp8(f"{source}.attn.wkv"),
-                    f"{target}.attention.kv_norm.weight": read(
-                        f"{source}.attn.kv_norm.weight"
-                    ).to(dtype),
-                    f"{target}.attention.o_a.weight": fp8(
-                        f"{source}.attn.wo_a"
-                    ).view(config.o_groups, config.o_lora_rank, -1),
-                    f"{target}.attention.o_b.weight": fp8(f"{source}.attn.wo_b"),
-                    f"{target}.input_norm.weight": read(
-                        f"{source}.attn_norm.weight"
-                    ).to(dtype),
-                    f"{target}.post_attention_norm.weight": read(
-                        f"{source}.ffn_norm.weight"
-                    ).to(dtype),
-                    f"{target}.moe.router.weight": read(
-                        f"{source}.ffn.gate.weight"
-                    ).to(dtype),
-                    f"{target}.moe.router.selection_bias": read(
-                        f"{source}.ffn.gate.bias"
-                    ),
-                    f"{target}.moe.shared.gate.weight": fp8(
-                        f"{source}.ffn.shared_experts.w1"
-                    ),
-                    f"{target}.moe.shared.up.weight": fp8(
-                        f"{source}.ffn.shared_experts.w3"
-                    ),
-                    f"{target}.moe.shared.down.weight": fp8(
-                        f"{source}.ffn.shared_experts.w2"
-                    ),
-                }
-            )
+            state: dict[str, torch.Tensor] = {
+                "attention_hc.base": read(f"{source}.hc_attn_base"),
+                "attention_hc.fn": read(f"{source}.hc_attn_fn"),
+                "attention_hc.scale": read(f"{source}.hc_attn_scale"),
+                "moe_hc.base": read(f"{source}.hc_ffn_base"),
+                "moe_hc.fn": read(f"{source}.hc_ffn_fn"),
+                "moe_hc.scale": read(f"{source}.hc_ffn_scale"),
+                "attention.sinks.weight": read(f"{source}.attn.attn_sink"),
+                "attention.q_a.weight": fp8(f"{source}.attn.wq_a"),
+                "attention.q_norm.weight": read(
+                    f"{source}.attn.q_norm.weight"
+                ).to(dtype),
+                "attention.q_b.weight": fp8(f"{source}.attn.wq_b"),
+                "attention.kv_proj.weight": fp8(f"{source}.attn.wkv"),
+                "attention.kv_norm.weight": read(
+                    f"{source}.attn.kv_norm.weight"
+                ).to(dtype),
+                "attention.o_a.weight": fp8(f"{source}.attn.wo_a").view(
+                    config.o_groups, config.o_lora_rank, -1
+                ),
+                "attention.o_b.weight": fp8(f"{source}.attn.wo_b"),
+                "input_norm.weight": read(f"{source}.attn_norm.weight").to(dtype),
+                "post_attention_norm.weight": read(f"{source}.ffn_norm.weight").to(
+                    dtype
+                ),
+                "moe.router.weight": read(f"{source}.ffn.gate.weight").to(dtype),
+                "moe.router.selection_bias": read(f"{source}.ffn.gate.bias"),
+                "moe.shared.gate.weight": fp8(f"{source}.ffn.shared_experts.w1"),
+                "moe.shared.up.weight": fp8(f"{source}.ffn.shared_experts.w3"),
+                "moe.shared.down.weight": fp8(f"{source}.ffn.shared_experts.w2"),
+            }
 
             routed = layer.moe.routed
             for local_id, global_id in enumerate(
@@ -391,10 +400,10 @@ def load_dsv41_backbone_window(
                     read(f"{prefix}.w3.scale"),
                     dtype=dtype,
                 )
-                state[f"{target}.moe.routed.gate_up.{local_id}"] = torch.cat(
+                state[f"moe.routed.gate_up.{local_id}"] = torch.cat(
                     (gate, up), dim=0
                 )
-                state[f"{target}.moe.routed.down.{local_id}"] = dequantize_fp4_rows(
+                state[f"moe.routed.down.{local_id}"] = dequantize_fp4_rows(
                     read(f"{prefix}.w2.weight"),
                     read(f"{prefix}.w2.scale"),
                     dtype=dtype,
@@ -402,30 +411,30 @@ def load_dsv41_backbone_window(
 
             compressor = layer.attention.compressor
             if compressor is not None:
-                state[f"{target}.attention.compressor.kv_proj.weight"] = read(
+                state["attention.compressor.kv_proj.weight"] = read(
                     f"{source}.attn.compressor.wkv.weight"
                 ).to(dtype)
                 if compressor.gate_proj is not None:
-                    state[f"{target}.attention.compressor.gate_proj.weight"] = read(
+                    state["attention.compressor.gate_proj.weight"] = read(
                         f"{source}.attn.compressor.wgate.weight"
                     ).to(dtype)
-                state[f"{target}.attention.compressor.norm.weight"] = read(
+                state["attention.compressor.norm.weight"] = read(
                     f"{source}.attn.compressor.norm.weight"
                 ).to(dtype)
 
             indexer = layer.attention.indexer
             if indexer is not None:
-                state[f"{target}.attention.indexer.q_proj.weight"] = fp8(
+                state["attention.indexer.q_proj.weight"] = fp8(
                     f"{source}.attn.indexer.wq_b"
                 )
-                state[f"{target}.attention.indexer.weight_proj.weight"] = read(
+                state["attention.indexer.weight_proj.weight"] = read(
                     f"{source}.attn.indexer.weights_proj.weight"
                 ).to(dtype)
                 if indexer.owns_keys:
-                    state[f"{target}.attention.indexer.k_proj.weight"] = read(
+                    state["attention.indexer.k_proj.weight"] = read(
                         f"{source}.attn.indexer.wk.weight"
                     ).to(dtype)
-                    state[f"{target}.attention.indexer.k_norm.weight"] = read(
+                    state["attention.indexer.k_norm.weight"] = read(
                         f"{source}.attn.indexer.k_norm.weight"
                     ).to(dtype)
 
@@ -452,40 +461,15 @@ def load_dsv41_backbone_window(
                     table_weight[chunk_start - table.row_start : chunk_stop - table.row_start].copy_(
                         dequantize_fp8_rows(weight, scale, dtype=dtype)
                     )
-                state[f"model.engram_tables.{layer_id}.weight"] = table_weight
-                state[f"{target}.engram.q_weight"] = read(
-                    f"{source}.engram.q_weight"
-                ).to(dtype)
-                state[f"{target}.engram.k_weight"] = read(
-                    f"{source}.engram.k_weight"
-                ).to(dtype)
-                state[f"{target}.engram.proj.weight"] = fp8(
-                    f"{source}.engram.wkv"
-                )
+                assign(table, {"weight": table_weight})
+                state["engram.q_weight"] = read(f"{source}.engram.q_weight").to(dtype)
+                state["engram.k_weight"] = read(f"{source}.engram.k_weight").to(dtype)
+                state["engram.proj.weight"] = fp8(f"{source}.engram.wkv")
 
-    result = model.load_state_dict(state, strict=True, assign=True)
-    if result.missing_keys or result.unexpected_keys:
-        raise RuntimeError(
-            f"checkpoint mismatch: missing={result.missing_keys[:5]}, "
-            f"unexpected={result.unexpected_keys[:5]}"
-        )
-    rotary = model.model.rotary
-    rotary.main = (
-        1.0
-        / (
-            config.rope_theta
-            ** (torch.arange(0, config.qk_rope_head_dim, 2, device=target_device).float()
-                / config.qk_rope_head_dim)
-        )
-    )
-    rotary.compressed = (
-        1.0
-        / (
-            config.compress_rope_theta
-            ** (torch.arange(0, config.qk_rope_head_dim, 2, device=target_device).float()
-                / config.qk_rope_head_dim)
-        )
-    )
+            assign(layer, state)
+            if layer_loaded is not None:
+                layer_loaded(layer)
+
     if model.model.hash is not None:
         model.model.hash = NgramHash(
             config, model.model.engram_layer_ids
@@ -505,6 +489,7 @@ def load_dsv41_backbone_prefix(
     token_dispatcher: TokenDispatcher | None = None,
     engram_mesh: DeviceMesh | None = None,
     sparse_engram_gradients: bool = False,
+    layer_loaded: Callable[[DecoderLayer], None] | None = None,
 ) -> DeepSeekV41ForCausalLM:
     """Load a trainable prefix directly from the released checkpoint."""
 
@@ -518,6 +503,7 @@ def load_dsv41_backbone_prefix(
         token_dispatcher=token_dispatcher,
         engram_mesh=engram_mesh,
         sparse_engram_gradients=sparse_engram_gradients,
+        layer_loaded=layer_loaded,
     )
 
 
