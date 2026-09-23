@@ -13,7 +13,12 @@ import torch
 from ...dispatch import TokenDispatcher
 from ...parallel import ContextParallel
 from .config import DeepSeekV41Config
-from .model import DeepSeekV41ForCausalLM
+from .model import DeepSeekV41ForCausalLM, NgramHash
+
+try:
+    from torch.distributed.device_mesh import DeviceMesh
+except ImportError:  # pragma: no cover - only needed for older PyTorch type checking
+    DeviceMesh = object
 
 
 _FP4_VALUES = (
@@ -85,6 +90,39 @@ class _SafeTensorShard:
         target = torch.device(device)
         return source.clone() if target.type == "cpu" else source.to(target)
 
+    def tensor_rows(
+        self,
+        name: str,
+        row_start: int,
+        row_stop: int,
+        device: torch.device | str,
+    ) -> torch.Tensor:
+        metadata = self.header[name]
+        shape = tuple(metadata["shape"])
+        if not shape:
+            raise ValueError(f"cannot slice rows from scalar tensor {name}")
+        if not 0 <= row_start <= row_stop <= shape[0]:
+            raise IndexError(
+                f"invalid row range for {name}: [{row_start}, {row_stop}) of {shape[0]}"
+            )
+        dtype = _torch_dtype(metadata["dtype"])
+        start, stop = metadata["data_offsets"]
+        row_numel = math.prod(shape[1:])
+        element_size = torch.empty((), dtype=dtype).element_size()
+        expected_bytes = math.prod(shape) * element_size
+        if stop - start != expected_bytes:
+            raise ValueError(
+                f"invalid byte range for {name}: expected {expected_bytes}, got {stop - start}"
+            )
+        source = torch.frombuffer(
+            self._mapping,
+            dtype=dtype,
+            count=(row_stop - row_start) * row_numel,
+            offset=self.data_start + start + row_start * row_numel * element_size,
+        ).reshape(row_stop - row_start, *shape[1:])
+        target = torch.device(device)
+        return source.clone() if target.type == "cpu" else source.to(target)
+
     def close(self) -> None:
         self._mapping.close()
         self._file.close()
@@ -108,6 +146,22 @@ class ShardedSafeTensorReader:
         if shard is None:
             shard = self._shards[shard_name] = _SafeTensorShard(self.folder / shard_name)
         return shard.tensor(name, device)
+
+    def tensor_rows(
+        self,
+        name: str,
+        row_start: int,
+        row_stop: int,
+        device: torch.device | str,
+    ) -> torch.Tensor:
+        try:
+            shard_name = self.weight_map[name]
+        except KeyError as error:
+            raise KeyError(f"checkpoint tensor is missing: {name}") from error
+        shard = self._shards.get(shard_name)
+        if shard is None:
+            shard = self._shards[shard_name] = _SafeTensorShard(self.folder / shard_name)
+        return shard.tensor_rows(name, row_start, row_stop, device)
 
     def close(self) -> None:
         for shard in self._shards.values():
@@ -143,6 +197,27 @@ def dequantize_fp8_blocks(
 
 
 @torch.no_grad()
+def dequantize_fp8_rows(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize E4M3 rows with one E8M0 scale per 32 columns."""
+
+    if weight.ndim != 2 or scale.ndim != 2:
+        raise ValueError("FP8 weight and scale must both be matrices")
+    rows, features = weight.shape
+    if scale.shape[0] != rows or features != scale.shape[1] * 32:
+        raise ValueError(
+            f"row-scaled FP8 shape mismatch: weight={tuple(weight.shape)}, "
+            f"scale={tuple(scale.shape)}"
+        )
+    blocks = weight.view(rows, scale.shape[1], 32).float()
+    return (blocks * scale.float().unsqueeze(-1)).flatten(1).to(dtype)
+
+
+@torch.no_grad()
 def dequantize_fp4_rows(
     packed: torch.Tensor,
     scale: torch.Tensor,
@@ -169,9 +244,9 @@ def dequantize_fp4_rows(
 
 def _prefix_config(folder: Path, num_layers: int) -> DeepSeekV41Config:
     full = DeepSeekV41Config.from_json(folder / "config.json")
-    if num_layers != 1:
+    if num_layers not in (1, 2):
         raise NotImplementedError(
-            "checkpoint-backed training currently supports the real layer-0 prefix only"
+            "checkpoint-backed training currently supports one or two real layers"
         )
     values = full.to_dict()
     values["num_hidden_layers"] = num_layers
@@ -199,6 +274,7 @@ def load_dsv41_backbone_prefix(
     dtype: torch.dtype = torch.bfloat16,
     context_parallel: ContextParallel | None = None,
     token_dispatcher: TokenDispatcher | None = None,
+    engram_mesh: DeviceMesh | None = None,
 ) -> DeepSeekV41ForCausalLM:
     """Load a trainable prefix directly from the released quantized checkpoint."""
 
@@ -206,10 +282,10 @@ def load_dsv41_backbone_prefix(
     config = _prefix_config(folder, num_layers)
     dispatcher = token_dispatcher or TokenDispatcher()
     with torch.device("meta"):
-        model = DeepSeekV41ForCausalLM(config, context_parallel, dispatcher)
+        model = DeepSeekV41ForCausalLM(
+            config, context_parallel, dispatcher, engram_mesh
+        )
 
-    layer = model.model.layers[0]
-    routed = layer.moe.routed
     target_device = torch.device(device)
     state: dict[str, torch.Tensor] = {}
 
@@ -228,85 +304,132 @@ def load_dsv41_backbone_prefix(
                 "model.embedding.weight": read("embed.weight").to(dtype),
                 "model.norm.weight": read("norm.weight").to(dtype),
                 "lm_head.weight": read("head.weight").to(dtype),
-                "model.layers.0.attention_hc.base": read("layers.0.hc_attn_base"),
-                "model.layers.0.attention_hc.fn": read("layers.0.hc_attn_fn"),
-                "model.layers.0.attention_hc.scale": read("layers.0.hc_attn_scale"),
-                "model.layers.0.moe_hc.base": read("layers.0.hc_ffn_base"),
-                "model.layers.0.moe_hc.fn": read("layers.0.hc_ffn_fn"),
-                "model.layers.0.moe_hc.scale": read("layers.0.hc_ffn_scale"),
-                "model.layers.0.attention.sinks.weight": read("layers.0.attn.attn_sink"),
-                "model.layers.0.attention.q_a.weight": fp8("layers.0.attn.wq_a"),
-                "model.layers.0.attention.q_norm.weight": read(
-                    "layers.0.attn.q_norm.weight"
-                ).to(dtype),
-                "model.layers.0.attention.q_b.weight": fp8("layers.0.attn.wq_b"),
-                "model.layers.0.attention.kv_proj.weight": fp8("layers.0.attn.wkv"),
-                "model.layers.0.attention.kv_norm.weight": read(
-                    "layers.0.attn.kv_norm.weight"
-                ).to(dtype),
-                "model.layers.0.attention.o_a.weight": fp8("layers.0.attn.wo_a").view(
-                    config.o_groups, config.o_lora_rank, -1
-                ),
-                "model.layers.0.attention.o_b.weight": fp8("layers.0.attn.wo_b"),
-                "model.layers.0.input_norm.weight": read(
-                    "layers.0.attn_norm.weight"
-                ).to(dtype),
-                "model.layers.0.post_attention_norm.weight": read(
-                    "layers.0.ffn_norm.weight"
-                ).to(dtype),
-                "model.layers.0.moe.router.weight": read(
-                    "layers.0.ffn.gate.weight"
-                ).to(dtype),
-                "model.layers.0.moe.router.selection_bias": read(
-                    "layers.0.ffn.gate.bias"
-                ),
-                "model.layers.0.moe.shared.gate.weight": fp8(
-                    "layers.0.ffn.shared_experts.w1"
-                ),
-                "model.layers.0.moe.shared.up.weight": fp8(
-                    "layers.0.ffn.shared_experts.w3"
-                ),
-                "model.layers.0.moe.shared.down.weight": fp8(
-                    "layers.0.ffn.shared_experts.w2"
-                ),
             }
         )
 
-        gate_up = torch.empty(
-            routed.num_experts,
-            2 * config.moe_intermediate_size,
-            config.hidden_size,
-            device=target_device,
-            dtype=dtype,
-        )
-        down = torch.empty(
-            routed.num_experts,
-            config.hidden_size,
-            config.moe_intermediate_size,
-            device=target_device,
-            dtype=dtype,
-        )
-        for local_id, global_id in enumerate(
-            range(routed.expert_start, routed.expert_start + routed.num_experts)
-        ):
-            prefix = f"layers.0.ffn.experts.{global_id}"
-            gate = dequantize_fp4_rows(
-                read(f"{prefix}.w1.weight"), read(f"{prefix}.w1.scale"), dtype=dtype
+        for layer_id, layer in enumerate(model.model.layers):
+            source = f"layers.{layer_id}"
+            target = f"model.layers.{layer_id}"
+            state.update(
+                {
+                    f"{target}.attention_hc.base": read(f"{source}.hc_attn_base"),
+                    f"{target}.attention_hc.fn": read(f"{source}.hc_attn_fn"),
+                    f"{target}.attention_hc.scale": read(f"{source}.hc_attn_scale"),
+                    f"{target}.moe_hc.base": read(f"{source}.hc_ffn_base"),
+                    f"{target}.moe_hc.fn": read(f"{source}.hc_ffn_fn"),
+                    f"{target}.moe_hc.scale": read(f"{source}.hc_ffn_scale"),
+                    f"{target}.attention.sinks.weight": read(f"{source}.attn.attn_sink"),
+                    f"{target}.attention.q_a.weight": fp8(f"{source}.attn.wq_a"),
+                    f"{target}.attention.q_norm.weight": read(
+                        f"{source}.attn.q_norm.weight"
+                    ).to(dtype),
+                    f"{target}.attention.q_b.weight": fp8(f"{source}.attn.wq_b"),
+                    f"{target}.attention.kv_proj.weight": fp8(f"{source}.attn.wkv"),
+                    f"{target}.attention.kv_norm.weight": read(
+                        f"{source}.attn.kv_norm.weight"
+                    ).to(dtype),
+                    f"{target}.attention.o_a.weight": fp8(
+                        f"{source}.attn.wo_a"
+                    ).view(config.o_groups, config.o_lora_rank, -1),
+                    f"{target}.attention.o_b.weight": fp8(f"{source}.attn.wo_b"),
+                    f"{target}.input_norm.weight": read(
+                        f"{source}.attn_norm.weight"
+                    ).to(dtype),
+                    f"{target}.post_attention_norm.weight": read(
+                        f"{source}.ffn_norm.weight"
+                    ).to(dtype),
+                    f"{target}.moe.router.weight": read(
+                        f"{source}.ffn.gate.weight"
+                    ).to(dtype),
+                    f"{target}.moe.router.selection_bias": read(
+                        f"{source}.ffn.gate.bias"
+                    ),
+                    f"{target}.moe.shared.gate.weight": fp8(
+                        f"{source}.ffn.shared_experts.w1"
+                    ),
+                    f"{target}.moe.shared.up.weight": fp8(
+                        f"{source}.ffn.shared_experts.w3"
+                    ),
+                    f"{target}.moe.shared.down.weight": fp8(
+                        f"{source}.ffn.shared_experts.w2"
+                    ),
+                }
             )
-            up = dequantize_fp4_rows(
-                read(f"{prefix}.w3.weight"), read(f"{prefix}.w3.scale"), dtype=dtype
+
+            routed = layer.moe.routed
+            gate_up = torch.empty(
+                routed.num_experts,
+                2 * config.moe_intermediate_size,
+                config.hidden_size,
+                device=target_device,
+                dtype=dtype,
             )
-            gate_up[local_id, : config.moe_intermediate_size].copy_(gate)
-            gate_up[local_id, config.moe_intermediate_size :].copy_(up)
-            down[local_id].copy_(
-                dequantize_fp4_rows(
-                    read(f"{prefix}.w2.weight"),
-                    read(f"{prefix}.w2.scale"),
+            down = torch.empty(
+                routed.num_experts,
+                config.hidden_size,
+                config.moe_intermediate_size,
+                device=target_device,
+                dtype=dtype,
+            )
+            for local_id, global_id in enumerate(
+                range(routed.expert_start, routed.expert_start + routed.num_experts)
+            ):
+                prefix = f"{source}.ffn.experts.{global_id}"
+                gate = dequantize_fp4_rows(
+                    read(f"{prefix}.w1.weight"),
+                    read(f"{prefix}.w1.scale"),
                     dtype=dtype,
                 )
-            )
-        state["model.layers.0.moe.routed.gate_up"] = gate_up
-        state["model.layers.0.moe.routed.down"] = down
+                up = dequantize_fp4_rows(
+                    read(f"{prefix}.w3.weight"),
+                    read(f"{prefix}.w3.scale"),
+                    dtype=dtype,
+                )
+                gate_up[local_id, : config.moe_intermediate_size].copy_(gate)
+                gate_up[local_id, config.moe_intermediate_size :].copy_(up)
+                down[local_id].copy_(
+                    dequantize_fp4_rows(
+                        read(f"{prefix}.w2.weight"),
+                        read(f"{prefix}.w2.scale"),
+                        dtype=dtype,
+                    )
+                )
+            state[f"{target}.moe.routed.gate_up"] = gate_up
+            state[f"{target}.moe.routed.down"] = down
+
+            if layer.engram is not None:
+                table = model.model.engram_tables[str(layer_id)]
+                table_weight = torch.empty(
+                    table.weight.shape, device=target_device, dtype=dtype
+                )
+                chunk_rows = 131072
+                for chunk_start in range(table.row_start, table.row_stop, chunk_rows):
+                    chunk_stop = min(chunk_start + chunk_rows, table.row_stop)
+                    weight = checkpoint.tensor_rows(
+                        f"{source}.engram.embed.weight",
+                        chunk_start,
+                        chunk_stop,
+                        target_device,
+                    )
+                    scale = checkpoint.tensor_rows(
+                        f"{source}.engram.embed.scale",
+                        chunk_start,
+                        chunk_stop,
+                        target_device,
+                    )
+                    table_weight[chunk_start - table.row_start : chunk_stop - table.row_start].copy_(
+                        dequantize_fp8_rows(weight, scale, dtype=dtype)
+                    )
+                state[f"model.engram_tables.{layer_id}.weight"] = table_weight
+                state[f"{target}.engram.q_weight"] = read(
+                    f"{source}.engram.q_weight"
+                ).to(dtype)
+                state[f"{target}.engram.k_weight"] = read(
+                    f"{source}.engram.k_weight"
+                ).to(dtype)
+                state[f"{target}.engram.proj.weight"] = fp8(
+                    f"{source}.engram.wkv"
+                )
 
     result = model.load_state_dict(state, strict=True, assign=True)
     if result.missing_keys or result.unexpected_keys:
@@ -331,6 +454,8 @@ def load_dsv41_backbone_prefix(
                 / config.qk_rope_head_dim)
         )
     )
+    if model.model.hash is not None:
+        model.model.hash = NgramHash(config).to(target_device)
     if any(parameter.is_meta for parameter in model.parameters()):
         raise RuntimeError("checkpoint loading left meta parameters in the model")
     return model
@@ -340,5 +465,6 @@ __all__ = [
     "ShardedSafeTensorReader",
     "dequantize_fp4_rows",
     "dequantize_fp8_blocks",
+    "dequantize_fp8_rows",
     "load_dsv41_backbone_prefix",
 ]

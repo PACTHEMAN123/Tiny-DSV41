@@ -30,6 +30,12 @@ class ModelTest(unittest.TestCase):
                     with patch(shard_path) as shard:
                         apply_fsdp2(target, meshes, reshard_after_forward=False)
                     expected = []
+                    if expert_parallel:
+                        for table in model.model.engram_tables.values():
+                            expected.append(call(
+                                table, mesh=meshes.expert_fsdp,
+                                reshard_after_forward=False,
+                            ))
                     for layer in model.model.layers:
                         if expert_parallel:
                             expected.append(call(

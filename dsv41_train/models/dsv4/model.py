@@ -11,8 +11,11 @@ deliberately outside this module.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn
 import torch.nn.functional as F
 from torch import nn
 
@@ -20,6 +23,9 @@ from .config import DeepSeekV41Config
 from .moe import RoutedExperts, SparseMoE, TopKRouter
 from ...dispatch import TokenDispatcher
 from ...parallel import ContextParallel
+
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
 
 
 class RMSNorm(nn.Module):
@@ -117,6 +123,102 @@ class AttentionSinks(nn.Module):
         # The result outlives this nested FSDP module's forward. Materialize it
         # before FSDP reshards and releases the unsharded parameter storage.
         return self.weight.clone()
+
+
+class _ScaleGradient(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, scale: float) -> torch.Tensor:
+        ctx.scale = scale
+        return tensor
+
+    @staticmethod
+    def backward(ctx, gradient: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return gradient * ctx.scale, None
+
+
+class RowShardedEmbedding(nn.Module):
+    """Shard embedding rows over a mesh and route lookups to their owner."""
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        mesh: DeviceMesh | None = None,
+    ) -> None:
+        super().__init__()
+        if mesh is not None and mesh.ndim != 1:
+            raise ValueError("the embedding mesh must be one-dimensional")
+        self.global_num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.mesh = mesh
+        self.size = 1 if mesh is None else mesh.size()
+        self.rank = 0 if mesh is None else mesh.get_local_rank()
+        self.group = None if mesh is None else mesh.get_group()
+        if num_embeddings < self.size:
+            raise ValueError("embedding rows must be at least the embedding mesh size")
+
+        base, remainder = divmod(num_embeddings, self.size)
+        self.row_start = self.rank * base + min(self.rank, remainder)
+        self.row_stop = self.row_start + base + int(self.rank < remainder)
+        self.weight = nn.Parameter(torch.empty(self.row_stop - self.row_start, embedding_dim))
+
+    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        if self.size == 1:
+            return F.embedding(indices, self.weight)
+        if indices.numel() and (indices.min() < 0 or indices.max() >= self.global_num_embeddings):
+            raise IndexError("embedding index is outside the configured row range")
+
+        shape = indices.shape
+        flat = indices.reshape(-1)
+        base, remainder = divmod(self.global_num_embeddings, self.size)
+        large_rows = (base + 1) * remainder
+        owners = torch.where(
+            flat < large_rows,
+            torch.div(flat, base + 1, rounding_mode="floor"),
+            remainder + torch.div(flat - large_rows, base, rounding_mode="floor"),
+        )
+        order = torch.argsort(owners, stable=True)
+        send_counts = torch.bincount(owners, minlength=self.size).to(torch.int64)
+        recv_counts = torch.empty_like(send_counts)
+        dist.all_to_all_single(recv_counts, send_counts, group=self.group)
+        send_splits = send_counts.tolist()
+        recv_splits = recv_counts.tolist()
+
+        routed = self._exchange(
+            flat[order].contiguous(), recv_splits, send_splits, autograd=False
+        )
+        rows = F.embedding(routed - self.row_start, self.weight)
+        rows = _ScaleGradient.apply(rows, 1.0 / self.size)
+        returned = self._exchange(
+            rows.contiguous(), send_splits, recv_splits, autograd=True
+        )
+        return returned[torch.argsort(order)].view(*shape, self.embedding_dim)
+
+    def _exchange(
+        self,
+        tensor: torch.Tensor,
+        output_splits: list[int],
+        input_splits: list[int],
+        *,
+        autograd: bool,
+    ) -> torch.Tensor:
+        output = tensor.new_empty((sum(output_splits), *tensor.shape[1:]))
+        if autograd:
+            return dist_nn.all_to_all_single(
+                output,
+                tensor,
+                output_split_sizes=output_splits,
+                input_split_sizes=input_splits,
+                group=self.group,
+            )
+        dist.all_to_all_single(
+            output,
+            tensor,
+            output_split_sizes=output_splits,
+            input_split_sizes=input_splits,
+            group=self.group,
+        )
+        return output
 
 
 class Compressor(nn.Module):
@@ -533,6 +635,7 @@ class DeepSeekV41Model(nn.Module):
         config: DeepSeekV41Config,
         context_parallel: ContextParallel | None = None,
         token_dispatcher: TokenDispatcher | None = None,
+        engram_mesh: DeviceMesh | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -554,7 +657,9 @@ class DeepSeekV41Model(nn.Module):
         self.hash = NgramHash(config) if config.engram_layer_ids else None
         self.engram_tables = nn.ModuleDict(
             {
-                str(layer_id): nn.Embedding(config.engram_num_embeddings[index], config.engram_head_dim)
+                str(layer_id): RowShardedEmbedding(
+                    config.engram_num_embeddings[index], config.engram_head_dim, engram_mesh
+                )
                 for index, layer_id in enumerate(config.engram_layer_ids)
             }
         )
@@ -667,11 +772,14 @@ class DeepSeekV41ForCausalLM(nn.Module):
         config: DeepSeekV41Config,
         context_parallel: ContextParallel | None = None,
         token_dispatcher: TokenDispatcher | None = None,
+        engram_mesh: DeviceMesh | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.context_parallel = context_parallel or ContextParallel()
-        self.model = DeepSeekV41Model(config, self.context_parallel, token_dispatcher)
+        self.model = DeepSeekV41Model(
+            config, self.context_parallel, token_dispatcher, engram_mesh
+        )
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._initialize)
 
@@ -679,7 +787,7 @@ class DeepSeekV41ForCausalLM(nn.Module):
         if any(parameter.is_meta for parameter in module.parameters(recurse=False)):
             return
         std = self.config.initializer_range
-        if isinstance(module, (nn.Linear, nn.Embedding)):
+        if isinstance(module, (nn.Linear, nn.Embedding, RowShardedEmbedding)):
             nn.init.normal_(module.weight, std=std)
         if isinstance(module, RMSNorm):
             nn.init.ones_(module.weight)
@@ -752,4 +860,5 @@ __all__ = [
     "DeepSeekV41ForCausalLM",
     "DeepSeekV41Model",
     "DeepseekV41ForCausalLM",
+    "RowShardedEmbedding",
 ]

@@ -10,6 +10,7 @@ from dsv41_train.models.dsv4.checkpoint import (
     ShardedSafeTensorReader,
     dequantize_fp4_rows,
     dequantize_fp8_blocks,
+    dequantize_fp8_rows,
 )
 
 
@@ -44,8 +45,10 @@ class DSV4CheckpointTest(unittest.TestCase):
 
             with ShardedSafeTensorReader(folder) as checkpoint:
                 actual = checkpoint.tensor("weight", "cpu")
+                sliced = checkpoint.tensor_rows("weight", 1, 2, "cpu")
 
         torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(sliced, expected[1:2])
 
     def test_dequantizes_fp8_blocks(self):
         weight = torch.ones(32, 32, dtype=torch.float8_e4m3fn)
@@ -62,6 +65,15 @@ class DSV4CheckpointTest(unittest.TestCase):
         actual = dequantize_fp4_rows(packed, scale, dtype=torch.float32)
 
         expected = torch.tensor([0.5, 1.0] * 16).view(1, 32)
+        torch.testing.assert_close(actual, expected)
+
+    def test_dequantizes_row_scaled_fp8(self):
+        weight = torch.ones(2, 64, dtype=torch.float8_e4m3fn)
+        scale = torch.tensor([[2.0, 3.0], [4.0, 5.0]])
+
+        actual = dequantize_fp8_rows(weight, scale, dtype=torch.float32)
+
+        expected = torch.tensor([[2.0] * 32 + [3.0] * 32, [4.0] * 32 + [5.0] * 32])
         torch.testing.assert_close(actual, expected)
 
 

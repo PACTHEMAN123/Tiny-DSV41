@@ -1,4 +1,4 @@
-"""Train a real DeepSeek V4.1 layer-0 prefix from the released checkpoint."""
+"""Train a real DeepSeek V4.1 prefix from the released checkpoint."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--steps", type=int, default=1)
+    parser.add_argument("--num-layers", type=int, choices=(1, 2), default=1)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1.0e-4)
@@ -67,17 +68,30 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         dtype=torch.bfloat16,
         context_parallel=context_parallel,
         token_dispatcher=token_dispatcher,
+        engram_mesh=meshes.ep,
+        num_layers=args.num_layers,
     )
     model.train()
     loaded_at = time.perf_counter()
 
     routed = model.model.layers[0].moe.routed
-    local_expert_parameters = routed.gate_up.numel() + routed.down.numel()
+    local_expert_parameters = sum(
+        layer.moe.routed.gate_up.numel() + layer.moe.routed.down.numel()
+        for layer in model.model.layers
+    )
+    local_engram_parameters = sum(
+        table.weight.numel() for table in model.model.engram_tables.values()
+    )
+    global_engram_parameters = sum(
+        rows * model.config.engram_head_dim for rows in model.config.engram_num_embeddings
+    )
     local_parameter_count = sum(parameter.numel() for parameter in model.parameters())
     full_parameter_count = (
         local_parameter_count
         - local_expert_parameters
+        - local_engram_parameters
         + local_expert_parameters * args.ep_size
+        + global_engram_parameters
     )
 
     apply_fsdp2(model, meshes)
@@ -128,7 +142,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
     torch.cuda.synchronize(runtime.device)
     finished = time.perf_counter()
     metrics: dict[str, float | int | str] = {
-        "model": "DeepSeek-V4.1-Flash layer-0 prefix",
+        "model": f"DeepSeek-V4.1-Flash {args.num_layers}-layer prefix",
         "checkpoint": str(Path(args.model_path).resolve()),
         "parameters": full_parameter_count,
         "local_parameters_before_fsdp": local_parameter_count,
@@ -137,6 +151,9 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         "ep_size": args.ep_size,
         "fsdp_size": meshes.fsdp.size(),
         "experts_per_rank": routed.num_experts,
+        "engram_rows_per_rank": sum(
+            table.weight.shape[0] for table in model.model.engram_tables.values()
+        ),
         "steps": args.steps,
         "batch_size_per_rank": args.batch_size,
         "sequence_length": args.seq_len,

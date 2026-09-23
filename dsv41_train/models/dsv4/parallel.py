@@ -29,6 +29,14 @@ def apply_fsdp2(
         from torch.distributed._composable.fsdp import fully_shard
 
     decoder = model.model if isinstance(model, DeepSeekV41ForCausalLM) else model
+    if meshes.ep is not None:
+        assert meshes.expert_fsdp is not None
+        for table in decoder.engram_tables.values():
+            fully_shard(
+                table,
+                mesh=meshes.expert_fsdp,
+                reshard_after_forward=reshard_after_forward,
+            )
     for layer in decoder.layers:
         if meshes.ep is not None:
             assert meshes.expert_fsdp is not None
