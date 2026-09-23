@@ -67,6 +67,37 @@ python -m torch.distributed.run --standalone --nproc-per-node=8 \
 Window mode verifies the selected layers and their shared compressed state; it
 is explicitly not an end-to-end prefix or a full 40-layer training recipe.
 
+### Two-node launch
+
+Validate rendezvous and NCCL collectives before loading the checkpoint. Run the
+same command on both nodes, changing only `--node-rank` from `0` to `1`:
+
+```bash
+NCCL_SOCKET_IFNAME=eth0 GLOO_SOCKET_IFNAME=eth0 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+python -m torch.distributed.run \
+  --nnodes=2 --nproc-per-node=8 --node-rank=0 \
+  --master-addr=<rank-0-container-ip> --master-port=29500 \
+  tests/distributed_nccl_smoke.py
+```
+
+The real-weight command uses the same launcher options. With 16 ranks,
+`--ep-size 8 --cp-size 1` keeps eight-way expert parallelism and adds two-way
+FSDP for each expert and Engram shard, while dense parameters use FSDP16:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+NCCL_SOCKET_IFNAME=eth0 GLOO_SOCKET_IFNAME=eth0 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+python -m torch.distributed.run \
+  --nnodes=2 --nproc-per-node=8 --node-rank=0 \
+  --master-addr=<rank-0-container-ip> --master-port=29500 \
+  train_dsv4_checkpoint.py \
+  --model-path /path/to/DeepSeek-V4.1-Flash \
+  --start-layer 20 --num-layers 1 \
+  --ep-size 8 --cp-size 1 --steps 1 --batch-size 1 --seq-len 8
+```
+
 ## Qwen
 
 The Qwen model itself depends only on PyTorch. Loading Hugging Face checkpoint
