@@ -106,6 +106,17 @@ class GroupedLinear(nn.Module):
         return torch.einsum("...gi,goi->...go", x, self.weight)
 
 
+class AttentionSinks(nn.Module):
+    """Keep trainable FP32 attention sinks in their own precision domain."""
+
+    def __init__(self, num_heads: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(num_heads))
+
+    def forward(self) -> torch.Tensor:
+        return self.weight
+
+
 class Compressor(nn.Module):
     """Pool complete groups of live tokens into shared KV latents."""
 
@@ -259,7 +270,7 @@ class CompressedAttention(nn.Module):
         group_input = self.num_heads * self.head_dim // config.o_groups
         self.o_a = GroupedLinear(group_input, config.o_lora_rank, config.o_groups)
         self.o_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
-        self.sinks = nn.Parameter(torch.zeros(self.num_heads))
+        self.sinks = AttentionSinks(self.num_heads)
         self.compressor = Compressor(config, layer_id) if layer_id in config.kv_source_layer_ids else None
         self.indexer = (
             SparseIndexer(config, layer_id, rotary) if layer_id in config.index_source_layer_ids else None
@@ -336,7 +347,9 @@ class CompressedAttention(nn.Module):
             picked = picked.masked_fill(~selected_valid.unsqueeze(1), float("-inf"))
             logits = torch.cat((logits, picked), dim=-1)
 
-        sinks = self.sinks.view(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+        sinks = self.sinks().view(1, -1, 1, 1).expand(
+            query.shape[0], -1, query.shape[-2], -1
+        )
         probabilities = torch.softmax(torch.cat((logits.float(), sinks), dim=-1), dim=-1)[..., :-1]
         probabilities = F.dropout(probabilities, self.dropout, self.training).to(kv.dtype)
         output = torch.matmul(probabilities[..., :window], kv)

@@ -37,6 +37,12 @@ def apply_fsdp2(
                 mesh=meshes.expert_fsdp,
                 reshard_after_forward=reshard_after_forward,
             )
+        for fp32_module in (layer.attention_hc, layer.moe_hc, layer.attention.sinks):
+            fully_shard(
+                fp32_module,
+                mesh=meshes.fsdp,
+                reshard_after_forward=reshard_after_forward,
+            )
         fully_shard(layer, mesh=meshes.fsdp, reshard_after_forward=reshard_after_forward)
     fully_shard(model, mesh=meshes.fsdp)
 

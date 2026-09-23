@@ -36,6 +36,16 @@ class ModelTest(unittest.TestCase):
                                 layer.moe.routed, mesh=meshes.expert_fsdp,
                                 reshard_after_forward=False,
                             ))
+                        for fp32_module in (
+                            layer.attention_hc,
+                            layer.moe_hc,
+                            layer.attention.sinks,
+                        ):
+                            expected.append(call(
+                                fp32_module,
+                                mesh=meshes.fsdp,
+                                reshard_after_forward=False,
+                            ))
                         expected.append(call(layer, mesh=meshes.fsdp, reshard_after_forward=False))
                     expected.append(call(target, mesh=meshes.fsdp))
                     self.assertEqual(shard.call_args_list, expected)

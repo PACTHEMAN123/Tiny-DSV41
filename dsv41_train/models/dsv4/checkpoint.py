@@ -234,7 +234,7 @@ def load_dsv41_backbone_prefix(
                 "model.layers.0.moe_hc.base": read("layers.0.hc_ffn_base"),
                 "model.layers.0.moe_hc.fn": read("layers.0.hc_ffn_fn"),
                 "model.layers.0.moe_hc.scale": read("layers.0.hc_ffn_scale"),
-                "model.layers.0.attention.sinks": read("layers.0.attn.attn_sink"),
+                "model.layers.0.attention.sinks.weight": read("layers.0.attn.attn_sink"),
                 "model.layers.0.attention.q_a.weight": fp8("layers.0.attn.wq_a"),
                 "model.layers.0.attention.q_norm.weight": read(
                     "layers.0.attn.q_norm.weight"
