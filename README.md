@@ -36,23 +36,23 @@ runs both write DCP checkpoints to `outputs/final/checkpoint/step-N/`.
 The checkpoint-backed entry point reads the released sharded safetensors with
 the Python standard library, dequantizes FP8/FP4 weights with PyTorch, and does
 not require Transformers or the `safetensors` package. The bring-up scope covers
-the first two real layers: embeddings, all 384 routed experts per layer, shared
-experts, attention, mHC, row-sharded Engram memory, final norm, and LM head. EP
-owns 48 experts and one eighth of the Engram table per rank while FSDP shards
-dense parameters across the eight ranks.
+the first three real layers: embeddings, all 384 routed experts per layer,
+shared experts, attention, mHC, row-sharded Engram memory, the first compressed
+KV/indexer source, final norm, and LM head. EP owns 48 experts and one eighth of
+the Engram table per rank while FSDP shards dense parameters across eight ranks.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 python -m torch.distributed.run --standalone --nproc-per-node=8 \
   train_dsv4_checkpoint.py \
   --model-path /path/to/DeepSeek-V4.1-Flash \
-  --num-layers 2 \
+  --num-layers 3 \
   --ep-size 8 --cp-size 1 --steps 1 --batch-size 1 --seq-len 8
 ```
 
 This is a real-weight forward/backward/optimizer validation, not yet the full
-40-layer training recipe. Extending it past layer 1 requires the compressed-
-attention/indexer training path used from layer 2 onward.
+40-layer training recipe. Layers after this checkpoint reuse the compressed KV
+and sparse index state until a later layer refreshes them.
 
 ## Qwen
 

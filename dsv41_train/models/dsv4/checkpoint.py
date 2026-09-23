@@ -244,9 +244,9 @@ def dequantize_fp4_rows(
 
 def _prefix_config(folder: Path, num_layers: int) -> DeepSeekV41Config:
     full = DeepSeekV41Config.from_json(folder / "config.json")
-    if num_layers not in (1, 2):
+    if num_layers not in (1, 2, 3):
         raise NotImplementedError(
-            "checkpoint-backed training currently supports one or two real layers"
+            "checkpoint-backed training currently supports one to three real layers"
         )
     values = full.to_dict()
     values["num_hidden_layers"] = num_layers
@@ -396,6 +396,35 @@ def load_dsv41_backbone_prefix(
                 )
             state[f"{target}.moe.routed.gate_up"] = gate_up
             state[f"{target}.moe.routed.down"] = down
+
+            compressor = layer.attention.compressor
+            if compressor is not None:
+                state[f"{target}.attention.compressor.kv_proj.weight"] = read(
+                    f"{source}.attn.compressor.wkv.weight"
+                ).to(dtype)
+                if compressor.gate_proj is not None:
+                    state[f"{target}.attention.compressor.gate_proj.weight"] = read(
+                        f"{source}.attn.compressor.wgate.weight"
+                    ).to(dtype)
+                state[f"{target}.attention.compressor.norm.weight"] = read(
+                    f"{source}.attn.compressor.norm.weight"
+                ).to(dtype)
+
+            indexer = layer.attention.indexer
+            if indexer is not None:
+                state[f"{target}.attention.indexer.q_proj.weight"] = fp8(
+                    f"{source}.attn.indexer.wq_b"
+                )
+                state[f"{target}.attention.indexer.weight_proj.weight"] = read(
+                    f"{source}.attn.indexer.weights_proj.weight"
+                ).to(dtype)
+                if indexer.owns_keys:
+                    state[f"{target}.attention.indexer.k_proj.weight"] = read(
+                        f"{source}.attn.indexer.wk.weight"
+                    ).to(dtype)
+                    state[f"{target}.attention.indexer.k_norm.weight"] = read(
+                        f"{source}.attn.indexer.k_norm.weight"
+                    ).to(dtype)
 
             if layer.engram is not None:
                 table = model.model.engram_tables[str(layer_id)]
