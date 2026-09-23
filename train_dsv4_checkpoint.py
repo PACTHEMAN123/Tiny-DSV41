@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -13,6 +14,11 @@ import torch.distributed as dist
 from dsv41_train.models.dsv4 import load_dsv41_backbone_window
 from dsv41_train.models.dsv4.parallel import apply_fsdp2, build_parallelism
 from dsv41_train.runtime import Runtime, distributed_mean, initialize_runtime, local_tensor
+
+
+def distributed_trace(runtime: Runtime, event: str) -> None:
+    if os.environ.get("DSV41_DISTRIBUTED_TRACE"):
+        print(json.dumps({"trace": event, "rank": runtime.rank}), flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -130,8 +136,10 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
             raise RuntimeError("training produced a non-finite loss")
         output.loss.backward()
         optimizer.step()
+        distributed_trace(runtime, "optimizer_step_complete")
         last_loss = distributed_mean(output.loss, runtime)
         last_aux_loss = distributed_mean(output.aux_loss, runtime)
+        distributed_trace(runtime, "metrics_reduced")
         if runtime.is_main:
             print(
                 json.dumps(
@@ -140,13 +148,17 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
                 flush=True,
             )
 
+    distributed_trace(runtime, "parameter_delta_start")
     after = local_tensor(tracked).detach().float()
     parameter_delta = (after - before).abs().max()
+    distributed_trace(runtime, "parameter_delta_local_complete")
     dist.all_reduce(parameter_delta, op=dist.ReduceOp.MAX)
+    distributed_trace(runtime, "parameter_delta_reduced")
     if parameter_delta.item() == 0:
         raise RuntimeError("optimizer step did not update the tracked parameter")
 
     torch.cuda.synchronize(runtime.device)
+    distributed_trace(runtime, "cuda_synchronize_complete")
     finished = time.perf_counter()
     metrics: dict[str, float | int | str] = {
         "model": (
