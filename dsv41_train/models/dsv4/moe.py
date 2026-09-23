@@ -79,7 +79,7 @@ class RoutedExperts(nn.Module):
         self, x: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor
     ) -> torch.Tensor:
         x, indices, weights, metadata = self.dispatcher.dispatch(x, indices, weights)
-        output = torch.zeros_like(x, dtype=torch.float32)
+        output = torch.zeros_like(x, dtype=torch.float32) + x.float().sum() * 0
         used = torch.zeros(self.num_experts, dtype=torch.int32, device=indices.device)
         used.scatter_(0, indices, 1)
         if self.gradient_group is not None:
