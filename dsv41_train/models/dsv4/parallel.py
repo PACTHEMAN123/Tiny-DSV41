@@ -1,7 +1,20 @@
-"""FSDP wrapping for the DSV4 decoder and routed experts."""
+"""DSV4 parallel topology and FSDP wrapping."""
 
-from ...parallel import ParallelMeshes
+from ...dispatch import AllToAllTokenDispatcher, TokenDispatcher
+from ...parallel import ContextParallel, ParallelMeshes
 from .model import DeepSeekV41ForCausalLM, DeepSeekV41Model
+
+
+def build_parallelism(
+    cp: int = 1,
+    ep: int = 1,
+    device_type: str = "cuda",
+) -> tuple[ParallelMeshes, ContextParallel, TokenDispatcher]:
+    meshes = ParallelMeshes.build(cp=cp, ep=ep, device_type=device_type)
+    dispatcher = (
+        AllToAllTokenDispatcher(meshes.ep) if meshes.ep is not None else TokenDispatcher()
+    )
+    return meshes, ContextParallel(meshes.cp), dispatcher
 
 
 def apply_fsdp2(
@@ -26,3 +39,6 @@ def apply_fsdp2(
             )
         fully_shard(layer, mesh=meshes.fsdp, reshard_after_forward=reshard_after_forward)
     fully_shard(model, mesh=meshes.fsdp)
+
+
+__all__ = ["apply_fsdp2", "build_parallelism"]

@@ -2,10 +2,12 @@
 
 from .config import DeepSeekV41Config
 from .model import CausalLMOutput, DeepSeekV41ForCausalLM, DeepSeekV41Model
+from .checkpoint import load_dsv41_backbone_prefix
 
 __all__ = [
     "CausalLMOutput",
     "DeepSeekV41Config",
     "DeepSeekV41ForCausalLM",
     "DeepSeekV41Model",
+    "load_dsv41_backbone_prefix",
 ]

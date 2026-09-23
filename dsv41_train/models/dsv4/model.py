@@ -661,6 +661,8 @@ class DeepSeekV41ForCausalLM(nn.Module):
         self.apply(self._initialize)
 
     def _initialize(self, module: nn.Module) -> None:
+        if any(parameter.is_meta for parameter in module.parameters(recurse=False)):
+            return
         std = self.config.initializer_range
         if isinstance(module, (nn.Linear, nn.Embedding)):
             nn.init.normal_(module.weight, std=std)
