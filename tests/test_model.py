@@ -12,7 +12,7 @@ from dsv41_train.parallel import ContextParallel, ParallelMeshes
 
 
 class ModelTest(unittest.TestCase):
-    def test_empty_expert_route_keeps_zero_gradient_dependency(self):
+    def test_empty_expert_route_does_not_allocate_gradients(self):
         class EmptyReceiveDispatcher(TokenDispatcher):
             def dispatch(self, hidden, expert_ids, weights):
                 metadata = DispatchMetadata(
@@ -36,10 +36,22 @@ class ModelTest(unittest.TestCase):
 
         experts(hidden, expert_ids, weights).sum().backward()
 
-        self.assertIsNotNone(experts.gate_up.grad)
-        self.assertIsNotNone(experts.down.grad)
-        self.assertEqual(experts.gate_up.grad.count_nonzero().item(), 0)
-        self.assertEqual(experts.down.grad.count_nonzero().item(), 0)
+        self.assertTrue(all(parameter.grad is None for parameter in experts.gate_up))
+        self.assertTrue(all(parameter.grad is None for parameter in experts.down))
+
+    def test_expert_gradients_are_allocated_only_for_used_experts(self):
+        config = DeepSeekV41Config.tiny()
+        experts = RoutedExperts(config, TokenDispatcher())
+        hidden = torch.randn(3, config.hidden_size)
+        expert_ids = torch.zeros(3, config.num_experts_per_tok, dtype=torch.long)
+        weights = torch.ones(3, config.num_experts_per_tok)
+
+        experts(hidden, expert_ids, weights).sum().backward()
+
+        self.assertIsNotNone(experts.gate_up[0].grad)
+        self.assertIsNotNone(experts.down[0].grad)
+        self.assertTrue(all(parameter.grad is None for parameter in experts.gate_up[1:]))
+        self.assertTrue(all(parameter.grad is None for parameter in experts.down[1:]))
 
     def test_layer_window_selects_global_layers(self):
         config = DeepSeekV41Config.tiny()
@@ -117,6 +129,40 @@ class ModelTest(unittest.TestCase):
                         expected.append(call(layer, mesh=meshes.fsdp, reshard_after_forward=False))
                     expected.append(call(target, mesh=meshes.fsdp))
                     self.assertEqual(shard.call_args_list, expected)
+
+    def test_dsv4_fsdp_leaves_sparse_engram_tables_row_sharded(self):
+        with torch.device("meta"):
+            model = DeepSeekV41ForCausalLM(
+                DeepSeekV41Config.tiny(), sparse_engram_gradients=True
+            )
+        meshes = ParallelMeshes(
+            fsdp=Mock(),
+            cp=None,
+            ep=Mock(),
+            expert_fsdp=Mock(),
+            engram=Mock(),
+            engram_fsdp=Mock(),
+        )
+        try:
+            from torch.distributed.fsdp import fully_shard
+        except ImportError:
+            shard_path = "torch.distributed._composable.fsdp.fully_shard"
+        else:
+            shard_path = "torch.distributed.fsdp.fully_shard"
+
+        with patch(shard_path) as shard:
+            apply_fsdp2(model, meshes)
+
+        table = next(iter(model.model.engram_tables.values()))
+        self.assertNotIn(table, [args.args[0] for args in shard.call_args_list])
+        self.assertEqual(
+            shard.call_args_list[-1],
+            call(
+                model,
+                mesh=meshes.fsdp,
+                ignored_params={table.weight},
+            ),
+        )
 
     def test_forward_and_backward(self):
         config = DeepSeekV41Config(

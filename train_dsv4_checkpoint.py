@@ -90,13 +90,14 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         token_dispatcher=token_dispatcher,
         engram_mesh=meshes.engram,
         num_layers=args.num_layers,
+        sparse_engram_gradients=args.optimizer == "sgd",
     )
     model.train()
     loaded_at = time.perf_counter()
 
     routed = model.model.layers[0].moe.routed
     local_expert_parameters = sum(
-        layer.moe.routed.gate_up.numel() + layer.moe.routed.down.numel()
+        layer.moe.routed.local_parameter_count
         for layer in model.model.layers
     )
     local_engram_parameters = sum(
@@ -187,6 +188,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         "engram_rows_per_rank": sum(
             table.weight.shape[0] for table in model.model.engram_tables.values()
         ),
+        "sparse_engram_gradients": args.optimizer == "sgd",
         "steps": args.steps,
         "batch_size_per_rank": args.batch_size,
         "sequence_length": args.seq_len,

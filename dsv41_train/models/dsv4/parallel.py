@@ -49,8 +49,11 @@ def apply_fsdp2(
     engram_fsdp = (
         meshes.engram_fsdp if meshes.engram_fsdp is not None else meshes.expert_fsdp
     )
-    if engram_fsdp is not None:
-        for table in decoder.engram_tables.values():
+    ignored_params = set()
+    for table in decoder.engram_tables.values():
+        if table.sparse_gradients:
+            ignored_params.add(table.weight)
+        elif engram_fsdp is not None:
             fully_shard(
                 table,
                 mesh=engram_fsdp,
@@ -59,6 +62,7 @@ def apply_fsdp2(
     for layer in decoder.layers:
         if meshes.ep is not None:
             assert meshes.expert_fsdp is not None
+            layer.moe.routed.set_gradient_group(meshes.expert_fsdp.get_group())
             fully_shard(
                 layer.moe.routed,
                 mesh=meshes.expert_fsdp,
@@ -71,7 +75,10 @@ def apply_fsdp2(
                 reshard_after_forward=reshard_after_forward,
             )
         fully_shard(layer, mesh=meshes.fsdp, reshard_after_forward=reshard_after_forward)
-    fully_shard(model, mesh=meshes.fsdp)
+    root_options = {"mesh": meshes.fsdp}
+    if ignored_params:
+        root_options["ignored_params"] = ignored_params
+    fully_shard(model, **root_options)
 
 
 __all__ = ["apply_fsdp2", "build_parallelism"]

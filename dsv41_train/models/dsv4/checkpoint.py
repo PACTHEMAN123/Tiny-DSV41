@@ -276,6 +276,7 @@ def load_dsv41_backbone_window(
     context_parallel: ContextParallel | None = None,
     token_dispatcher: TokenDispatcher | None = None,
     engram_mesh: DeviceMesh | None = None,
+    sparse_engram_gradients: bool = False,
 ) -> DeepSeekV41ForCausalLM:
     """Load a trainable prefix or source-anchored layer window."""
 
@@ -301,6 +302,7 @@ def load_dsv41_backbone_window(
             dispatcher,
             engram_mesh,
             layer_ids,
+            sparse_engram_gradients,
         )
 
     target_device = torch.device(device)
@@ -375,20 +377,6 @@ def load_dsv41_backbone_window(
             )
 
             routed = layer.moe.routed
-            gate_up = torch.empty(
-                routed.num_experts,
-                2 * config.moe_intermediate_size,
-                config.hidden_size,
-                device=target_device,
-                dtype=dtype,
-            )
-            down = torch.empty(
-                routed.num_experts,
-                config.hidden_size,
-                config.moe_intermediate_size,
-                device=target_device,
-                dtype=dtype,
-            )
             for local_id, global_id in enumerate(
                 range(routed.expert_start, routed.expert_start + routed.num_experts)
             ):
@@ -403,17 +391,14 @@ def load_dsv41_backbone_window(
                     read(f"{prefix}.w3.scale"),
                     dtype=dtype,
                 )
-                gate_up[local_id, : config.moe_intermediate_size].copy_(gate)
-                gate_up[local_id, config.moe_intermediate_size :].copy_(up)
-                down[local_id].copy_(
-                    dequantize_fp4_rows(
-                        read(f"{prefix}.w2.weight"),
-                        read(f"{prefix}.w2.scale"),
-                        dtype=dtype,
-                    )
+                state[f"{target}.moe.routed.gate_up.{local_id}"] = torch.cat(
+                    (gate, up), dim=0
                 )
-            state[f"{target}.moe.routed.gate_up"] = gate_up
-            state[f"{target}.moe.routed.down"] = down
+                state[f"{target}.moe.routed.down.{local_id}"] = dequantize_fp4_rows(
+                    read(f"{prefix}.w2.weight"),
+                    read(f"{prefix}.w2.scale"),
+                    dtype=dtype,
+                )
 
             compressor = layer.attention.compressor
             if compressor is not None:
@@ -519,6 +504,7 @@ def load_dsv41_backbone_prefix(
     context_parallel: ContextParallel | None = None,
     token_dispatcher: TokenDispatcher | None = None,
     engram_mesh: DeviceMesh | None = None,
+    sparse_engram_gradients: bool = False,
 ) -> DeepSeekV41ForCausalLM:
     """Load a trainable prefix directly from the released checkpoint."""
 
@@ -531,6 +517,7 @@ def load_dsv41_backbone_prefix(
         context_parallel=context_parallel,
         token_dispatcher=token_dispatcher,
         engram_mesh=engram_mesh,
+        sparse_engram_gradients=sparse_engram_gradients,
     )
 
 

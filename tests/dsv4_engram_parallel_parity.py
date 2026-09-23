@@ -20,7 +20,7 @@ def main() -> None:
             raise RuntimeError("this parity test requires exactly two ranks")
 
         mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("ep",))
-        table = RowShardedEmbedding(11, 3, mesh)
+        table = RowShardedEmbedding(11, 3, mesh, sparse_gradients=True)
         full_weight = torch.arange(33, dtype=torch.float32).view(11, 3)
         with torch.no_grad():
             table.weight.copy_(full_weight[table.row_start : table.row_stop])
@@ -35,7 +35,9 @@ def main() -> None:
         for index in global_indices:
             if table.row_start <= index < table.row_stop:
                 expected_gradient[index - table.row_start].fill_(1.0 / world_size)
-        torch.testing.assert_close(table.weight.grad, expected_gradient)
+        if table.weight.grad is None or not table.weight.grad.is_sparse:
+            raise AssertionError("Engram gradient must stay sparse")
+        torch.testing.assert_close(table.weight.grad.to_dense(), expected_gradient)
         if rank == 0:
             print("row-sharded Engram parity passed", flush=True)
     finally:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -57,20 +58,41 @@ class RoutedExperts(nn.Module):
         self.num_experts = expert_stop - self.expert_start
         self.intermediate = config.moe_intermediate_size
         self.limit = config.swiglu_limit
-        self.gate_up = nn.Parameter(
-            torch.empty(self.num_experts, 2 * self.intermediate, config.hidden_size)
+        self.gate_up = nn.ParameterList(
+            nn.Parameter(torch.empty(2 * self.intermediate, config.hidden_size))
+            for _ in range(self.num_experts)
         )
-        self.down = nn.Parameter(
-            torch.empty(self.num_experts, config.hidden_size, self.intermediate)
+        self.down = nn.ParameterList(
+            nn.Parameter(torch.empty(config.hidden_size, self.intermediate))
+            for _ in range(self.num_experts)
         )
+        self.gradient_group = None
+
+    @property
+    def local_parameter_count(self) -> int:
+        return sum(parameter.numel() for parameter in (*self.gate_up, *self.down))
+
+    def set_gradient_group(self, group) -> None:
+        self.gradient_group = group
 
     def forward(
         self, x: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor
     ) -> torch.Tensor:
         x, indices, weights, metadata = self.dispatcher.dispatch(x, indices, weights)
         output = torch.zeros_like(x, dtype=torch.float32)
-        for expert_id in indices.unique():
+        used = torch.zeros(self.num_experts, dtype=torch.int32, device=indices.device)
+        used.scatter_(0, indices, 1)
+        if self.gradient_group is not None:
+            dist.all_reduce(used, op=dist.ReduceOp.MAX, group=self.gradient_group)
+        for expert_id in used.nonzero().flatten().tolist():
             token_ids = torch.where(indices == expert_id)[0]
+            if token_ids.numel() == 0:
+                anchor = (
+                    self.gate_up[expert_id].flatten()[0]
+                    + self.down[expert_id].flatten()[0]
+                )
+                output = output + anchor.to(output.dtype) * 0
+                continue
             current = x[token_ids]
             gate, up = F.linear(current, self.gate_up[expert_id]).chunk(2, dim=-1)
             current = _clamped_swiglu(gate, up, self.limit)
@@ -78,9 +100,7 @@ class RoutedExperts(nn.Module):
             current = F.linear(current.to(x.dtype), self.down[expert_id])
             output.index_add_(0, token_ids, current.float())
         output = self.dispatcher.combine(output, metadata)
-        # Empty EP ranks must still run the same FSDP gradient collective.
-        anchor = self.gate_up.reshape(-1)[0] + self.down.reshape(-1)[0]
-        return output + anchor.to(output.dtype) * 0
+        return output
 
 
 class SharedExpert(nn.Module):

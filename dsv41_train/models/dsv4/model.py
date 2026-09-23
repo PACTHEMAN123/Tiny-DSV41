@@ -144,6 +144,7 @@ class RowShardedEmbedding(nn.Module):
         num_embeddings: int,
         embedding_dim: int,
         mesh: DeviceMesh | None = None,
+        sparse_gradients: bool = False,
     ) -> None:
         super().__init__()
         if mesh is not None and mesh.ndim != 1:
@@ -151,6 +152,7 @@ class RowShardedEmbedding(nn.Module):
         self.global_num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.mesh = mesh
+        self.sparse_gradients = sparse_gradients
         self.size = 1 if mesh is None else mesh.size()
         self.rank = 0 if mesh is None else mesh.get_local_rank()
         self.group = None if mesh is None else mesh.get_group()
@@ -164,7 +166,7 @@ class RowShardedEmbedding(nn.Module):
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         if self.size == 1:
-            return F.embedding(indices, self.weight)
+            return F.embedding(indices, self.weight, sparse=self.sparse_gradients)
         if indices.numel() and (indices.min() < 0 or indices.max() >= self.global_num_embeddings):
             raise IndexError("embedding index is outside the configured row range")
 
@@ -187,7 +189,11 @@ class RowShardedEmbedding(nn.Module):
         routed = self._exchange(
             flat[order].contiguous(), recv_splits, send_splits, autograd=False
         )
-        rows = F.embedding(routed - self.row_start, self.weight)
+        rows = F.embedding(
+            routed - self.row_start,
+            self.weight,
+            sparse=self.sparse_gradients,
+        )
         rows = _ScaleGradient.apply(rows, 1.0 / self.size)
         returned = self._exchange(
             rows.contiguous(), send_splits, recv_splits, autograd=True
@@ -648,6 +654,7 @@ class DeepSeekV41Model(nn.Module):
         token_dispatcher: TokenDispatcher | None = None,
         engram_mesh: DeviceMesh | None = None,
         layer_ids: list[int] | None = None,
+        sparse_engram_gradients: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -684,7 +691,10 @@ class DeepSeekV41Model(nn.Module):
         self.engram_tables = nn.ModuleDict(
             {
                 str(layer_id): RowShardedEmbedding(
-                    table_sizes[layer_id], config.engram_head_dim, engram_mesh
+                    table_sizes[layer_id],
+                    config.engram_head_dim,
+                    engram_mesh,
+                    sparse_gradients=sparse_engram_gradients,
                 )
                 for layer_id in self.engram_layer_ids
             }
@@ -800,6 +810,7 @@ class DeepSeekV41ForCausalLM(nn.Module):
         token_dispatcher: TokenDispatcher | None = None,
         engram_mesh: DeviceMesh | None = None,
         layer_ids: list[int] | None = None,
+        sparse_engram_gradients: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -810,6 +821,7 @@ class DeepSeekV41ForCausalLM(nn.Module):
             token_dispatcher,
             engram_mesh,
             layer_ids,
+            sparse_engram_gradients,
         )
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._initialize)
@@ -832,14 +844,20 @@ class DeepSeekV41ForCausalLM(nn.Module):
             nn.init.normal_(module.weight, std=std)
             nn.init.zeros_(module.selection_bias)
         elif isinstance(module, RoutedExperts):
+            if not module.gate_up or module.gate_up[0].is_meta:
+                return
             if module.num_experts == module.global_num_experts:
-                nn.init.normal_(module.gate_up, std=std)
-                nn.init.normal_(module.down, std=std)
+                for parameter in module.gate_up:
+                    nn.init.normal_(parameter, std=std)
+                for parameter in module.down:
+                    nn.init.normal_(parameter, std=std)
             else:
-                generator = torch.Generator(device=module.gate_up.device)
+                generator = torch.Generator(device=module.gate_up[0].device)
                 generator.manual_seed(torch.initial_seed() + module.expert_start)
-                nn.init.normal_(module.gate_up, std=std, generator=generator)
-                nn.init.normal_(module.down, std=std, generator=generator)
+                for parameter in module.gate_up:
+                    nn.init.normal_(parameter, std=std, generator=generator)
+                for parameter in module.down:
+                    nn.init.normal_(parameter, std=std, generator=generator)
 
     def forward(
         self,
