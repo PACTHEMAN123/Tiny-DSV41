@@ -6,8 +6,10 @@ from pathlib import Path
 
 import torch
 
+from dsv41_train.models.dsv4 import DeepSeekV41Config
 from dsv41_train.models.dsv4.checkpoint import (
     ShardedSafeTensorReader,
+    _prefix_config,
     dequantize_fp4_rows,
     dequantize_fp8_blocks,
     dequantize_fp8_rows,
@@ -33,6 +35,25 @@ def write_safetensors(path: Path, tensors: dict[str, torch.Tensor]) -> None:
 
 
 class DSV4CheckpointTest(unittest.TestCase):
+    def test_prefix_config_includes_the_second_engram_layer(self):
+        config = DeepSeekV41Config(
+            engram_layer_ids=[1, 14],
+            engram_num_embeddings=[100, 200],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "config.json").write_text(
+                json.dumps(config.to_dict()), encoding="utf-8"
+            )
+
+            prefix = _prefix_config(folder, 15)
+
+            self.assertEqual(prefix.num_hidden_layers, 15)
+            self.assertEqual(prefix.engram_layer_ids, [1, 14])
+            self.assertEqual(prefix.engram_num_embeddings, [100, 200])
+            with self.assertRaisesRegex(NotImplementedError, "fifteen"):
+                _prefix_config(folder, 16)
+
     def test_reads_an_indexed_safetensors_file_without_safetensors_package(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
