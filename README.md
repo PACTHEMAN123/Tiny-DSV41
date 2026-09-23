@@ -36,9 +36,10 @@ runs both write DCP checkpoints to `outputs/final/checkpoint/step-N/`.
 The checkpoint-backed entry point reads the released sharded safetensors with
 the Python standard library, dequantizes FP8/FP4 weights with PyTorch, and does
 not require Transformers or the `safetensors` package. The validated full-prefix
-scope covers layers 0-8, including row-sharded Engram memory and the compressed
-KV/index refreshes at layers 2 and 8. EP owns 48 experts per rank, Engram rows
-are distributed across the full world mesh, and FSDP shards dense parameters.
+scope covers layers 0-14, including both row-sharded Engram tables and the
+compressed KV/index refreshes at layers 2, 8, and 14. EP owns 48 experts per
+rank, Engram rows are distributed across the full world mesh, and FSDP shards
+dense parameters.
 
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \

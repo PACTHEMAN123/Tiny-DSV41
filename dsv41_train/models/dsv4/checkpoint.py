@@ -244,9 +244,9 @@ def dequantize_fp4_rows(
 
 def _prefix_config(folder: Path, num_layers: int) -> DeepSeekV41Config:
     full = DeepSeekV41Config.from_json(folder / "config.json")
-    if not 1 <= num_layers <= 15:
+    if not 1 <= num_layers <= 20:
         raise NotImplementedError(
-            "a full checkpoint prefix supports one to fifteen real layers"
+            "a full checkpoint prefix supports one to twenty real layers"
         )
     values = full.to_dict()
     values["num_hidden_layers"] = num_layers
