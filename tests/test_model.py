@@ -3,14 +3,44 @@ from unittest.mock import Mock, call, patch
 
 import torch
 
-from dsv41_train.dispatch import TokenDispatcher
+from dsv41_train.dispatch import DispatchMetadata, TokenDispatcher
 from dsv41_train.models.dsv4 import DeepSeekV41Config, DeepSeekV41ForCausalLM
 from dsv41_train.models.dsv4.model import NgramHash
+from dsv41_train.models.dsv4.moe import RoutedExperts
 from dsv41_train.models.dsv4.parallel import apply_fsdp2
 from dsv41_train.parallel import ContextParallel, ParallelMeshes
 
 
 class ModelTest(unittest.TestCase):
+    def test_empty_expert_route_keeps_zero_gradient_dependency(self):
+        class EmptyReceiveDispatcher(TokenDispatcher):
+            def dispatch(self, hidden, expert_ids, weights):
+                metadata = DispatchMetadata(
+                    token_count=hidden.shape[0], topk=expert_ids.shape[-1]
+                )
+                return (
+                    hidden[:0],
+                    expert_ids.reshape(-1)[:0],
+                    weights.reshape(-1)[:0],
+                    metadata,
+                )
+
+            def combine(self, hidden, metadata):
+                return hidden.new_zeros(metadata.token_count, hidden.shape[-1])
+
+        config = DeepSeekV41Config.tiny()
+        experts = RoutedExperts(config, EmptyReceiveDispatcher())
+        hidden = torch.randn(3, config.hidden_size)
+        expert_ids = torch.zeros(3, config.num_experts_per_tok, dtype=torch.long)
+        weights = torch.ones(3, config.num_experts_per_tok)
+
+        experts(hidden, expert_ids, weights).sum().backward()
+
+        self.assertIsNotNone(experts.gate_up.grad)
+        self.assertIsNotNone(experts.down.grad)
+        self.assertEqual(experts.gate_up.grad.count_nonzero().item(), 0)
+        self.assertEqual(experts.down.grad.count_nonzero().item(), 0)
+
     def test_layer_window_selects_global_layers(self):
         config = DeepSeekV41Config.tiny()
         with torch.device("meta"):

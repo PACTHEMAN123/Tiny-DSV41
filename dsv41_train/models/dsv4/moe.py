@@ -77,7 +77,10 @@ class RoutedExperts(nn.Module):
             current = current * weights[token_ids, None]
             current = F.linear(current.to(x.dtype), self.down[expert_id])
             output.index_add_(0, token_ids, current.float())
-        return self.dispatcher.combine(output, metadata)
+        output = self.dispatcher.combine(output, metadata)
+        # Empty EP ranks must still run the same FSDP gradient collective.
+        anchor = self.gate_up.reshape(-1)[0] + self.down.reshape(-1)[0]
+        return output + anchor.to(output.dtype) * 0
 
 
 class SharedExpert(nn.Module):
