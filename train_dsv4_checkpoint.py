@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--steps", type=int, default=1)
-    parser.add_argument("--num-layers", type=int, choices=(1, 2, 3), default=1)
+    parser.add_argument("--num-layers", type=int, choices=range(1, 10), default=1)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1.0e-4)
