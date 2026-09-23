@@ -73,7 +73,7 @@ Validate rendezvous and NCCL collectives before loading the checkpoint. Run the
 same command on both nodes, changing only `--node-rank` from `0` to `1`:
 
 ```bash
-NCCL_SOCKET_IFNAME=eth0 GLOO_SOCKET_IFNAME=eth0 \
+PYTHONPATH=. NCCL_SOCKET_IFNAME=eth0 GLOO_SOCKET_IFNAME=eth0 \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 python -m torch.distributed.run \
   --nnodes=2 --nproc-per-node=8 --node-rank=0 \
