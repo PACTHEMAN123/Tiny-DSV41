@@ -37,8 +37,8 @@ The checkpoint-backed entry point reads the released sharded safetensors with
 the Python standard library, dequantizes FP8/FP4 weights with PyTorch, and does
 not require Transformers or the `safetensors` package. The validated full-prefix
 scope covers layers 0-8, including row-sharded Engram memory and the compressed
-KV/index refreshes at layers 2 and 8. EP owns 48 experts and one eighth of the
-Engram table per rank while FSDP shards dense parameters across eight ranks.
+KV/index refreshes at layers 2 and 8. EP owns 48 experts per rank, Engram rows
+are distributed across the full world mesh, and FSDP shards dense parameters.
 
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -83,7 +83,8 @@ python -m torch.distributed.run \
 
 The real-weight command uses the same launcher options. With 16 ranks,
 `--ep-size 8 --cp-size 1` keeps eight-way expert parallelism and adds two-way
-FSDP for each expert and Engram shard, while dense parameters use FSDP16:
+FSDP for each expert shard, while dense parameters use FSDP16. Engram remains
+independent of EP8 and row-shards directly across all 16 ranks:
 
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \

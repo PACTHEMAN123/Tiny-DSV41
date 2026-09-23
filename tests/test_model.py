@@ -80,6 +80,8 @@ class ModelTest(unittest.TestCase):
                         fsdp=Mock(), cp=None,
                         ep=Mock() if expert_parallel else None,
                         expert_fsdp=Mock() if expert_parallel else None,
+                        engram=Mock() if expert_parallel else None,
+                        engram_fsdp=Mock() if expert_parallel else None,
                     )
                     try:
                         from torch.distributed.fsdp import fully_shard
@@ -93,7 +95,7 @@ class ModelTest(unittest.TestCase):
                     if expert_parallel:
                         for table in model.model.engram_tables.values():
                             expected.append(call(
-                                table, mesh=meshes.expert_fsdp,
+                                table, mesh=meshes.engram_fsdp,
                                 reshard_after_forward=False,
                             ))
                     for layer in model.model.layers:

@@ -1,5 +1,9 @@
 """DSV4 parallel topology and FSDP wrapping."""
 
+from dataclasses import replace
+
+import torch.distributed as dist
+
 from ...dispatch import AllToAllTokenDispatcher, TokenDispatcher
 from ...parallel import ContextParallel, ParallelMeshes
 from .model import DeepSeekV41ForCausalLM, DeepSeekV41Model
@@ -11,6 +15,19 @@ def build_parallelism(
     device_type: str = "cuda",
 ) -> tuple[ParallelMeshes, ContextParallel, TokenDispatcher]:
     meshes = ParallelMeshes.build(cp=cp, ep=ep, device_type=device_type)
+    from torch.distributed.device_mesh import init_device_mesh
+
+    engram_sparse = init_device_mesh(
+        device_type,
+        (dist.get_world_size(), 1),
+        mesh_dim_names=("engram", "engram_fsdp"),
+    )
+    meshes = replace(
+        meshes,
+        engram=engram_sparse["engram"],
+        engram_fsdp=engram_sparse["engram_fsdp"],
+        _engram_sparse=engram_sparse,
+    )
     dispatcher = (
         AllToAllTokenDispatcher(meshes.ep) if meshes.ep is not None else TokenDispatcher()
     )
@@ -29,12 +46,14 @@ def apply_fsdp2(
         from torch.distributed._composable.fsdp import fully_shard
 
     decoder = model.model if isinstance(model, DeepSeekV41ForCausalLM) else model
-    if meshes.ep is not None:
-        assert meshes.expert_fsdp is not None
+    engram_fsdp = (
+        meshes.engram_fsdp if meshes.engram_fsdp is not None else meshes.expert_fsdp
+    )
+    if engram_fsdp is not None:
         for table in decoder.engram_tables.values():
             fully_shard(
                 table,
-                mesh=meshes.expert_fsdp,
+                mesh=engram_fsdp,
                 reshard_after_forward=reshard_after_forward,
             )
     for layer in decoder.layers:

@@ -36,7 +36,7 @@ class _AllGather(torch.autograd.Function):
 
 @dataclass(frozen=True)
 class ParallelMeshes:
-    """The four mesh views needed by dense weights, contexts, and experts."""
+    """Mesh views for dense weights, contexts, experts, and Engram rows."""
 
     fsdp: DeviceMesh
     cp: DeviceMesh | None
@@ -44,6 +44,9 @@ class ParallelMeshes:
     expert_fsdp: DeviceMesh | None
     _dense: DeviceMesh | None = None
     _sparse: DeviceMesh | None = None
+    engram: DeviceMesh | None = None
+    engram_fsdp: DeviceMesh | None = None
+    _engram_sparse: DeviceMesh | None = None
 
     @classmethod
     def build(

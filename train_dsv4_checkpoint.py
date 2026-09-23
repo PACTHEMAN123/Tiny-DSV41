@@ -88,7 +88,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         dtype=torch.bfloat16,
         context_parallel=context_parallel,
         token_dispatcher=token_dispatcher,
-        engram_mesh=meshes.ep,
+        engram_mesh=meshes.engram,
         num_layers=args.num_layers,
     )
     model.train()
@@ -183,6 +183,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         "ep_size": args.ep_size,
         "fsdp_size": meshes.fsdp.size(),
         "experts_per_rank": routed.num_experts,
+        "engram_size": meshes.engram.size() if meshes.engram is not None else 1,
         "engram_rows_per_rank": sum(
             table.weight.shape[0] for table in model.model.engram_tables.values()
         ),
