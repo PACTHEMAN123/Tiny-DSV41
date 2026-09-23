@@ -244,9 +244,9 @@ def dequantize_fp4_rows(
 
 def _prefix_config(folder: Path, num_layers: int) -> DeepSeekV41Config:
     full = DeepSeekV41Config.from_json(folder / "config.json")
-    if not 1 <= num_layers <= 9:
+    if not 1 <= num_layers <= 10:
         raise NotImplementedError(
-            "checkpoint-backed training currently supports one to nine real layers"
+            "checkpoint-backed training currently supports one to ten real layers"
         )
     values = full.to_dict()
     values["num_hidden_layers"] = num_layers
