@@ -35,24 +35,37 @@ runs both write DCP checkpoints to `outputs/final/checkpoint/step-N/`.
 
 The checkpoint-backed entry point reads the released sharded safetensors with
 the Python standard library, dequantizes FP8/FP4 weights with PyTorch, and does
-not require Transformers or the `safetensors` package. The bring-up scope covers
-the first three real layers: embeddings, all 384 routed experts per layer,
-shared experts, attention, mHC, row-sharded Engram memory, the first compressed
-KV/indexer source, final norm, and LM head. EP owns 48 experts and one eighth of
-the Engram table per rank while FSDP shards dense parameters across eight ranks.
+not require Transformers or the `safetensors` package. The validated full-prefix
+scope covers layers 0-8, including row-sharded Engram memory and the compressed
+KV/index refreshes at layers 2 and 8. EP owns 48 experts and one eighth of the
+Engram table per rank while FSDP shards dense parameters across eight ranks.
 
 ```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 python -m torch.distributed.run --standalone --nproc-per-node=8 \
   train_dsv4_checkpoint.py \
   --model-path /path/to/DeepSeek-V4.1-Flash \
-  --num-layers 3 \
+  --num-layers 9 \
   --ep-size 8 --cp-size 1 --steps 1 --batch-size 1 --seq-len 8
 ```
 
-This is a real-weight forward/backward/optimizer validation, not yet the full
-40-layer training recipe. Layers after this checkpoint reuse the compressed KV
-and sparse index state until a later layer refreshes them.
+Use `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for prefixes of seven or
+more layers. Nine layers are the measured 8xH20 capacity limit for this BF16
+training smoke. Later layers can be validated in a real-weight window anchored
+at a KV source layer:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python -m torch.distributed.run --standalone --nproc-per-node=8 \
+  train_dsv4_checkpoint.py \
+  --model-path /path/to/DeepSeek-V4.1-Flash \
+  --start-layer 8 --num-layers 6 \
+  --ep-size 8 --cp-size 1 --steps 1 --batch-size 1 --seq-len 8
+```
+
+Window mode verifies the selected layers and their shared compressed state; it
+is explicitly not an end-to-end prefix or a full 40-layer training recipe.
 
 ## Qwen
 

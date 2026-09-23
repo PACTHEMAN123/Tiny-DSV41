@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from dsv41_train.models.dsv4 import load_dsv41_backbone_prefix
+from dsv41_train.models.dsv4 import load_dsv41_backbone_window
 from dsv41_train.models.dsv4.parallel import apply_fsdp2, build_parallelism
 from dsv41_train.runtime import Runtime, distributed_mean, initialize_runtime, local_tensor
 
@@ -19,7 +19,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--steps", type=int, default=1)
-    parser.add_argument("--num-layers", type=int, choices=range(1, 11), default=1)
+    parser.add_argument("--start-layer", type=int, default=0)
+    parser.add_argument("--num-layers", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1.0e-4)
@@ -38,8 +39,12 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
     for filename in ("config.json", "model.safetensors.index.json"):
         if not (model_path / filename).is_file():
             raise FileNotFoundError(f"checkpoint file does not exist: {model_path / filename}")
-    if args.steps < 1 or args.batch_size < 1 or args.seq_len < 2:
-        raise ValueError("steps and batch-size must be positive; seq-len must be at least 2")
+    if args.steps < 1 or args.batch_size < 1 or args.num_layers < 1 or args.seq_len < 2:
+        raise ValueError(
+            "steps, batch-size, and num-layers must be positive; seq-len must be at least 2"
+        )
+    if args.start_layer < 0:
+        raise ValueError("start-layer must be non-negative")
     if args.learning_rate <= 0:
         raise ValueError("learning-rate must be positive")
     if args.cp_size < 1 or args.ep_size < 1:
@@ -62,8 +67,9 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
     )
 
     started = time.perf_counter()
-    model = load_dsv41_backbone_prefix(
+    model = load_dsv41_backbone_window(
         args.model_path,
+        start_layer=args.start_layer,
         device=runtime.device,
         dtype=torch.bfloat16,
         context_parallel=context_parallel,
@@ -83,7 +89,8 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         table.weight.numel() for table in model.model.engram_tables.values()
     )
     global_engram_parameters = sum(
-        rows * model.config.engram_head_dim for rows in model.config.engram_num_embeddings
+        table.global_num_embeddings * model.config.engram_head_dim
+        for table in model.model.engram_tables.values()
     )
     local_parameter_count = sum(parameter.numel() for parameter in model.parameters())
     full_parameter_count = (
@@ -142,7 +149,12 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
     torch.cuda.synchronize(runtime.device)
     finished = time.perf_counter()
     metrics: dict[str, float | int | str] = {
-        "model": f"DeepSeek-V4.1-Flash {args.num_layers}-layer prefix",
+        "model": (
+            f"DeepSeek-V4.1-Flash {args.num_layers}-layer prefix"
+            if args.start_layer == 0
+            else f"DeepSeek-V4.1-Flash layers {args.start_layer}-"
+            f"{args.start_layer + args.num_layers - 1} window"
+        ),
         "checkpoint": str(Path(args.model_path).resolve()),
         "parameters": full_parameter_count,
         "local_parameters_before_fsdp": local_parameter_count,
@@ -157,6 +169,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         "steps": args.steps,
         "batch_size_per_rank": args.batch_size,
         "sequence_length": args.seq_len,
+        "start_layer": args.start_layer,
         "optimizer": args.optimizer,
         "loss": last_loss,
         "aux_loss": last_aux_loss,

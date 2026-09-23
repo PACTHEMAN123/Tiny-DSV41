@@ -483,12 +483,22 @@ def _next_prime(value: int, used: set[int]) -> int:
 
 
 class NgramHash(nn.Module):
-    def __init__(self, config: DeepSeekV41Config) -> None:
+    def __init__(
+        self,
+        config: DeepSeekV41Config,
+        layer_ids: list[int] | None = None,
+    ) -> None:
         super().__init__()
         self.max_ngram = config.engram_max_ngram_size
         self.pad_id = config.engram_pad_id % config.engram_compressed_vocab_size
+        layer_ids = list(config.engram_layer_ids if layer_ids is None else layer_ids)
+        if not set(layer_ids).issubset(config.engram_layer_ids):
+            raise ValueError("Engram hash layers must be configured Engram layers")
+        selected = set(layer_ids)
         layer_primes, layer_offsets, used = [], [], set()
-        for table_size in config.engram_num_embeddings:
+        for layer_id, table_size in zip(
+            config.engram_layer_ids, config.engram_num_embeddings
+        ):
             primes, offsets, offset = [], [], 0
             current = config.engram_vocab_size - 1
             for _ in range((self.max_ngram - 1) * config.engram_n_heads):
@@ -499,16 +509,17 @@ class NgramHash(nn.Module):
                 offset += current
             if offset > table_size:
                 raise ValueError(f"engram table needs {offset} rows, got {table_size}")
-            layer_primes.append(primes)
-            layer_offsets.append(offsets)
+            if layer_id in selected:
+                layer_primes.append(primes)
+                layer_offsets.append(offsets)
 
         primes = torch.tensor(layer_primes).view(
-            len(config.engram_layer_ids), self.max_ngram - 1, config.engram_n_heads
+            len(layer_ids), self.max_ngram - 1, config.engram_n_heads
         )
         offsets = torch.tensor(layer_offsets)
         bound = max(2, ((2**63 - 1) // config.engram_compressed_vocab_size) // 2)
         multipliers = []
-        for layer_id in config.engram_layer_ids:
+        for layer_id in layer_ids:
             values = [((layer_id + 1) * 1000003 + (i + 1) * 9176) % bound for i in range(self.max_ngram)]
             multipliers.append([2 * value + 1 for value in values])
         self.compressed_vocab_size = config.engram_compressed_vocab_size
@@ -636,11 +647,20 @@ class DeepSeekV41Model(nn.Module):
         context_parallel: ContextParallel | None = None,
         token_dispatcher: TokenDispatcher | None = None,
         engram_mesh: DeviceMesh | None = None,
+        layer_ids: list[int] | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.context_parallel = context_parallel or ContextParallel()
         token_dispatcher = token_dispatcher or TokenDispatcher()
+        layer_ids = (
+            list(range(config.num_hidden_layers)) if layer_ids is None else layer_ids
+        )
+        if not layer_ids or any(
+            not 0 <= layer_id < config.num_hidden_layers for layer_id in layer_ids
+        ):
+            raise ValueError("layer_ids must select at least one configured layer")
+        self.layer_ids = list(layer_ids)
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.rotary = RotaryEmbedding(config)
         self.layers = nn.ModuleList(
@@ -651,16 +671,22 @@ class DeepSeekV41Model(nn.Module):
                 self.context_parallel,
                 token_dispatcher,
             )
-            for layer_id in range(config.num_hidden_layers)
+            for layer_id in self.layer_ids
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.hash = NgramHash(config) if config.engram_layer_ids else None
+        table_sizes = dict(zip(config.engram_layer_ids, config.engram_num_embeddings))
+        self.engram_layer_ids = [
+            layer_id for layer_id in config.engram_layer_ids if layer_id in self.layer_ids
+        ]
+        self.hash = (
+            NgramHash(config, self.engram_layer_ids) if self.engram_layer_ids else None
+        )
         self.engram_tables = nn.ModuleDict(
             {
                 str(layer_id): RowShardedEmbedding(
-                    config.engram_num_embeddings[index], config.engram_head_dim, engram_mesh
+                    table_sizes[layer_id], config.engram_head_dim, engram_mesh
                 )
-                for index, layer_id in enumerate(config.engram_layer_ids)
+                for layer_id in self.engram_layer_ids
             }
         )
 
@@ -692,7 +718,7 @@ class DeepSeekV41Model(nn.Module):
         engram_rows: dict[int, torch.Tensor] = {}
         if hashes is not None:
             hashes = self.context_parallel.shard(hashes)
-            for index, layer_id in enumerate(self.config.engram_layer_ids):
+            for index, layer_id in enumerate(self.engram_layer_ids):
                 engram_rows[layer_id] = self.engram_tables[str(layer_id)](hashes[:, :, index])
 
         shared: dict[str, torch.Tensor | None] = {}
@@ -773,12 +799,17 @@ class DeepSeekV41ForCausalLM(nn.Module):
         context_parallel: ContextParallel | None = None,
         token_dispatcher: TokenDispatcher | None = None,
         engram_mesh: DeviceMesh | None = None,
+        layer_ids: list[int] | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.context_parallel = context_parallel or ContextParallel()
         self.model = DeepSeekV41Model(
-            config, self.context_parallel, token_dispatcher, engram_mesh
+            config,
+            self.context_parallel,
+            token_dispatcher,
+            engram_mesh,
+            layer_ids,
         )
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._initialize)

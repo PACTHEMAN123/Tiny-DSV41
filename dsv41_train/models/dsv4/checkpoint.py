@@ -244,9 +244,9 @@ def dequantize_fp4_rows(
 
 def _prefix_config(folder: Path, num_layers: int) -> DeepSeekV41Config:
     full = DeepSeekV41Config.from_json(folder / "config.json")
-    if not 1 <= num_layers <= 10:
+    if not 1 <= num_layers <= 9:
         raise NotImplementedError(
-            "checkpoint-backed training currently supports one to ten real layers"
+            "a full checkpoint prefix is validated for one to nine real layers"
         )
     values = full.to_dict()
     values["num_hidden_layers"] = num_layers
@@ -266,9 +266,10 @@ def _prefix_config(folder: Path, num_layers: int) -> DeepSeekV41Config:
     return DeepSeekV41Config(**values)
 
 
-def load_dsv41_backbone_prefix(
+def load_dsv41_backbone_window(
     folder: str | Path,
     *,
+    start_layer: int = 0,
     num_layers: int = 1,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.bfloat16,
@@ -276,14 +277,30 @@ def load_dsv41_backbone_prefix(
     token_dispatcher: TokenDispatcher | None = None,
     engram_mesh: DeviceMesh | None = None,
 ) -> DeepSeekV41ForCausalLM:
-    """Load a trainable prefix directly from the released quantized checkpoint."""
+    """Load a trainable prefix or source-anchored layer window."""
 
     folder = Path(folder)
-    config = _prefix_config(folder, num_layers)
+    if start_layer == 0:
+        config = _prefix_config(folder, num_layers)
+        layer_ids = list(range(num_layers))
+    else:
+        config = DeepSeekV41Config.from_json(folder / "config.json")
+        stop_layer = start_layer + num_layers
+        if num_layers < 1 or not 0 < start_layer < stop_layer <= config.num_hidden_layers:
+            raise ValueError("the layer window must be inside the checkpoint backbone")
+        if start_layer not in config.kv_source_layer_ids:
+            raise ValueError(
+                "a non-prefix layer window must start at a KV source layer"
+            )
+        layer_ids = list(range(start_layer, stop_layer))
     dispatcher = token_dispatcher or TokenDispatcher()
     with torch.device("meta"):
         model = DeepSeekV41ForCausalLM(
-            config, context_parallel, dispatcher, engram_mesh
+            config,
+            context_parallel,
+            dispatcher,
+            engram_mesh,
+            layer_ids,
         )
 
     target_device = torch.device(device)
@@ -307,9 +324,10 @@ def load_dsv41_backbone_prefix(
             }
         )
 
-        for layer_id, layer in enumerate(model.model.layers):
+        for local_layer_id, layer in enumerate(model.model.layers):
+            layer_id = layer.layer_id
             source = f"layers.{layer_id}"
-            target = f"model.layers.{layer_id}"
+            target = f"model.layers.{local_layer_id}"
             state.update(
                 {
                     f"{target}.attention_hc.base": read(f"{source}.hc_attn_base"),
@@ -484,10 +502,36 @@ def load_dsv41_backbone_prefix(
         )
     )
     if model.model.hash is not None:
-        model.model.hash = NgramHash(config).to(target_device)
+        model.model.hash = NgramHash(
+            config, model.model.engram_layer_ids
+        ).to(target_device)
     if any(parameter.is_meta for parameter in model.parameters()):
         raise RuntimeError("checkpoint loading left meta parameters in the model")
     return model
+
+
+def load_dsv41_backbone_prefix(
+    folder: str | Path,
+    *,
+    num_layers: int = 1,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.bfloat16,
+    context_parallel: ContextParallel | None = None,
+    token_dispatcher: TokenDispatcher | None = None,
+    engram_mesh: DeviceMesh | None = None,
+) -> DeepSeekV41ForCausalLM:
+    """Load a trainable prefix directly from the released checkpoint."""
+
+    return load_dsv41_backbone_window(
+        folder,
+        start_layer=0,
+        num_layers=num_layers,
+        device=device,
+        dtype=dtype,
+        context_parallel=context_parallel,
+        token_dispatcher=token_dispatcher,
+        engram_mesh=engram_mesh,
+    )
 
 
 __all__ = [
@@ -496,4 +540,5 @@ __all__ = [
     "dequantize_fp8_blocks",
     "dequantize_fp8_rows",
     "load_dsv41_backbone_prefix",
+    "load_dsv41_backbone_window",
 ]

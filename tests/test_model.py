@@ -5,11 +5,41 @@ import torch
 
 from dsv41_train.dispatch import TokenDispatcher
 from dsv41_train.models.dsv4 import DeepSeekV41Config, DeepSeekV41ForCausalLM
+from dsv41_train.models.dsv4.model import NgramHash
 from dsv41_train.models.dsv4.parallel import apply_fsdp2
 from dsv41_train.parallel import ContextParallel, ParallelMeshes
 
 
 class ModelTest(unittest.TestCase):
+    def test_layer_window_selects_global_layers(self):
+        config = DeepSeekV41Config.tiny()
+        with torch.device("meta"):
+            model = DeepSeekV41ForCausalLM(config, layer_ids=[3, 4])
+
+        self.assertEqual([layer.layer_id for layer in model.model.layers], [3, 4])
+        self.assertEqual(list(model.model.engram_tables), [])
+
+    def test_selected_engram_hash_preserves_global_prime_sequence(self):
+        config = DeepSeekV41Config(
+            num_hidden_layers=4,
+            compress_ratios=[0, 0, 0, 0],
+            kv_source_layer_ids=[],
+            index_source_layer_ids=[],
+            candidate_source_layer_id=-1,
+            engram_layer_ids=[1, 3],
+            engram_num_embeddings=[100, 100],
+            engram_vocab_size=31,
+            engram_max_ngram_size=3,
+            engram_n_heads=1,
+        )
+
+        full = NgramHash(config)
+        selected = NgramHash(config, [3])
+
+        torch.testing.assert_close(selected.primes[0], full.primes[1])
+        torch.testing.assert_close(selected.offsets[0], full.offsets[1])
+        torch.testing.assert_close(selected.multipliers[0], full.multipliers[1])
+
     def test_dsv4_fsdp_wraps_experts_before_layers_and_root(self):
         with torch.device("meta"):
             model = DeepSeekV41ForCausalLM(DeepSeekV41Config.tiny())
