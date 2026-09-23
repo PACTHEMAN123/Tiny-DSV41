@@ -6,10 +6,28 @@ from unittest.mock import patch
 import torch
 
 import train
+import train_dsv4_checkpoint
 from dsv41_train import runtime as training_runtime
 
 
 class TrainTest(unittest.TestCase):
+    def test_parameter_delta_handles_an_empty_fsdp_shard(self):
+        before = torch.empty(0, 4)
+        after = torch.empty(0, 4)
+
+        actual = train_dsv4_checkpoint.maximum_parameter_delta(before, after)
+
+        self.assertEqual(actual.dtype, torch.float32)
+        self.assertEqual(actual.item(), 0)
+
+    def test_parameter_delta_uses_the_largest_local_change(self):
+        before = torch.tensor([1.0, 2.0])
+        after = torch.tensor([1.25, 1.5])
+
+        actual = train_dsv4_checkpoint.maximum_parameter_delta(before, after)
+
+        self.assertEqual(actual.item(), 0.5)
+
     def test_make_batch_is_reproducible_with_an_explicit_generator(self):
         first = torch.Generator().manual_seed(123)
         second = torch.Generator().manual_seed(123)

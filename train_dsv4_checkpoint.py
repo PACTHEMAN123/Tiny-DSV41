@@ -21,6 +21,14 @@ def distributed_trace(runtime: Runtime, event: str) -> None:
         print(json.dumps({"trace": event, "rank": runtime.rank}), flush=True)
 
 
+def maximum_parameter_delta(before: torch.Tensor, after: torch.Tensor) -> torch.Tensor:
+    if before.shape != after.shape:
+        raise ValueError("parameter snapshots must have matching shapes")
+    if after.numel() == 0:
+        return torch.zeros((), dtype=torch.float32, device=after.device)
+    return (after.float() - before.float()).abs().max()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
@@ -149,8 +157,8 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
             )
 
     distributed_trace(runtime, "parameter_delta_start")
-    after = local_tensor(tracked).detach().float()
-    parameter_delta = (after - before).abs().max()
+    after = local_tensor(tracked).detach()
+    parameter_delta = maximum_parameter_delta(before, after)
     distributed_trace(runtime, "parameter_delta_local_complete")
     dist.all_reduce(parameter_delta, op=dist.ReduceOp.MAX)
     distributed_trace(runtime, "parameter_delta_reduced")
