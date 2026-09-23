@@ -114,7 +114,9 @@ class AttentionSinks(nn.Module):
         self.weight = nn.Parameter(torch.zeros(num_heads))
 
     def forward(self) -> torch.Tensor:
-        return self.weight
+        # The result outlives this nested FSDP module's forward. Materialize it
+        # before FSDP reshards and releases the unsharded parameter storage.
+        return self.weight.clone()
 
 
 class Compressor(nn.Module):
