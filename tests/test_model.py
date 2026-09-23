@@ -26,11 +26,12 @@ class ModelTest(unittest.TestCase):
                 )
 
             def combine(self, hidden, metadata):
-                return hidden.new_zeros(metadata.token_count, hidden.shape[-1])
+                empty = hidden.new_zeros(metadata.token_count, hidden.shape[-1])
+                return empty + hidden.sum() * 0
 
         config = DeepSeekV41Config.tiny()
         experts = RoutedExperts(config, EmptyReceiveDispatcher())
-        hidden = torch.randn(3, config.hidden_size)
+        hidden = torch.randn(3, config.hidden_size, requires_grad=True)
         expert_ids = torch.zeros(3, config.num_experts_per_tok, dtype=torch.long)
         weights = torch.ones(3, config.num_experts_per_tok)
 
