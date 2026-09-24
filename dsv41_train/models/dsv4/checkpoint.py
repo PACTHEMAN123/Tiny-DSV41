@@ -18,6 +18,7 @@ from .model import (
     DecoderLayer,
     DeepSeekV41ForCausalLM,
     NgramHash,
+    RotaryEmbedding,
     build_compressed_token_map,
 )
 
@@ -275,6 +276,16 @@ def _prefix_config(folder: Path, num_layers: int) -> DeepSeekV41Config:
     return DeepSeekV41Config(**values)
 
 
+def _materialize_rotary(
+    rotary: RotaryEmbedding,
+    config: DeepSeekV41Config,
+    device: torch.device,
+) -> None:
+    materialized = RotaryEmbedding(config).to(device)
+    rotary.main = materialized.main
+    rotary.compressed = materialized.compressed
+
+
 def load_dsv41_backbone_window(
     folder: str | Path,
     *,
@@ -317,22 +328,7 @@ def load_dsv41_backbone_window(
 
     target_device = torch.device(device)
     rotary = model.model.rotary
-    rotary.main = (
-        1.0
-        / (
-            config.rope_theta
-            ** (torch.arange(0, config.qk_rope_head_dim, 2, device=target_device).float()
-                / config.qk_rope_head_dim)
-        )
-    )
-    rotary.compressed = (
-        1.0
-        / (
-            config.compress_rope_theta
-            ** (torch.arange(0, config.qk_rope_head_dim, 2, device=target_device).float()
-                / config.qk_rope_head_dim)
-        )
-    )
+    _materialize_rotary(rotary, config, target_device)
     with ShardedSafeTensorReader(folder) as checkpoint:
 
         def read(name: str) -> torch.Tensor:

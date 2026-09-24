@@ -670,12 +670,16 @@ class NgramHash(nn.Module):
             )
         if token_map.ndim != 1 or token_map.shape[0] != config.vocab_size:
             raise ValueError("Engram token map must contain one entry per vocabulary id")
-        if token_map.numel() and (
+        if not token_map.is_meta and token_map.numel() and (
             token_map.min() < 0
             or token_map.max() >= config.engram_compressed_vocab_size
         ):
             raise ValueError("Engram token map contains an out-of-range compressed id")
-        self.pad_id = int(token_map[config.engram_pad_id])
+        self.pad_id = (
+            config.engram_pad_id % config.engram_compressed_vocab_size
+            if token_map.is_meta
+            else int(token_map[config.engram_pad_id])
+        )
         layer_ids = list(config.engram_layer_ids if layer_ids is None else layer_ids)
         if not set(layer_ids).issubset(config.engram_layer_ids):
             raise ValueError("Engram hash layers must be configured Engram layers")

@@ -9,11 +9,13 @@ import torch
 from dsv41_train.models.dsv4 import DeepSeekV41Config
 from dsv41_train.models.dsv4.checkpoint import (
     ShardedSafeTensorReader,
+    _materialize_rotary,
     _prefix_config,
     dequantize_fp4_rows,
     dequantize_fp8_blocks,
     dequantize_fp8_rows,
 )
+from dsv41_train.models.dsv4.model import RotaryEmbedding
 
 
 def write_safetensors(path: Path, tensors: dict[str, torch.Tensor]) -> None:
@@ -35,6 +37,27 @@ def write_safetensors(path: Path, tensors: dict[str, torch.Tensor]) -> None:
 
 
 class DSV4CheckpointTest(unittest.TestCase):
+    def test_materializes_checkpoint_rotary_with_yarn_scaling(self):
+        values = DeepSeekV41Config.tiny().to_dict()
+        values["rope_scaling"] = {
+            "rope_type": "yarn",
+            "factor": 4,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "original_max_position_embeddings": 16,
+        }
+        config = DeepSeekV41Config(**values)
+        with torch.device("meta"):
+            actual = RotaryEmbedding(config)
+
+        _materialize_rotary(actual, config, torch.device("cpu"))
+        expected = RotaryEmbedding(config)
+
+        self.assertFalse(actual.main.is_meta)
+        self.assertFalse(actual.compressed.is_meta)
+        torch.testing.assert_close(actual.main, expected.main, rtol=0, atol=0)
+        torch.testing.assert_close(actual.compressed, expected.compressed, rtol=0, atol=0)
+
     def test_prefix_config_includes_the_second_engram_layer(self):
         config = DeepSeekV41Config(
             engram_layer_ids=[1, 14],
