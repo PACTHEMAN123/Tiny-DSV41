@@ -10,9 +10,12 @@ deliberately outside this module.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
@@ -65,9 +68,10 @@ class HyperConnection(nn.Module):
         post = 2 * torch.sigmoid(post * post_scale + post_bias)
         comb = comb.view(*comb.shape[:-1], hc, hc) * comb_scale + comb_bias.view(hc, hc)
         comb = torch.softmax(comb, dim=-1) + self.eps
-        for _ in range(self.sinkhorn_iters):
-            comb = comb / (comb.sum(dim=-2, keepdim=True) + self.eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.eps)
+        for _ in range(self.sinkhorn_iters - 1):
             comb = comb / (comb.sum(dim=-1, keepdim=True) + self.eps)
+            comb = comb / (comb.sum(dim=-2, keepdim=True) + self.eps)
         return pre, post, comb
 
 
@@ -77,6 +81,26 @@ class RotaryEmbedding(nn.Module):
         dim = config.qk_rope_head_dim
         main = 1.0 / (config.rope_theta ** (torch.arange(0, dim, 2).float() / dim))
         compressed = 1.0 / (config.compress_rope_theta ** (torch.arange(0, dim, 2).float() / dim))
+        scaling = config.rope_scaling or {}
+        if scaling.get("rope_type", scaling.get("type")) == "yarn":
+            factor = scaling["factor"]
+            original = scaling["original_max_position_embeddings"]
+            beta_fast = scaling.get("beta_fast", 32)
+            beta_slow = scaling.get("beta_slow", 1)
+
+            def corrected_dim(rotations: float) -> float:
+                return dim * math.log(original / (rotations * 2 * math.pi)) / (
+                    2 * math.log(config.compress_rope_theta)
+                )
+
+            low = max(math.floor(corrected_dim(beta_fast)), 0)
+            high = min(math.ceil(corrected_dim(beta_slow)), dim - 1)
+            ramp = (
+                (torch.arange(dim // 2, dtype=torch.float32) - low)
+                / max(high - low, 1e-3)
+            ).clamp(0, 1)
+            smooth = 1 - ramp
+            compressed = compressed / factor * (1 - smooth) + compressed * smooth
         self.register_buffer("main", main, persistent=False)
         self.register_buffer("compressed", compressed, persistent=False)
 
@@ -109,7 +133,12 @@ class GroupedLinear(nn.Module):
         self.weight = nn.Parameter(torch.empty(groups, output_per_group, input_per_group))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.einsum("...gi,goi->...go", x, self.weight)
+        input_shape = x.shape[:-2]
+        hidden_dim = x.shape[-1]
+        weight = self.weight.transpose(1, 2)
+        grouped = x.reshape(-1, self.groups, hidden_dim).transpose(0, 1)
+        output = torch.bmm(grouped, weight).transpose(0, 1)
+        return output.reshape(*input_shape, self.groups, -1)
 
 
 class AttentionSinks(nn.Module):
@@ -248,8 +277,12 @@ class Compressor(nn.Module):
         group_counts = counts // self.ratio
         query_lengths = live.long().cumsum(-1)
 
-        kv = self.kv_proj(x)
-        gate = self.gate_proj(x).float() if self.gate_proj is not None else None
+        if self.gate_proj is None:
+            kv = self.kv_proj(x)
+            gate = None
+        else:
+            kv = F.linear(x.float(), self.kv_proj.weight.float())
+            gate = F.linear(x.float(), self.gate_proj.weight.float())
         destinations = torch.where(live, live.long().cumsum(-1) - 1, length)
         order = positions.new_zeros(batch, length + 1)
         order.scatter_(1, destinations, torch.arange(length, device=x.device).expand(batch, -1))
@@ -460,7 +493,9 @@ class CompressedAttention(nn.Module):
         sinks = self.sinks().view(1, -1, 1, 1).expand(
             query.shape[0], -1, query.shape[-2], -1
         )
-        probabilities = torch.softmax(torch.cat((logits.float(), sinks), dim=-1), dim=-1)[..., :-1]
+        combined = torch.cat((logits.float(), sinks), dim=-1)
+        combined = combined - combined.max(dim=-1, keepdim=True).values
+        probabilities = torch.softmax(combined, dim=-1, dtype=combined.dtype)[..., :-1]
         probabilities = F.dropout(probabilities, self.dropout, self.training).to(kv.dtype)
         output = torch.matmul(probabilities[..., :window], kv)
         if selected is not None:
@@ -488,15 +523,83 @@ def _next_prime(value: int, used: set[int]) -> int:
     return value
 
 
+def build_compressed_token_map(tokenizer_file: str | Path) -> tuple[torch.Tensor, int]:
+    try:
+        from tokenizers import Regex, Tokenizer, normalizers
+    except ImportError as error:
+        raise RuntimeError(
+            "loading Engram checkpoint weights requires the tokenizers package"
+        ) from error
+
+    tokenizer = Tokenizer.from_file(str(tokenizer_file))
+    sentinel = "\ue000"
+    normalizer = normalizers.Sequence(
+        [
+            normalizers.NFKC(),
+            normalizers.NFD(),
+            normalizers.StripAccents(),
+            normalizers.Lowercase(),
+            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
+            normalizers.Replace(Regex(r"^ $"), sentinel),
+            normalizers.Strip(),
+            normalizers.Replace(sentinel, " "),
+        ]
+    )
+    compressed: dict[str, int] = {}
+    mapping = []
+    for token_id in range(tokenizer.get_vocab_size(with_added_tokens=True)):
+        text = tokenizer.decode([token_id], skip_special_tokens=False)
+        if "\ufffd" in text:
+            key = tokenizer.id_to_token(token_id)
+        else:
+            normalized = normalizer.normalize_str(text)
+            key = normalized or text
+        new_id = compressed.get(key)
+        if new_id is None:
+            new_id = len(compressed)
+            compressed[key] = new_id
+        mapping.append(new_id)
+    return torch.tensor(mapping, dtype=torch.long), len(compressed)
+
+
+def _build_hash_multipliers(
+    layer_ids: list[int], max_ngram: int, compressed_vocab_size: int
+) -> torch.Tensor:
+    """Rebuild the fixed hash constants used to address pretrained Engram rows."""
+    bound = max(1, (np.iinfo(np.int64).max // compressed_vocab_size) // 2)
+    rows = []
+    for layer_id in layer_ids:
+        generator = np.random.default_rng(10007 * layer_id)
+        values = generator.integers(0, bound, size=max_ngram, dtype=np.int64)
+        rows.append(torch.from_numpy(values * 2 + 1))
+    return torch.stack(rows)
+
+
 class NgramHash(nn.Module):
     def __init__(
         self,
         config: DeepSeekV41Config,
         layer_ids: list[int] | None = None,
+        token_map: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.max_ngram = config.engram_max_ngram_size
-        self.pad_id = config.engram_pad_id % config.engram_compressed_vocab_size
+        if token_map is None:
+            token_map = torch.arange(config.vocab_size).remainder(
+                config.engram_compressed_vocab_size
+            )
+        if token_map.ndim != 1 or token_map.shape[0] != config.vocab_size:
+            raise ValueError("Engram token map must contain one entry per vocabulary id")
+        if not token_map.is_meta and token_map.numel() and (
+            token_map.min() < 0
+            or token_map.max() >= config.engram_compressed_vocab_size
+        ):
+            raise ValueError("Engram token map contains an out-of-range compressed id")
+        self.pad_id = (
+            config.engram_pad_id % config.engram_compressed_vocab_size
+            if token_map.is_meta
+            else int(token_map[config.engram_pad_id])
+        )
         layer_ids = list(config.engram_layer_ids if layer_ids is None else layer_ids)
         if not set(layer_ids).issubset(config.engram_layer_ids):
             raise ValueError("Engram hash layers must be configured Engram layers")
@@ -523,18 +626,17 @@ class NgramHash(nn.Module):
             len(layer_ids), self.max_ngram - 1, config.engram_n_heads
         )
         offsets = torch.tensor(layer_offsets)
-        bound = max(2, ((2**63 - 1) // config.engram_compressed_vocab_size) // 2)
-        multipliers = []
-        for layer_id in layer_ids:
-            values = [((layer_id + 1) * 1000003 + (i + 1) * 9176) % bound for i in range(self.max_ngram)]
-            multipliers.append([2 * value + 1 for value in values])
+        multipliers = _build_hash_multipliers(
+            layer_ids, self.max_ngram, config.engram_compressed_vocab_size
+        )
         self.compressed_vocab_size = config.engram_compressed_vocab_size
+        self.register_buffer("token_map", token_map.to(torch.long), persistent=False)
         self.register_buffer("primes", primes, persistent=False)
         self.register_buffer("offsets", offsets, persistent=False)
-        self.register_buffer("multipliers", torch.tensor(multipliers), persistent=False)
+        self.register_buffer("multipliers", multipliers, persistent=False)
 
     def forward(self, input_ids: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
-        tokens = input_ids.remainder(self.compressed_vocab_size)
+        tokens = self.token_map[input_ids]
         dead = -1
         tokens = tokens.masked_fill(~token_mask, dead)
         context = self.max_ngram - 1

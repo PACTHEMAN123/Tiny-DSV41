@@ -94,7 +94,9 @@ class RoutedExperts(nn.Module):
                 output = output + anchor.to(output.dtype) * 0
                 continue
             current = x[token_ids]
-            gate, up = F.linear(current, self.gate_up[expert_id]).chunk(2, dim=-1)
+            weight = self.gate_up[expert_id]
+            gate = F.linear(current, weight[: self.intermediate])
+            up = F.linear(current, weight[self.intermediate :])
             current = _clamped_swiglu(gate, up, self.limit)
             current = current * weights[token_ids, None]
             current = F.linear(current.to(x.dtype), self.down[expert_id])
