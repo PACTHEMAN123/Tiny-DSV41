@@ -49,7 +49,7 @@ def config_values(*, engram: bool = False) -> dict:
         },
         "max_position_embeddings": 64,
         "sliding_window": 8,
-        "compress_ratios": [0, 2, 2, 1],
+        "compress_ratios": [0, 2, 2, 2],
         "kv_source_layer_ids": [1, 3],
         "index_source_layer_ids": [1, 2, 3],
         "candidate_source_layer_id": 2,
@@ -95,6 +95,7 @@ def hf_config(*, engram: bool = False):
         n_shared_experts=1,
         num_nextn_predict_layers=0,
         dspark_target_layer_ids=[],
+        dspark_noise_token_id=None,
         use_cache=False,
     )
     return DeepseekV41TextConfig(**values)
@@ -102,6 +103,15 @@ def hf_config(*, engram: bool = False):
 
 def copy_tensor(target: torch.Tensor, source: torch.Tensor) -> None:
     target.copy_(source.reshape_as(target))
+
+
+@torch.no_grad()
+def initialize_parameters(module: torch.nn.Module, seed: int) -> None:
+    generator = torch.Generator().manual_seed(seed)
+    for parameter in module.parameters():
+        parameter.copy_(
+            torch.randn(parameter.shape, generator=generator, dtype=parameter.dtype) * 0.02
+        )
 
 
 @torch.no_grad()
@@ -205,6 +215,7 @@ class HuggingFaceParityTest(unittest.TestCase):
         reference = hf_config()
         native_hc = HyperConnection(native)
         reference_hc = DeepseekV41HyperConnection(reference)
+        initialize_parameters(reference_hc, seed=11)
         native_hc.load_state_dict(reference_hc.state_dict(), strict=True)
         streams = torch.randn(2, 7, native.hc_mult, native.hidden_size)
 
@@ -245,6 +256,7 @@ class HuggingFaceParityTest(unittest.TestCase):
 
         native_engram = Engram(native)
         reference_engram = DeepseekV41Engram(reference, 0)
+        initialize_parameters(reference_engram, seed=17)
         with torch.no_grad():
             copy_tensor(native_engram.proj.weight, reference_engram.wkv.weight)
             copy_tensor(native_engram.q_weight, reference_engram.q_weight)
