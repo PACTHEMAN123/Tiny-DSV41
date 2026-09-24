@@ -14,7 +14,12 @@ import torch
 from ...dispatch import TokenDispatcher
 from ...parallel import ContextParallel
 from .config import DeepSeekV41Config
-from .model import DecoderLayer, DeepSeekV41ForCausalLM, NgramHash
+from .model import (
+    DecoderLayer,
+    DeepSeekV41ForCausalLM,
+    NgramHash,
+    build_compressed_token_map,
+)
 
 try:
     from torch.distributed.device_mesh import DeviceMesh
@@ -471,8 +476,19 @@ def load_dsv41_backbone_window(
                 layer_loaded(layer)
 
     if model.model.hash is not None:
+        token_map, compressed_vocab_size = build_compressed_token_map(
+            folder / "tokenizer.json"
+        )
+        if compressed_vocab_size != config.engram_compressed_vocab_size:
+            raise ValueError(
+                "tokenizer-derived compressed vocabulary size "
+                f"({compressed_vocab_size}) does not match the model config "
+                f"({config.engram_compressed_vocab_size})"
+            )
         model.model.hash = NgramHash(
-            config, model.model.engram_layer_ids
+            config,
+            model.model.engram_layer_ids,
+            token_map=token_map,
         ).to(target_device)
     if any(parameter.is_meta for parameter in model.parameters()):
         raise RuntimeError("checkpoint loading left meta parameters in the model")

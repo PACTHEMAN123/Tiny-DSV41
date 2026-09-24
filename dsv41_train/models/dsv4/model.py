@@ -10,9 +10,12 @@ deliberately outside this module.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
@@ -65,9 +68,10 @@ class HyperConnection(nn.Module):
         post = 2 * torch.sigmoid(post * post_scale + post_bias)
         comb = comb.view(*comb.shape[:-1], hc, hc) * comb_scale + comb_bias.view(hc, hc)
         comb = torch.softmax(comb, dim=-1) + self.eps
-        for _ in range(self.sinkhorn_iters):
-            comb = comb / (comb.sum(dim=-2, keepdim=True) + self.eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.eps)
+        for _ in range(self.sinkhorn_iters - 1):
             comb = comb / (comb.sum(dim=-1, keepdim=True) + self.eps)
+            comb = comb / (comb.sum(dim=-2, keepdim=True) + self.eps)
         return pre, post, comb
 
 
@@ -77,6 +81,26 @@ class RotaryEmbedding(nn.Module):
         dim = config.qk_rope_head_dim
         main = 1.0 / (config.rope_theta ** (torch.arange(0, dim, 2).float() / dim))
         compressed = 1.0 / (config.compress_rope_theta ** (torch.arange(0, dim, 2).float() / dim))
+        scaling = config.rope_scaling or {}
+        if scaling.get("rope_type", scaling.get("type")) == "yarn":
+            factor = scaling["factor"]
+            original = scaling["original_max_position_embeddings"]
+            beta_fast = scaling.get("beta_fast", 32)
+            beta_slow = scaling.get("beta_slow", 1)
+
+            def corrected_dim(rotations: float) -> float:
+                return dim * math.log(original / (rotations * 2 * math.pi)) / (
+                    2 * math.log(config.compress_rope_theta)
+                )
+
+            low = max(math.floor(corrected_dim(beta_fast)), 0)
+            high = min(math.ceil(corrected_dim(beta_slow)), dim - 1)
+            ramp = (
+                (torch.arange(dim // 2, dtype=torch.float32) - low)
+                / max(high - low, 1e-3)
+            ).clamp(0, 1)
+            smooth = 1 - ramp
+            compressed = compressed / factor * (1 - smooth) + compressed * smooth
         self.register_buffer("main", main, persistent=False)
         self.register_buffer("compressed", compressed, persistent=False)
 
@@ -109,7 +133,96 @@ class GroupedLinear(nn.Module):
         self.weight = nn.Parameter(torch.empty(groups, output_per_group, input_per_group))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.einsum("...gi,goi->...go", x, self.weight)
+        input_shape = x.shape[:-2]
+        hidden_dim = x.shape[-1]
+        weight = self.weight.transpose(1, 2)
+        grouped = x.reshape(-1, self.groups, hidden_dim).transpose(0, 1)
+        output = torch.bmm(grouped, weight).transpose(0, 1)
+        return output.reshape(*input_shape, self.groups, -1)
+
+
+_FP4_MAX = 6.0
+_FP4_VALUES = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
+_FP8_MAX = 448.0
+
+
+def _pow2_ceil_scale(values: torch.Tensor) -> torch.Tensor:
+    bits = values.contiguous().view(torch.int32)
+    exponent = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    power = exponent - 127 + (mantissa != 0).to(torch.int32)
+    return torch.exp2(power.to(torch.float32))
+
+
+def _e2m1_codes(values: torch.Tensor) -> torch.Tensor:
+    magnitude = values.abs()
+    negative = torch.signbit(values)
+    boundaries = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+        dtype=torch.float32,
+        device=values.device,
+    )
+    ties_up = torch.tensor(
+        [False, True, False, True, False, True, False], device=values.device
+    )
+    thresholds = torch.where(
+        ties_up,
+        boundaries,
+        torch.nextafter(boundaries, torch.full_like(boundaries, float("inf"))),
+    )
+    codes = (magnitude.unsqueeze(-1) >= thresholds).sum(-1).to(torch.uint8)
+    return codes | (negative.to(torch.uint8) << 3)
+
+
+def _fake_quant_fp4_block(
+    tensor: torch.Tensor, block_size: int, *, e4m3_scales: bool = False
+) -> torch.Tensor:
+    width = tensor.shape[-1]
+    if width % block_size:
+        return tensor
+    blocks = tensor.float().view(*tensor.shape[:-1], width // block_size, block_size)
+    maximum = blocks.abs().amax(-1)
+    if e4m3_scales:
+        scale = (maximum.clamp_min(_FP4_MAX * 2.0**-9) / _FP4_MAX).to(
+            torch.float8_e4m3fn
+        ).float()
+    else:
+        scale = _pow2_ceil_scale(
+            maximum.clamp_min(_FP4_MAX * 2.0**-126) / _FP4_MAX
+        )
+    quantized = (blocks / scale.unsqueeze(-1)).clamp(-_FP4_MAX, _FP4_MAX)
+    lookup = torch.tensor(_FP4_VALUES, device=tensor.device, dtype=torch.float32)
+    values = lookup[_e2m1_codes(quantized).long()]
+    return (values * scale.unsqueeze(-1)).view_as(tensor).to(tensor.dtype)
+
+
+def _fake_quant_fp8_block(tensor: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    width = tensor.shape[-1]
+    if width % block_size:
+        return tensor
+    blocks = tensor.float().view(*tensor.shape[:-1], width // block_size, block_size)
+    maximum = blocks.abs().amax(-1).clamp_min(1e-4)
+    scale = _pow2_ceil_scale(maximum / _FP8_MAX)
+    quantized = (blocks / scale.unsqueeze(-1)).clamp(-_FP8_MAX, _FP8_MAX)
+    values = quantized.to(torch.float8_e4m3fn).float() * scale.unsqueeze(-1)
+    return values.view_as(tensor).to(tensor.dtype)
 
 
 class AttentionSinks(nn.Module):
@@ -248,8 +361,12 @@ class Compressor(nn.Module):
         group_counts = counts // self.ratio
         query_lengths = live.long().cumsum(-1)
 
-        kv = self.kv_proj(x)
-        gate = self.gate_proj(x).float() if self.gate_proj is not None else None
+        if self.gate_proj is None:
+            kv = self.kv_proj(x)
+            gate = None
+        else:
+            kv = F.linear(x.float(), self.kv_proj.weight.float())
+            gate = F.linear(x.float(), self.gate_proj.weight.float())
         destinations = torch.where(live, live.long().cumsum(-1) - 1, length)
         order = positions.new_zeros(batch, length + 1)
         order.scatter_(1, destinations, torch.arange(length, device=x.device).expand(batch, -1))
@@ -321,7 +438,10 @@ class SparseIndexer(nn.Module):
             if latent is not None:
                 keys = self.k_norm(self.k_proj(latent))
                 cos, sin = self.rotary(keys, group_positions, compressed=True)
-                shared["index_keys"] = apply_rope(keys, cos, sin).unsqueeze(1)
+                keys = apply_rope(keys, cos, sin)
+                shared["index_keys"] = _fake_quant_fp4_block(
+                    keys, 32
+                ).unsqueeze(1)
 
         index_keys = shared.get("index_keys")
         if index_keys is None:
@@ -333,7 +453,9 @@ class SparseIndexer(nn.Module):
         keys = index_keys[:, 0].float()
         query = self.q_proj(q_residual).view(batch, length, self.num_heads, self.head_dim)
         cos, sin = self.rotary(query, positions, compressed=True)
-        query = apply_rope(query, cos, sin).float()
+        query = _fake_quant_fp4_block(
+            apply_rope(query, cos, sin), 32
+        ).float()
         head_weights = self.weight_proj(x).float() * self.num_heads**-0.5
         scores = torch.einsum("bshd,btd->bsht", query, keys).relu_() * self.head_dim**-0.5
         scores = (scores * head_weights.unsqueeze(-1)).sum(2)
@@ -349,7 +471,7 @@ class SparseIndexer(nn.Module):
         elif previous_candidates is not None:
             scores = scores.masked_fill(~previous_candidates, float("-inf"))
 
-        picked = scores.topk(min(self.topk, keys.shape[1]), dim=-1, sorted=False)
+        picked = scores.topk(min(self.topk, keys.shape[1]), dim=-1)
         shared["topk_indices"] = torch.where(
             picked.values > float("-inf"), picked.indices, torch.full_like(picked.indices, -1)
         )
@@ -401,6 +523,7 @@ class CompressedAttention(nn.Module):
         query = self.q_b(q_residual).view(batch, length, self.num_heads, self.head_dim)
         query = apply_rope(query, cos, sin).transpose(1, 2)
         kv = apply_rope(self.kv_norm(self.kv_proj(x)), cos, sin).unsqueeze(1)
+        kv = _fake_quant_fp8_block(kv)
         kv = self.context_parallel.gather(kv, dim=2)
 
         selected = selected_valid = None
@@ -425,7 +548,10 @@ class CompressedAttention(nn.Module):
 
             if latent is not None:
                 latent_cos, latent_sin = self.rotary(latent, group_positions, compressed=True)
-                shared["compressed_kv"] = apply_rope(latent, latent_cos, latent_sin).unsqueeze(1)
+                rotated = apply_rope(latent, latent_cos, latent_sin)
+                shared["compressed_kv"] = _fake_quant_fp4_block(
+                    rotated, 16, e4m3_scales=True
+                ).unsqueeze(1)
 
             compressed_kv = shared.get("compressed_kv")
             topk_indices = shared.get("topk_indices")
@@ -460,7 +586,9 @@ class CompressedAttention(nn.Module):
         sinks = self.sinks().view(1, -1, 1, 1).expand(
             query.shape[0], -1, query.shape[-2], -1
         )
-        probabilities = torch.softmax(torch.cat((logits.float(), sinks), dim=-1), dim=-1)[..., :-1]
+        combined = torch.cat((logits.float(), sinks), dim=-1)
+        combined = combined - combined.max(dim=-1, keepdim=True).values
+        probabilities = torch.softmax(combined, dim=-1, dtype=combined.dtype)[..., :-1]
         probabilities = F.dropout(probabilities, self.dropout, self.training).to(kv.dtype)
         output = torch.matmul(probabilities[..., :window], kv)
         if selected is not None:
@@ -488,15 +616,66 @@ def _next_prime(value: int, used: set[int]) -> int:
     return value
 
 
+def build_compressed_token_map(tokenizer_file: str | Path) -> tuple[torch.Tensor, int]:
+    try:
+        from tokenizers import Regex, Tokenizer, normalizers
+    except ImportError as error:
+        raise RuntimeError(
+            "loading Engram checkpoint weights requires the tokenizers package"
+        ) from error
+
+    tokenizer = Tokenizer.from_file(str(tokenizer_file))
+    sentinel = "\ue000"
+    normalizer = normalizers.Sequence(
+        [
+            normalizers.NFKC(),
+            normalizers.NFD(),
+            normalizers.StripAccents(),
+            normalizers.Lowercase(),
+            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
+            normalizers.Replace(Regex(r"^ $"), sentinel),
+            normalizers.Strip(),
+            normalizers.Replace(sentinel, " "),
+        ]
+    )
+    compressed: dict[str, int] = {}
+    mapping = []
+    for token_id in range(tokenizer.get_vocab_size(with_added_tokens=True)):
+        text = tokenizer.decode([token_id], skip_special_tokens=False)
+        if "\ufffd" in text:
+            key = tokenizer.id_to_token(token_id)
+        else:
+            normalized = normalizer.normalize_str(text)
+            key = normalized or text
+        new_id = compressed.get(key)
+        if new_id is None:
+            new_id = len(compressed)
+            compressed[key] = new_id
+        mapping.append(new_id)
+    return torch.tensor(mapping, dtype=torch.long), len(compressed)
+
+
 class NgramHash(nn.Module):
     def __init__(
         self,
         config: DeepSeekV41Config,
         layer_ids: list[int] | None = None,
+        token_map: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.max_ngram = config.engram_max_ngram_size
-        self.pad_id = config.engram_pad_id % config.engram_compressed_vocab_size
+        if token_map is None:
+            token_map = torch.arange(config.vocab_size).remainder(
+                config.engram_compressed_vocab_size
+            )
+        if token_map.ndim != 1 or token_map.shape[0] != config.vocab_size:
+            raise ValueError("Engram token map must contain one entry per vocabulary id")
+        if token_map.numel() and (
+            token_map.min() < 0
+            or token_map.max() >= config.engram_compressed_vocab_size
+        ):
+            raise ValueError("Engram token map contains an out-of-range compressed id")
+        self.pad_id = int(token_map[config.engram_pad_id])
         layer_ids = list(config.engram_layer_ids if layer_ids is None else layer_ids)
         if not set(layer_ids).issubset(config.engram_layer_ids):
             raise ValueError("Engram hash layers must be configured Engram layers")
@@ -523,18 +702,28 @@ class NgramHash(nn.Module):
             len(layer_ids), self.max_ngram - 1, config.engram_n_heads
         )
         offsets = torch.tensor(layer_offsets)
-        bound = max(2, ((2**63 - 1) // config.engram_compressed_vocab_size) // 2)
+        bound = max(
+            1,
+            (np.iinfo(np.int64).max // config.engram_compressed_vocab_size) // 2,
+        )
         multipliers = []
         for layer_id in layer_ids:
-            values = [((layer_id + 1) * 1000003 + (i + 1) * 9176) % bound for i in range(self.max_ngram)]
-            multipliers.append([2 * value + 1 for value in values])
+            generator = np.random.default_rng(10007 * layer_id)
+            values = generator.integers(
+                low=0,
+                high=bound,
+                size=(self.max_ngram,),
+                dtype=np.int64,
+            )
+            multipliers.append(torch.from_numpy(values * 2 + 1))
         self.compressed_vocab_size = config.engram_compressed_vocab_size
+        self.register_buffer("token_map", token_map.to(torch.long), persistent=False)
         self.register_buffer("primes", primes, persistent=False)
         self.register_buffer("offsets", offsets, persistent=False)
-        self.register_buffer("multipliers", torch.tensor(multipliers), persistent=False)
+        self.register_buffer("multipliers", torch.stack(multipliers), persistent=False)
 
     def forward(self, input_ids: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
-        tokens = input_ids.remainder(self.compressed_vocab_size)
+        tokens = self.token_map[input_ids]
         dead = -1
         tokens = tokens.masked_fill(~token_mask, dead)
         context = self.max_ngram - 1
