@@ -95,7 +95,7 @@ def hf_config(*, engram: bool = False):
         n_shared_experts=1,
         num_nextn_predict_layers=0,
         dspark_target_layer_ids=[],
-        dspark_noise_token_id=None,
+        dspark_noise_token_id=31,
         use_cache=False,
     )
     return DeepseekV41TextConfig(**values)
