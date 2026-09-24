@@ -20,6 +20,7 @@ class DeepSeekV41Config:
     qk_rope_head_dim: int = 64
     rope_theta: float = 10000.0
     compress_rope_theta: float = 160000.0
+    rope_scaling: dict | None = None
     max_position_embeddings: int = 1048576
     attention_dropout: float = 0.0
 
