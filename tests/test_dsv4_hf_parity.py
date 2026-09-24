@@ -33,7 +33,7 @@ def config_values(*, engram: bool = False) -> dict:
     return {
         "vocab_size": 32,
         "hidden_size": 32,
-        "num_hidden_layers": 4,
+        "num_hidden_layers": 5,
         "num_attention_heads": 2,
         "head_dim": 32,
         "q_lora_rank": 16,
@@ -49,7 +49,7 @@ def config_values(*, engram: bool = False) -> dict:
         },
         "max_position_embeddings": 64,
         "sliding_window": 8,
-        "compress_ratios": [0, 2, 2, 2],
+        "compress_ratios": [0, 2, 2, 2, 2],
         "kv_source_layer_ids": [1, 3],
         "index_source_layer_ids": [1, 2, 3],
         "candidate_source_layer_id": 2,
