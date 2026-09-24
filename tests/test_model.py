@@ -74,6 +74,7 @@ class ModelTest(unittest.TestCase):
             engram_vocab_size=31,
             engram_max_ngram_size=3,
             engram_n_heads=1,
+            engram_compressed_vocab_size=32,
         )
 
         full = NgramHash(config)
@@ -82,6 +83,15 @@ class ModelTest(unittest.TestCase):
         torch.testing.assert_close(selected.primes[0], full.primes[1])
         torch.testing.assert_close(selected.offsets[0], full.offsets[1])
         torch.testing.assert_close(selected.multipliers[0], full.multipliers[1])
+        torch.testing.assert_close(
+            full.multipliers,
+            torch.tensor(
+                [
+                    [237300864419207287, 14987281307456977, 111353620295905115],
+                    [85240722207167499, 252868047889091175, 33684873675973757],
+                ]
+            ),
+        )
 
     def test_dsv4_fsdp_wraps_experts_before_layers_and_root(self):
         with torch.device("meta"):
