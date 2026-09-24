@@ -13,6 +13,7 @@ import torch.distributed as dist
 
 from dsv41_train.models.dsv4 import load_dsv41_backbone_window
 from dsv41_train.models.dsv4.parallel import (
+    ParallelParameters,
     apply_fsdp2_layer,
     apply_fsdp2_root,
     build_parallelism,
@@ -31,6 +32,12 @@ def maximum_parameter_delta(before: torch.Tensor, after: torch.Tensor) -> torch.
     if after.numel() == 0:
         return torch.zeros((), dtype=torch.float32, device=after.device)
     return (after.float() - before.float()).abs().max()
+
+
+def data_parallel_rank(global_rank: int, cp_size: int) -> int:
+    if global_rank < 0 or cp_size < 1:
+        raise ValueError("global-rank must be non-negative and cp-size must be positive")
+    return global_rank // cp_size
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,6 +76,8 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
         raise ValueError("cp-size and ep-size must be positive")
     if world_size % args.cp_size or world_size % args.ep_size:
         raise ValueError("cp-size and ep-size must both divide world size")
+    if args.cp_size > 1 and args.cp_size != args.ep_size:
+        raise ValueError("DSV4 context parallelism requires cp-size == ep-size")
     if args.seq_len % args.cp_size:
         raise ValueError("seq-len must divide evenly across cp-size")
     if 384 % args.ep_size:
@@ -123,6 +132,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
 
     apply_fsdp2_root(model, meshes)
     sharded_at = time.perf_counter()
+    parameters = ParallelParameters.collect(model)
     tracked = model.model.layers[0].attention_hc.fn
     before = local_tensor(tracked).detach().float().clone()
     if args.optimizer == "adamw":
@@ -133,7 +143,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, foreach=False)
 
     generator = torch.Generator(device=runtime.device)
-    generator.manual_seed(args.seed + runtime.rank)
+    generator.manual_seed(args.seed + data_parallel_rank(runtime.rank, args.cp_size))
     last_loss = last_aux_loss = 0.0
     for step in range(1, args.steps + 1):
         input_ids = torch.randint(
@@ -149,6 +159,8 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         if output.loss is None or not torch.isfinite(output.loss):
             raise RuntimeError("training produced a non-finite loss")
         output.loss.backward()
+        parameters.synchronize(context_parallel, dense_fully_sharded=True)
+        distributed_trace(runtime, "context_parallel_gradients_synchronized")
         optimizer.step()
         distributed_trace(runtime, "optimizer_step_complete")
         last_loss = distributed_mean(output.loss, runtime)
@@ -188,6 +200,10 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         "cp_size": args.cp_size,
         "ep_size": args.ep_size,
         "fsdp_size": meshes.fsdp.size(),
+        "expert_fsdp_size": (
+            meshes.expert_fsdp.size() if meshes.expert_fsdp is not None else 1
+        ),
+        "data_parallel_size": runtime.world_size // args.cp_size,
         "experts_per_rank": routed.num_experts,
         "engram_size": meshes.engram.size() if meshes.engram is not None else 1,
         "engram_rows_per_rank": sum(
@@ -196,6 +212,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         "sparse_engram_gradients": args.optimizer == "sgd",
         "steps": args.steps,
         "batch_size_per_rank": args.batch_size,
+        "global_batch_size": args.batch_size * (runtime.world_size // args.cp_size),
         "sequence_length": args.seq_len,
         "start_layer": args.start_layer,
         "optimizer": args.optimizer,

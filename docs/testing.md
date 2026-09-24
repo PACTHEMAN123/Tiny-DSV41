@@ -20,6 +20,16 @@ PYTHONPATH=. python3 -m torch.distributed.run \
   tests/dsv4_engram_parallel_parity.py
 ```
 
+Two-rank DSV4 CP2/EP2 output and gradient parity, including compressed
+attention and row-sharded Engram:
+
+```bash
+PYTHONPATH=. python3 -m torch.distributed.run \
+  --nnodes=1 --nproc-per-node=2 \
+  --master-addr=127.0.0.1 --master-port=29503 \
+  tests/dsv4_parallel_parity.py
+```
+
 ```bash
 PYTHONPATH=.:tests python3 -m torch.distributed.run \
   --nnodes=1 --nproc-per-node=2 \

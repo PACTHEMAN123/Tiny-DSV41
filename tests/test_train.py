@@ -1,6 +1,8 @@
 import argparse
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import torch
@@ -11,6 +13,49 @@ from dsv41_train import runtime as training_runtime
 
 
 class TrainTest(unittest.TestCase):
+    @staticmethod
+    def dsv4_arguments(folder: str, **overrides):
+        values = {
+            "model_path": folder,
+            "steps": 1,
+            "start_layer": 0,
+            "num_layers": 40,
+            "batch_size": 1,
+            "seq_len": 128,
+            "learning_rate": 1.0e-4,
+            "cp_size": 8,
+            "ep_size": 8,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_dsv4_validate_args_accepts_cp8_ep8_on_sixteen_ranks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "config.json").touch()
+            (folder / "model.safetensors.index.json").touch()
+
+            train_dsv4_checkpoint.validate_args(
+                self.dsv4_arguments(temporary), world_size=16
+            )
+
+    def test_dsv4_validate_args_rejects_misaligned_cp_and_ep(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "config.json").touch()
+            (folder / "model.safetensors.index.json").touch()
+
+            with self.assertRaisesRegex(ValueError, "requires cp-size == ep-size"):
+                train_dsv4_checkpoint.validate_args(
+                    self.dsv4_arguments(temporary, ep_size=4), world_size=16
+                )
+
+    def test_dsv4_cp_ranks_on_one_node_share_a_data_rank(self):
+        self.assertEqual(
+            [train_dsv4_checkpoint.data_parallel_rank(rank, 8) for rank in range(16)],
+            [0] * 8 + [1] * 8,
+        )
+
     def test_parameter_delta_handles_an_empty_fsdp_shard(self):
         before = torch.empty(0, 4)
         after = torch.empty(0, 4)

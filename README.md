@@ -6,10 +6,16 @@ Run all commands from the repository root.
 
 ## DeepSeek V4.1
 
-### Two nodes, 16 GPUs, full 40 layers
+### Two nodes, 16 GPUs, full 40 layers with intra-node CP8
 
 Run this command on both 8-GPU nodes. Set `NODE_RANK=0` on the first node and
 `NODE_RANK=1` on the second. Replace `10.0.0.1` with the first container's IP.
+Torchrun assigns ranks 0-7 to node 0 and ranks 8-15 to node 1, so both the CP8
+and EP8 groups remain inside each node. Dense parameters use FSDP16 across the
+whole job, routed experts use FSDP2 across matching ranks on the two nodes, and
+Engram rows are split across all 16 ranks. The two nodes process different data
+samples; the eight CP ranks in one node process contiguous shards of the same
+sample.
 
 ```bash
 NODE_RANK=0
@@ -24,9 +30,14 @@ python3 -m torch.distributed.run \
   train_dsv4_checkpoint.py \
   --model-path /path/to/DeepSeek-V4.1-Flash \
   --start-layer 0 --num-layers 40 \
-  --ep-size 8 --cp-size 1 \
-  --optimizer sgd --steps 1 --batch-size 1 --seq-len 8
+  --ep-size 8 --cp-size 8 \
+  --optimizer sgd --steps 1 --batch-size 1 --seq-len 128 \
+  --metrics-file /mnt/fuse/oss/xiaopac.xjy/dsv41/cp8-fsdp16-128.json
 ```
+
+The first run gives each GPU 16 query tokens, versus eight tokens per GPU in the
+previous CP1 smoke. Validate it before increasing the global sequence length to
+256, 512, and beyond.
 
 ### One node, 8 GPUs, 9-layer prefix
 
@@ -40,6 +51,31 @@ python3 -m torch.distributed.run --standalone --nproc-per-node=8 \
   --ep-size 8 --cp-size 1 \
   --optimizer sgd --steps 1 --batch-size 1 --seq-len 8
 ```
+
+### One node, 8 GPUs, CP8 long-sequence smoke
+
+CP8 and EP8 share the eight local ranks. Each CP rank processes 2,048 tokens
+for this 16K-token sequence while the routed experts and Engram rows stay
+partitioned across the same ranks. Start with one source-anchored compressed
+layer, then increase `--num-layers` only after checking the reported peak
+memory.
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+python3 -m torch.distributed.run --standalone --nproc-per-node=8 \
+  train_dsv4_checkpoint.py \
+  --model-path /mnt/fuse/deepseek-ai/DeepSeek-V4.1-Flash \
+  --start-layer 2 --num-layers 1 \
+  --ep-size 8 --cp-size 8 \
+  --optimizer sgd --steps 1 --batch-size 1 --seq-len 16384 \
+  --metrics-file /mnt/fuse/oss/xiaopac.xjy/dsv41/cp8-16k.json
+```
+
+DSV4 CP currently requires `cp-size == ep-size` whenever CP is enabled. This
+keeps the context and expert groups aligned so fully sharded dense gradients,
+partitioned expert gradients, and row-sharded Engram gradients use the intended
+normalization.
 
 ## Qwen3-30B-A3B
 

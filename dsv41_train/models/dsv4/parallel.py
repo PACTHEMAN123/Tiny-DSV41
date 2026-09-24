@@ -1,12 +1,20 @@
 """DSV4 parallel topology and FSDP wrapping."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import torch.distributed as dist
+from torch import nn
 
 from ...dispatch import AllToAllTokenDispatcher, TokenDispatcher
 from ...parallel import ContextParallel, ParallelMeshes
-from .model import DecoderLayer, DeepSeekV41ForCausalLM, DeepSeekV41Model
+from ...runtime import local_tensor
+from .model import (
+    DecoderLayer,
+    DeepSeekV41ForCausalLM,
+    DeepSeekV41Model,
+    RowShardedEmbedding,
+)
+from .moe import RoutedExperts
 
 
 def build_parallelism(
@@ -14,9 +22,18 @@ def build_parallelism(
     ep: int = 1,
     device_type: str = "cuda",
 ) -> tuple[ParallelMeshes, ContextParallel, TokenDispatcher]:
+    if cp > 1 and cp != ep:
+        raise ValueError("DSV4 context parallelism requires cp-size == ep-size")
     meshes = ParallelMeshes.build(cp=cp, ep=ep, device_type=device_type)
     from torch.distributed.device_mesh import init_device_mesh
 
+    if cp > 1:
+        dense_fsdp = init_device_mesh(
+            device_type,
+            (dist.get_world_size(),),
+            mesh_dim_names=("fsdp",),
+        )
+        meshes = replace(meshes, fsdp=dense_fsdp)
     engram_sparse = init_device_mesh(
         device_type,
         (dist.get_world_size(), 1),
@@ -32,6 +49,56 @@ def build_parallelism(
         AllToAllTokenDispatcher(meshes.ep) if meshes.ep is not None else TokenDispatcher()
     )
     return meshes, ContextParallel(meshes.cp), dispatcher
+
+
+@dataclass
+class ParallelParameters:
+    """Parameters with different gradient semantics on the shared CP/EP mesh."""
+
+    dense: list[nn.Parameter]
+    experts: list[nn.Parameter]
+    engram: list[nn.Parameter]
+
+    @classmethod
+    def collect(cls, model: nn.Module) -> ParallelParameters:
+        experts = [
+            parameter
+            for module in model.modules()
+            if isinstance(module, RoutedExperts)
+            and module.num_experts < module.global_num_experts
+            for parameter in module.parameters()
+        ]
+        engram = [
+            module.weight
+            for module in model.modules()
+            if isinstance(module, RowShardedEmbedding) and module.size > 1
+        ]
+        partitioned_ids = {id(parameter) for parameter in (*experts, *engram)}
+        dense = [
+            parameter
+            for parameter in model.parameters()
+            if id(parameter) not in partitioned_ids
+        ]
+        return cls(dense, experts, engram)
+
+    def synchronize(
+        self,
+        cp: ContextParallel,
+        *,
+        dense_fully_sharded: bool = False,
+    ) -> None:
+        """Normalize CP gradients not already reduced by dense FSDP."""
+
+        if not cp.enabled:
+            return
+        if not dense_fully_sharded:
+            for parameter in self.dense:
+                if parameter.grad is not None:
+                    dist.all_reduce(local_tensor(parameter.grad), group=cp.group)
+        scaled = self.experts if dense_fully_sharded else [*self.dense, *self.experts]
+        for parameter in scaled:
+            if parameter.grad is not None:
+                local_tensor(parameter.grad).div_(cp.size)
 
 
 def _fully_shard():
@@ -115,6 +182,7 @@ def apply_fsdp2(
 
 
 __all__ = [
+    "ParallelParameters",
     "apply_fsdp2",
     "apply_fsdp2_layer",
     "apply_fsdp2_root",
