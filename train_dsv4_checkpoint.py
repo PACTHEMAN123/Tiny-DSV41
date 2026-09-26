@@ -26,6 +26,40 @@ def distributed_trace(runtime: Runtime, event: str) -> None:
         print(json.dumps({"trace": event, "rank": runtime.rank}), flush=True)
 
 
+def install_backward_traces(
+    model: torch.nn.Module,
+    runtime: Runtime,
+) -> list[torch.utils.hooks.RemovableHandle]:
+    """Trace nested backward progress without affecting normal training runs."""
+
+    if not os.environ.get("DSV41_LAYER_TRACE"):
+        return []
+
+    handles: list[torch.utils.hooks.RemovableHandle] = []
+
+    def register(module: torch.nn.Module, name: str) -> None:
+        def start(_module: torch.nn.Module, _grad_output: tuple[torch.Tensor, ...]) -> None:
+            distributed_trace(runtime, f"{name}_backward_start")
+
+        def complete(
+            _module: torch.nn.Module,
+            _grad_input: tuple[torch.Tensor | None, ...],
+            _grad_output: tuple[torch.Tensor | None, ...],
+        ) -> None:
+            distributed_trace(runtime, f"{name}_backward_complete")
+
+        handles.append(module.register_full_backward_pre_hook(start))
+        handles.append(module.register_full_backward_hook(complete))
+
+    decoder = model.model
+    for layer in decoder.layers:
+        prefix = f"layer_{layer.layer_id}"
+        register(layer, prefix)
+        register(layer.moe.routed, f"{prefix}_routed_experts")
+        register(layer.attention, f"{prefix}_attention")
+    return handles
+
+
 def maximum_parameter_delta(before: torch.Tensor, after: torch.Tensor) -> torch.Tensor:
     if before.shape != after.shape:
         raise ValueError("parameter snapshots must have matching shapes")
@@ -135,6 +169,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
     apply_fsdp2_root(model, meshes)
     sharded_at = time.perf_counter()
     distributed_trace(runtime, "root_shard_complete")
+    backward_trace_handles = install_backward_traces(model, runtime)
     parameters = ParallelParameters.collect(model)
     tracked = model.model.layers[0].attention_hc.fn
     before = local_tensor(tracked).detach().float().clone()
@@ -237,6 +272,8 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
             path = Path(args.metrics_file)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+    for handle in backward_trace_handles:
+        handle.remove()
     return metrics
 
 
