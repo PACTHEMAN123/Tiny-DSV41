@@ -11,9 +11,11 @@ from ...dispatch import AllToAllTokenDispatcher, TokenDispatcher
 from ...parallel import ContextParallel, ParallelMeshes
 from ...runtime import local_tensor
 from .model import (
+    AttentionSinks,
     DecoderLayer,
     DeepSeekV41ForCausalLM,
     DeepSeekV41Model,
+    HyperConnection,
     RowShardedEmbedding,
 )
 from .moe import RoutedExperts
@@ -60,6 +62,7 @@ class ParallelParameters:
     dense: list[nn.Parameter]
     experts: list[nn.Parameter]
     engram: list[nn.Parameter]
+    replicated: list[nn.Parameter]
 
     @classmethod
     def collect(cls, model: nn.Module) -> ParallelParameters:
@@ -75,13 +78,21 @@ class ParallelParameters:
             for module in model.modules()
             if isinstance(module, RowShardedEmbedding) and module.size > 1
         ]
-        partitioned_ids = {id(parameter) for parameter in (*experts, *engram)}
+        replicated = [
+            parameter
+            for module in model.modules()
+            if isinstance(module, (HyperConnection, AttentionSinks))
+            for parameter in module.parameters(recurse=False)
+        ]
+        partitioned_ids = {
+            id(parameter) for parameter in (*experts, *engram, *replicated)
+        }
         dense = [
             parameter
             for parameter in model.parameters()
             if id(parameter) not in partitioned_ids
         ]
-        return cls(dense, experts, engram)
+        return cls(dense, experts, engram, replicated)
 
     def synchronize(
         self,
@@ -94,10 +105,20 @@ class ParallelParameters:
         if not cp.enabled:
             return
         if not dense_fully_sharded:
-            for parameter in self.dense:
+            for parameter in (*self.dense, *self.replicated):
                 if parameter.grad is not None:
                     dist.all_reduce(local_tensor(parameter.grad), group=cp.group)
-        scaled = self.experts if dense_fully_sharded else [*self.dense, *self.experts]
+        else:
+            for parameter in self.replicated:
+                if parameter.grad is not None:
+                    gradient = local_tensor(parameter.grad)
+                    dist.all_reduce(gradient)
+                    gradient.div_(dist.get_world_size())
+        scaled = (
+            self.experts
+            if dense_fully_sharded
+            else [*self.dense, *self.replicated, *self.experts]
+        )
         for parameter in scaled:
             if parameter.grad is not None:
                 local_tensor(parameter.grad).div_(cp.size)
@@ -124,6 +145,15 @@ def _disable_backward_prefetch(module: nn.Module) -> None:
             child.set_modules_to_backward_prefetch([])
 
 
+def _replicated_fp32_parameters(module: nn.Module) -> set[nn.Parameter]:
+    return {
+        parameter
+        for child in module.modules()
+        if isinstance(child, (HyperConnection, AttentionSinks))
+        for parameter in child.parameters(recurse=False)
+    }
+
+
 def apply_fsdp2_layer(
     layer: DecoderLayer,
     meshes: ParallelMeshes,
@@ -131,6 +161,7 @@ def apply_fsdp2_layer(
     reshard_after_forward: bool = True,
 ) -> None:
     fully_shard = _fully_shard()
+    replicate_fp32 = meshes.ep is not None and meshes._dense is not None
     if meshes.ep is not None:
         assert meshes.expert_fsdp is not None
         layer.moe.routed.set_gradient_group(meshes.expert_fsdp.get_group())
@@ -139,13 +170,21 @@ def apply_fsdp2_layer(
             mesh=meshes.expert_fsdp,
             reshard_after_forward=reshard_after_forward,
         )
-    for fp32_module in (layer.attention_hc, layer.moe_hc, layer.attention.sinks):
+    if replicate_fp32:
         fully_shard(
-            fp32_module,
+            layer,
             mesh=meshes.fsdp,
             reshard_after_forward=reshard_after_forward,
+            ignored_params=_replicated_fp32_parameters(layer),
         )
-    fully_shard(layer, mesh=meshes.fsdp, reshard_after_forward=reshard_after_forward)
+    else:
+        for fp32_module in (layer.attention_hc, layer.moe_hc, layer.attention.sinks):
+            fully_shard(
+                fp32_module,
+                mesh=meshes.fsdp,
+                reshard_after_forward=reshard_after_forward,
+            )
+        fully_shard(layer, mesh=meshes.fsdp, reshard_after_forward=reshard_after_forward)
 
 
 def apply_fsdp2_root(
@@ -160,7 +199,11 @@ def apply_fsdp2_root(
     engram_fsdp = (
         meshes.engram_fsdp if meshes.engram_fsdp is not None else meshes.expert_fsdp
     )
-    ignored_params = set()
+    ignored_params = (
+        _replicated_fp32_parameters(decoder)
+        if meshes.ep is not None and meshes._dense is not None
+        else set()
+    )
     for table in decoder.engram_tables.values():
         if table.sparse_gradients:
             ignored_params.add(table.weight)

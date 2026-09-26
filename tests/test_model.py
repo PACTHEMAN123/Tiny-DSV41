@@ -8,7 +8,7 @@ from dsv41_train.dispatch import DispatchMetadata, TokenDispatcher
 from dsv41_train.models.dsv4 import DeepSeekV41Config, DeepSeekV41ForCausalLM
 from dsv41_train.models.dsv4.model import NgramHash
 from dsv41_train.models.dsv4.moe import RoutedExperts
-from dsv41_train.models.dsv4.parallel import apply_fsdp2
+from dsv41_train.models.dsv4.parallel import ParallelParameters, apply_fsdp2
 from dsv41_train.parallel import ContextParallel, ParallelMeshes
 
 
@@ -168,6 +168,54 @@ class ModelTest(unittest.TestCase):
             apply_fsdp2(model, meshes)
 
         disable.assert_called_once_with(model)
+
+    def test_dsv4_cp_ep_fsdp_replicates_small_fp32_parameters(self):
+        with torch.device("meta"):
+            model = DeepSeekV41ForCausalLM(DeepSeekV41Config.tiny())
+        meshes = ParallelMeshes(
+            fsdp=Mock(),
+            cp=Mock(),
+            ep=Mock(),
+            expert_fsdp=Mock(),
+            _dense=Mock(),
+        )
+        try:
+            from torch.distributed.fsdp import fully_shard
+        except ImportError:
+            shard_path = "torch.distributed._composable.fsdp.fully_shard"
+        else:
+            shard_path = "torch.distributed.fsdp.fully_shard"
+
+        with (
+            patch(shard_path) as shard,
+            patch("dsv41_train.models.dsv4.parallel._disable_backward_prefetch"),
+        ):
+            apply_fsdp2(model, meshes)
+
+        replicated = ParallelParameters.collect(model).replicated
+        replicated_ids = {id(parameter) for parameter in replicated}
+        self.assertTrue(replicated_ids)
+        wrapped_ids = {id(args.args[0]) for args in shard.call_args_list}
+        for layer in model.model.layers:
+            self.assertNotIn(id(layer.attention_hc), wrapped_ids)
+            self.assertNotIn(id(layer.moe_hc), wrapped_ids)
+            self.assertNotIn(id(layer.attention.sinks), wrapped_ids)
+            layer_call = next(
+                args for args in shard.call_args_list if args.args[0] is layer
+            )
+            self.assertEqual(
+                {id(parameter) for parameter in layer_call.kwargs["ignored_params"]},
+                {
+                    id(parameter)
+                    for module in (layer.attention_hc, layer.moe_hc, layer.attention.sinks)
+                    for parameter in module.parameters(recurse=False)
+                },
+            )
+        root_call = shard.call_args_list[-1]
+        self.assertEqual(
+            {id(parameter) for parameter in root_call.kwargs["ignored_params"]},
+            replicated_ids,
+        )
 
     def test_dsv4_fsdp_leaves_sparse_engram_tables_row_sharded(self):
         with torch.device("meta"):
