@@ -23,7 +23,15 @@ from dsv41_train.runtime import Runtime, distributed_mean, initialize_runtime, l
 
 def distributed_trace(runtime: Runtime, event: str) -> None:
     if os.environ.get("DSV41_DISTRIBUTED_TRACE"):
-        print(json.dumps({"trace": event, "rank": runtime.rank}), flush=True)
+        payload: dict[str, float | int | str] = {
+            "trace": event,
+            "rank": runtime.rank,
+        }
+        if runtime.device.type == "cuda":
+            payload["memory_allocated_gib"] = (
+                torch.cuda.memory_allocated(runtime.device) / 1024**3
+            )
+        print(json.dumps(payload), flush=True)
 
 
 def install_backward_traces(
@@ -90,26 +98,32 @@ def register_sgd_in_backward(
     *,
     learning_rate: float,
     cp_size: int,
-) -> tuple[set[int], list[torch.utils.hooks.RemovableHandle]]:
+) -> tuple[
+    set[int],
+    list[torch.utils.hooks.RemovableHandle],
+    dict[str, int],
+]:
     expert_ids = {id(parameter) for parameter in parameters.experts}
     fsdp_parameters = [
         parameter
         for parameter in (*parameters.dense, *parameters.experts, *parameters.replicated)
         if hasattr(parameter, "to_local")
     ]
+    statistics = {"updates": 0}
     handles = []
     for parameter in fsdp_parameters:
         gradient_scale = 1.0 / cp_size if id(parameter) in expert_ids else 1.0
-        handles.append(
-            parameter.register_post_accumulate_grad_hook(
-                lambda value, scale=gradient_scale: sgd_step_in_backward(
-                    value,
-                    learning_rate=learning_rate,
-                    gradient_scale=scale,
-                )
+
+        def step(value: torch.nn.Parameter, scale: float = gradient_scale) -> None:
+            sgd_step_in_backward(
+                value,
+                learning_rate=learning_rate,
+                gradient_scale=scale,
             )
-        )
-    return {id(parameter) for parameter in fsdp_parameters}, handles
+            statistics["updates"] += 1
+
+        handles.append(parameter.register_post_accumulate_grad_hook(step))
+    return {id(parameter) for parameter in fsdp_parameters}, handles, statistics
 
 
 def data_parallel_rank(global_rank: int, cp_size: int) -> int:
@@ -239,11 +253,20 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
     before = local_tensor(tracked).detach().float().clone()
     optimizer_hook_handles: list[torch.utils.hooks.RemovableHandle] = []
     in_backward_parameter_ids: set[int] = set()
+    optimizer_in_backward_statistics = {"updates": 0}
     if args.optimizer_in_backward:
-        in_backward_parameter_ids, optimizer_hook_handles = register_sgd_in_backward(
+        (
+            in_backward_parameter_ids,
+            optimizer_hook_handles,
+            optimizer_in_backward_statistics,
+        ) = register_sgd_in_backward(
             parameters,
             learning_rate=args.learning_rate,
             cp_size=args.cp_size,
+        )
+        distributed_trace(
+            runtime,
+            f"optimizer_in_backward_registered_{len(in_backward_parameter_ids)}",
         )
     optimizer_parameters = [
         parameter
@@ -282,6 +305,8 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         distributed_trace(runtime, "backward_start")
         output.loss.backward()
         distributed_trace(runtime, "backward_complete")
+        if args.optimizer_in_backward and not optimizer_in_backward_statistics["updates"]:
+            raise RuntimeError("optimizer-in-backward hooks did not run")
         parameters.synchronize(context_parallel, dense_fully_sharded=True)
         distributed_trace(runtime, "context_parallel_gradients_synchronized")
         optimizer.step()
@@ -343,6 +368,8 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         "engram_cpu_offload": args.offload_engram,
         "fsdp_cpu_offload_layers": args.fsdp_cpu_offload_layers,
         "optimizer_in_backward": args.optimizer_in_backward,
+        "optimizer_in_backward_parameters": len(in_backward_parameter_ids),
+        "optimizer_in_backward_updates": optimizer_in_backward_statistics["updates"],
         "loss": last_loss,
         "aux_loss": last_aux_loss,
         "parameter_delta_max": parameter_delta.item(),
