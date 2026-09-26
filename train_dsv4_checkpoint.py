@@ -94,6 +94,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
     )
 
     started = time.perf_counter()
+    distributed_trace(runtime, "checkpoint_load_start")
     model = load_dsv41_backbone_window(
         args.model_path,
         start_layer=args.start_layer,
@@ -108,6 +109,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
     )
     model.train()
     loaded_at = time.perf_counter()
+    distributed_trace(runtime, "checkpoint_load_complete")
 
     routed = model.model.layers[0].moe.routed
     local_expert_parameters = sum(
@@ -132,6 +134,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
 
     apply_fsdp2_root(model, meshes)
     sharded_at = time.perf_counter()
+    distributed_trace(runtime, "root_shard_complete")
     parameters = ParallelParameters.collect(model)
     tracked = model.model.layers[0].attention_hc.fn
     before = local_tensor(tracked).detach().float().clone()
@@ -155,10 +158,14 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         )
         input_ids[:, 0] = model.config.bos_token_id
         optimizer.zero_grad(set_to_none=True)
+        distributed_trace(runtime, "forward_start")
         output = model(input_ids, labels=input_ids)
+        distributed_trace(runtime, "forward_complete")
         if output.loss is None or not torch.isfinite(output.loss):
             raise RuntimeError("training produced a non-finite loss")
+        distributed_trace(runtime, "backward_start")
         output.loss.backward()
+        distributed_trace(runtime, "backward_complete")
         parameters.synchronize(context_parallel, dense_fully_sharded=True)
         distributed_trace(runtime, "context_parallel_gradients_synchronized")
         optimizer.step()

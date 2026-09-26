@@ -141,6 +141,33 @@ class ModelTest(unittest.TestCase):
                     expected.append(call(target, mesh=meshes.fsdp))
                     self.assertEqual(shard.call_args_list, expected)
 
+    def test_dsv4_cp_ep_fsdp_disables_implicit_backward_prefetch(self):
+        with torch.device("meta"):
+            model = DeepSeekV41ForCausalLM(DeepSeekV41Config.tiny())
+        meshes = ParallelMeshes(
+            fsdp=Mock(),
+            cp=Mock(),
+            ep=Mock(),
+            expert_fsdp=Mock(),
+            _dense=Mock(),
+        )
+        try:
+            from torch.distributed.fsdp import fully_shard
+        except ImportError:
+            shard_path = "torch.distributed._composable.fsdp.fully_shard"
+        else:
+            shard_path = "torch.distributed.fsdp.fully_shard"
+
+        with (
+            patch(shard_path),
+            patch(
+                "dsv41_train.models.dsv4.parallel._disable_backward_prefetch"
+            ) as disable,
+        ):
+            apply_fsdp2(model, meshes)
+
+        disable.assert_called_once_with(model)
+
     def test_dsv4_fsdp_leaves_sparse_engram_tables_row_sharded(self):
         with torch.device("meta"):
             model = DeepSeekV41ForCausalLM(

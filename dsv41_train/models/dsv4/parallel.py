@@ -111,6 +111,19 @@ def _fully_shard():
     return fully_shard
 
 
+def _disable_backward_prefetch(module: nn.Module) -> None:
+    """Avoid cross-process-group collective cycles during MoE backward."""
+
+    try:
+        from torch.distributed.fsdp import FSDPModule
+    except ImportError:
+        from torch.distributed._composable.fsdp import FSDPModule
+
+    for child in module.modules():
+        if isinstance(child, FSDPModule):
+            child.set_modules_to_backward_prefetch([])
+
+
 def apply_fsdp2_layer(
     layer: DecoderLayer,
     meshes: ParallelMeshes,
@@ -161,6 +174,8 @@ def apply_fsdp2_root(
     if ignored_params:
         root_options["ignored_params"] = ignored_params
     fully_shard(model, **root_options)
+    if meshes.ep is not None and meshes._dense is not None:
+        _disable_backward_prefetch(model)
 
 
 def apply_fsdp2(
