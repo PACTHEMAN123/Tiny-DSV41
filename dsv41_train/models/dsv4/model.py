@@ -989,20 +989,27 @@ class DeepSeekV41ForCausalLM(nn.Module):
             loss = self.context_parallel.mean_loss(loss_sum, (targets != -100).sum())
 
         local_token_mask = self.context_parallel.shard(token_mask)
+        coefficient = self.config.router_aux_loss_coef
+        stage_router_gradients = bool(
+            loss is not None and torch.is_grad_enabled() and coefficient
+        )
+        auxiliary_logits = (
+            tuple(logits.detach().requires_grad_() for logits in router_logits)
+            if loss is not None
+            else router_logits
+        )
         aux_loss = load_balancing_loss(
-            router_logits,
+            auxiliary_logits,
             self.config.n_routed_experts,
             self.config.num_experts_per_tok,
             local_token_mask,
             self.context_parallel,
         )
         if loss is not None:
-            coefficient = self.config.router_aux_loss_coef
-            if torch.is_grad_enabled() and coefficient:
+            if stage_router_gradients:
                 router_gradients = torch.autograd.grad(
                     aux_loss,
-                    router_logits,
-                    retain_graph=True,
+                    auxiliary_logits,
                 )
                 for layer, gradient in zip(self.model.layers, router_gradients):
                     layer.moe.stage_router_aux_gradient(gradient * coefficient)
