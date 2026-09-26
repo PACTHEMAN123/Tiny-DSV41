@@ -44,6 +44,16 @@ Engram CPU offload, and SGD optimizer steps during FSDP2 backward. Engram
 weights and gradients remain on CPU while only selected rows execute on GPU;
 reduced FSDP2 gradients are applied and released one parameter group at a time.
 
+Two-GPU DSV4 parity between regular SGD and SGD steps during FSDP2 backward,
+including CP2/EP2, gradient checkpointing, compressed attention, and sparse
+Engram gradients:
+
+```bash
+PYTHONPATH=. CUDA_VISIBLE_DEVICES=0,1 \
+python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
+  tests/dsv4_fsdp_optimizer_parity.py
+```
+
 Two-GPU Qwen output and gradient parity:
 
 ```bash
