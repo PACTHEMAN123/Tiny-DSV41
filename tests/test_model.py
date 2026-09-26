@@ -6,13 +6,31 @@ import torch
 
 from dsv41_train.dispatch import DispatchMetadata, TokenDispatcher
 from dsv41_train.models.dsv4 import DeepSeekV41Config, DeepSeekV41ForCausalLM
-from dsv41_train.models.dsv4.model import NgramHash
+from dsv41_train.models.dsv4.model import NgramHash, RowShardedEmbedding
 from dsv41_train.models.dsv4.moe import RoutedExperts
 from dsv41_train.models.dsv4.parallel import ParallelParameters, apply_fsdp2
 from dsv41_train.parallel import ContextParallel, ParallelMeshes
 
 
 class ModelTest(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_cpu_offloaded_sparse_embedding_backpropagates_from_cuda(self):
+        torch.manual_seed(17)
+        table = RowShardedEmbedding(32, 8, sparse_gradients=True)
+        original = table.weight.detach().clone()
+        indices = torch.tensor([1, 3, 1, 7], device="cuda")
+
+        output = table(indices)
+        expected = torch.nn.functional.embedding(indices.cpu(), original).cuda()
+        output.float().square().sum().backward()
+
+        torch.testing.assert_close(output, expected)
+        self.assertEqual(table.weight.device.type, "cpu")
+        self.assertIsNotNone(table.weight.grad)
+        assert table.weight.grad is not None
+        self.assertTrue(table.weight.grad.is_sparse)
+        self.assertEqual(table.weight.grad.device.type, "cpu")
+
     def test_empty_expert_route_does_not_allocate_gradients(self):
         class EmptyReceiveDispatcher(TokenDispatcher):
             def dispatch(self, hidden, expert_ids, weights):

@@ -24,8 +24,10 @@ class TrainTest(unittest.TestCase):
             "batch_size": 1,
             "seq_len": 128,
             "learning_rate": 1.0e-4,
+            "optimizer": "sgd",
             "cp_size": 8,
             "ep_size": 8,
+            "offload_engram": False,
         }
         values.update(overrides)
         return argparse.Namespace(**values)
@@ -49,6 +51,22 @@ class TrainTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires cp-size == ep-size"):
                 train_dsv4_checkpoint.validate_args(
                     self.dsv4_arguments(temporary, ep_size=4), world_size=16
+                )
+
+    def test_dsv4_validate_args_rejects_engram_offload_with_adamw(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "config.json").touch()
+            (folder / "model.safetensors.index.json").touch()
+
+            with self.assertRaisesRegex(ValueError, "requires the sparse SGD"):
+                train_dsv4_checkpoint.validate_args(
+                    self.dsv4_arguments(
+                        temporary,
+                        optimizer="adamw",
+                        offload_engram=True,
+                    ),
+                    world_size=16,
                 )
 
     def test_dsv4_cp_ranks_on_one_node_share_a_data_rank(self):

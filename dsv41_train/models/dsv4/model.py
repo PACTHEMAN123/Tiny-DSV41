@@ -196,7 +196,12 @@ class RowShardedEmbedding(nn.Module):
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         if self.size == 1:
-            return F.embedding(indices, self.weight, sparse=self.sparse_gradients)
+            rows = F.embedding(
+                indices.to(self.weight.device),
+                self.weight,
+                sparse=self.sparse_gradients,
+            )
+            return rows if rows.device == indices.device else rows.to(indices.device)
         if indices.numel() and (indices.min() < 0 or indices.max() >= self.global_num_embeddings):
             raise IndexError("embedding index is outside the configured row range")
 
@@ -220,10 +225,12 @@ class RowShardedEmbedding(nn.Module):
             flat[order].contiguous(), recv_splits, send_splits, autograd=False
         )
         rows = F.embedding(
-            routed - self.row_start,
+            (routed - self.row_start).to(self.weight.device),
             self.weight,
             sparse=self.sparse_gradients,
         )
+        if rows.device != routed.device:
+            rows = rows.to(routed.device)
         rows = _ScaleGradient.apply(rows, 1.0 / self.size)
         returned = self._exchange(
             rows.contiguous(), send_splits, recv_splits, autograd=True

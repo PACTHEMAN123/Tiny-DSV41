@@ -39,6 +39,11 @@ PYTHONPATH=.:tests python3 -m torch.distributed.run \
 
 ## GPU distributed checks
 
+The full 40-layer DSV4 CP8 smoke in the README uses
+`--gradient-checkpointing --offload-engram`. The latter keeps sparse Engram
+weights and gradients on CPU while preserving GPU execution for the selected
+rows.
+
 Two-GPU Qwen output and gradient parity:
 
 ```bash

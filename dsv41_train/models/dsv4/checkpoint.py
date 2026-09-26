@@ -297,9 +297,13 @@ def load_dsv41_backbone_window(
     token_dispatcher: TokenDispatcher | None = None,
     engram_mesh: DeviceMesh | None = None,
     sparse_engram_gradients: bool = False,
+    offload_engram: bool = False,
     layer_loaded: Callable[[DecoderLayer], None] | None = None,
 ) -> DeepSeekV41ForCausalLM:
     """Load a trainable prefix or source-anchored layer window."""
+
+    if offload_engram and not sparse_engram_gradients:
+        raise ValueError("Engram CPU offload requires sparse Engram gradients")
 
     folder = Path(folder)
     if start_layer == 0:
@@ -441,8 +445,9 @@ def load_dsv41_backbone_window(
 
             if layer.engram is not None:
                 table = model.model.engram_tables[str(layer_id)]
+                table_device = torch.device("cpu") if offload_engram else target_device
                 table_weight = torch.empty(
-                    table.weight.shape, device=target_device, dtype=dtype
+                    table.weight.shape, device=table_device, dtype=dtype
                 )
                 chunk_rows = 131072
                 for chunk_start in range(table.row_start, table.row_stop, chunk_rows):
@@ -460,7 +465,7 @@ def load_dsv41_backbone_window(
                         target_device,
                     )
                     table_weight[chunk_start - table.row_start : chunk_stop - table.row_start].copy_(
-                        dequantize_fp8_rows(weight, scale, dtype=dtype)
+                        dequantize_fp8_rows(weight, scale, dtype=dtype).to(table_device)
                     )
                 assign(table, {"weight": table_weight})
                 state["engram.q_weight"] = read(f"{source}.engram.q_weight").to(dtype)
@@ -501,6 +506,7 @@ def load_dsv41_backbone_prefix(
     token_dispatcher: TokenDispatcher | None = None,
     engram_mesh: DeviceMesh | None = None,
     sparse_engram_gradients: bool = False,
+    offload_engram: bool = False,
     layer_loaded: Callable[[DecoderLayer], None] | None = None,
 ) -> DeepSeekV41ForCausalLM:
     """Load a trainable prefix directly from the released checkpoint."""
@@ -515,6 +521,7 @@ def load_dsv41_backbone_prefix(
         token_dispatcher=token_dispatcher,
         engram_mesh=engram_mesh,
         sparse_engram_gradients=sparse_engram_gradients,
+        offload_engram=offload_engram,
         layer_loaded=layer_loaded,
     )
 

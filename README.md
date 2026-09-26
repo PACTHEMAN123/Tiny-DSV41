@@ -31,13 +31,16 @@ python3 -m torch.distributed.run \
   --model-path /path/to/DeepSeek-V4.1-Flash \
   --start-layer 0 --num-layers 40 \
   --ep-size 8 --cp-size 8 \
-  --optimizer sgd --steps 1 --batch-size 1 --seq-len 128 \
-  --metrics-file /mnt/fuse/oss/xiaopac.xjy/dsv41/cp8-fsdp16-128.json
+  --optimizer sgd --steps 1 --batch-size 1 --seq-len 256 \
+  --gradient-checkpointing --offload-engram \
+  --metrics-file /mnt/fuse/oss/xiaopac.xjy/dsv41/cp8-fsdp16-256.json
 ```
 
-The first run gives each GPU 16 query tokens, versus eight tokens per GPU in the
-previous CP1 smoke. Validate it before increasing the global sequence length to
-256, 512, and beyond.
+Each GPU processes 32 query tokens in this first full-model run. Gradient
+checkpointing recomputes the decoder stack during backward, while
+`--offload-engram` keeps the row-sharded sparse Engram tables in host memory and
+copies only the selected rows to the GPU. Engram offload is available with the
+sparse SGD path; validate this run before increasing the sequence length.
 
 ### One node, 8 GPUs, 9-layer prefix
 
