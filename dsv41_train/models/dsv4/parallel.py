@@ -1,5 +1,7 @@
 """DSV4 parallel topology and FSDP wrapping."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, replace
 
 import torch.distributed as dist
