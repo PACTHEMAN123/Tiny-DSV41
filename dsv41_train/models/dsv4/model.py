@@ -997,7 +997,16 @@ class DeepSeekV41ForCausalLM(nn.Module):
             self.context_parallel,
         )
         if loss is not None:
-            loss = loss + self.config.router_aux_loss_coef * aux_loss
+            coefficient = self.config.router_aux_loss_coef
+            if torch.is_grad_enabled() and coefficient:
+                router_gradients = torch.autograd.grad(
+                    aux_loss,
+                    router_logits,
+                    retain_graph=True,
+                )
+                for layer, gradient in zip(self.model.layers, router_gradients):
+                    layer.moe.stage_router_aux_gradient(gradient * coefficient)
+            loss = loss + coefficient * aux_loss.detach()
         return CausalLMOutput(loss, logits, aux_loss, router_logits)
 
 

@@ -1,4 +1,5 @@
 import unittest
+from copy import deepcopy
 from unittest.mock import Mock, call, patch
 
 import torch
@@ -247,6 +248,46 @@ class ModelTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(output.loss))
         output.loss.backward()
         self.assertIsNotNone(model.model.embedding.weight.grad)
+
+    def test_router_aux_gradient_injection_matches_direct_loss(self):
+        torch.manual_seed(31)
+        config = DeepSeekV41Config.tiny()
+        config.router_aux_loss_coef = 0.125
+        injected = DeepSeekV41ForCausalLM(config)
+        direct = deepcopy(injected)
+        input_ids = torch.randint(0, config.vocab_size, (2, 8))
+
+        injected_output = injected(input_ids, labels=input_ids)
+        assert injected_output.loss is not None
+        injected_output.loss.backward()
+
+        direct_output = direct(input_ids)
+        targets = torch.full_like(input_ids, -100)
+        targets[:, :-1] = input_ids[:, 1:]
+        task_loss = torch.nn.functional.cross_entropy(
+            direct_output.logits.float().reshape(-1, config.vocab_size),
+            targets.reshape(-1),
+            ignore_index=-100,
+        )
+        assert direct_output.aux_loss is not None
+        direct_loss = task_loss + config.router_aux_loss_coef * direct_output.aux_loss
+        direct_loss.backward()
+
+        torch.testing.assert_close(injected_output.loss, direct_loss)
+        for (injected_name, injected_parameter), (direct_name, direct_parameter) in zip(
+            injected.named_parameters(), direct.named_parameters()
+        ):
+            self.assertEqual(injected_name, direct_name)
+            if injected_parameter.grad is None or direct_parameter.grad is None:
+                self.assertIs(injected_parameter.grad, direct_parameter.grad)
+                continue
+            torch.testing.assert_close(
+                injected_parameter.grad,
+                direct_parameter.grad,
+                rtol=2e-5,
+                atol=2e-6,
+                msg=lambda message, name=injected_name: f"{name}: {message}",
+            )
 
     def test_explicit_local_parallel_primitives(self):
         dispatcher = TokenDispatcher()

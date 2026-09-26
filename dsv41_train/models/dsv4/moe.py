@@ -123,11 +123,26 @@ class SparseMoE(nn.Module):
         self.router = TopKRouter(config)
         self.routed = RoutedExperts(config, dispatcher)
         self.shared = SharedExpert(config)
+        self._router_aux_gradient: torch.Tensor | None = None
+
+    def stage_router_aux_gradient(self, gradient: torch.Tensor) -> None:
+        if self._router_aux_gradient is not None:
+            raise RuntimeError("router auxiliary gradient was not consumed")
+        self._router_aux_gradient = gradient.detach()
+
+    def _add_router_aux_gradient(self, gradient: torch.Tensor) -> torch.Tensor:
+        auxiliary = self._router_aux_gradient
+        self._router_aux_gradient = None
+        if auxiliary is None:
+            return gradient
+        return gradient + auxiliary.to(device=gradient.device, dtype=gradient.dtype)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         shape = x.shape
         flat = x.flatten(0, 1)
         logits, weights, indices = self.router(x)
+        if logits.requires_grad:
+            logits.register_hook(self._add_router_aux_gradient)
         output = self.routed(flat, indices, weights) + self.shared(flat).float()
         return output.to(x.dtype).view(shape), logits
 
