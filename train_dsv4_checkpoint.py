@@ -88,6 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ep-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--metrics-file")
+    parser.add_argument("--gradient-checkpointing", action="store_true")
     return parser.parse_args()
 
 
@@ -141,6 +142,8 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         sparse_engram_gradients=args.optimizer == "sgd",
         layer_loaded=lambda layer: apply_fsdp2_layer(layer, meshes),
     )
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
     model.train()
     loaded_at = time.perf_counter()
     distributed_trace(runtime, "checkpoint_load_complete")
@@ -258,6 +261,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         "sequence_length": args.seq_len,
         "start_layer": args.start_layer,
         "optimizer": args.optimizer,
+        "gradient_checkpointing": args.gradient_checkpointing,
         "loss": last_loss,
         "aux_loss": last_aux_loss,
         "parameter_delta_max": parameter_delta.item(),

@@ -21,6 +21,7 @@ import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from .config import DeepSeekV41Config
 from .moe import RoutedExperts, SparseMoE, TopKRouter
@@ -801,6 +802,7 @@ class DeepSeekV41Model(nn.Module):
                 for layer_id in self.engram_layer_ids
             }
         )
+        self.gradient_checkpointing = False
 
     def forward(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None
@@ -833,9 +835,43 @@ class DeepSeekV41Model(nn.Module):
             for index, layer_id in enumerate(self.engram_layer_ids):
                 engram_rows[layer_id] = self.engram_tables[str(layer_id)](hashes[:, :, index])
 
-        shared: dict[str, torch.Tensor | None] = {}
         pre_mix = hidden.new_zeros(batch, length, self.config.hc_mult, dtype=torch.float32)
         pre_mix[..., 0] = 1
+        ordered_engram_rows = tuple(
+            engram_rows[layer_id] for layer_id in self.engram_layer_ids
+        )
+        layer_inputs = (
+            streams,
+            pre_mix,
+            positions,
+            causal_mask,
+            attention_mask,
+            *ordered_engram_rows,
+        )
+        if self.gradient_checkpointing and self.training:
+            layer_outputs = checkpoint(
+                self._forward_layers,
+                *layer_inputs,
+                use_reentrant=False,
+            )
+        else:
+            layer_outputs = self._forward_layers(*layer_inputs)
+        streams, pre_mix, *router_logits = layer_outputs
+
+        hidden = DecoderLayer.collapse(streams, pre_mix)
+        return self.norm(hidden), tuple(router_logits)
+
+    def _forward_layers(
+        self,
+        streams: torch.Tensor,
+        pre_mix: torch.Tensor,
+        positions: torch.Tensor,
+        causal_mask: torch.Tensor,
+        attention_mask: torch.Tensor,
+        *ordered_engram_rows: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        shared: dict[str, torch.Tensor | None] = {}
+        engram_rows = dict(zip(self.engram_layer_ids, ordered_engram_rows))
         router_logits = []
         for layer in self.layers:
             streams, pre_mix, logits = layer(
@@ -848,9 +884,7 @@ class DeepSeekV41Model(nn.Module):
                 engram_rows.get(layer.layer_id),
             )
             router_logits.append(logits)
-
-        hidden = DecoderLayer.collapse(streams, pre_mix)
-        return self.norm(hidden), tuple(router_logits)
+        return streams, pre_mix, *router_logits
 
     def _causal_mask(self, token_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         length = token_mask.shape[1]
@@ -960,6 +994,9 @@ class DeepSeekV41ForCausalLM(nn.Module):
                     nn.init.normal_(parameter, std=std, generator=generator)
                 for parameter in module.down:
                     nn.init.normal_(parameter, std=std, generator=generator)
+
+    def gradient_checkpointing_enable(self) -> None:
+        self.model.gradient_checkpointing = True
 
     def forward(
         self,

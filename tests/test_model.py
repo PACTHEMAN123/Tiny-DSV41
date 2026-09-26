@@ -297,6 +297,41 @@ class ModelTest(unittest.TestCase):
         output.loss.backward()
         self.assertIsNotNone(model.model.embedding.weight.grad)
 
+    def test_gradient_checkpointing_matches_direct_backward(self):
+        torch.manual_seed(23)
+        direct = DeepSeekV41ForCausalLM(DeepSeekV41Config.tiny())
+        checkpointed = deepcopy(direct)
+        checkpointed.gradient_checkpointing_enable()
+        direct.train()
+        checkpointed.train()
+        input_ids = torch.randint(0, direct.config.vocab_size, (1, 8))
+
+        direct_output = direct(input_ids, labels=input_ids)
+        checkpointed_output = checkpointed(input_ids, labels=input_ids)
+        assert direct_output.loss is not None
+        assert checkpointed_output.loss is not None
+        direct_output.loss.backward()
+        checkpointed_output.loss.backward()
+
+        torch.testing.assert_close(checkpointed_output.logits, direct_output.logits)
+        torch.testing.assert_close(checkpointed_output.loss, direct_output.loss)
+        pairs = zip(direct.named_parameters(), checkpointed.named_parameters())
+        for (direct_name, direct_parameter), (
+            checkpointed_name,
+            checkpointed_parameter,
+        ) in pairs:
+            self.assertEqual(direct_name, checkpointed_name)
+            if direct_parameter.grad is None or checkpointed_parameter.grad is None:
+                self.assertIs(direct_parameter.grad, checkpointed_parameter.grad)
+                continue
+            torch.testing.assert_close(
+                checkpointed_parameter.grad,
+                direct_parameter.grad,
+                rtol=2e-5,
+                atol=2e-6,
+                msg=lambda message, name=direct_name: f"{name}: {message}",
+            )
+
     def test_router_aux_gradient_injection_matches_direct_loss(self):
         torch.manual_seed(31)
         config = DeepSeekV41Config.tiny()
