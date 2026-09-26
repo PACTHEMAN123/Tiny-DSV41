@@ -68,6 +68,50 @@ def maximum_parameter_delta(before: torch.Tensor, after: torch.Tensor) -> torch.
     return (after.float() - before.float()).abs().max()
 
 
+def sgd_step_in_backward(
+    parameter: torch.nn.Parameter,
+    *,
+    learning_rate: float,
+    gradient_scale: float = 1.0,
+) -> None:
+    gradient = parameter.grad
+    if gradient is None:
+        return
+    with torch.no_grad():
+        local_tensor(parameter).add_(
+            local_tensor(gradient),
+            alpha=-learning_rate * gradient_scale,
+        )
+    parameter.grad = None
+
+
+def register_sgd_in_backward(
+    parameters: ParallelParameters,
+    *,
+    learning_rate: float,
+    cp_size: int,
+) -> tuple[set[int], list[torch.utils.hooks.RemovableHandle]]:
+    expert_ids = {id(parameter) for parameter in parameters.experts}
+    fsdp_parameters = [
+        parameter
+        for parameter in (*parameters.dense, *parameters.experts, *parameters.replicated)
+        if hasattr(parameter, "to_local")
+    ]
+    handles = []
+    for parameter in fsdp_parameters:
+        gradient_scale = 1.0 / cp_size if id(parameter) in expert_ids else 1.0
+        handles.append(
+            parameter.register_post_accumulate_grad_hook(
+                lambda value, scale=gradient_scale: sgd_step_in_backward(
+                    value,
+                    learning_rate=learning_rate,
+                    gradient_scale=scale,
+                )
+            )
+        )
+    return {id(parameter) for parameter in fsdp_parameters}, handles
+
+
 def data_parallel_rank(global_rank: int, cp_size: int) -> int:
     if global_rank < 0 or cp_size < 1:
         raise ValueError("global-rank must be non-negative and cp-size must be positive")
@@ -91,6 +135,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--offload-engram", action="store_true")
     parser.add_argument("--fsdp-cpu-offload-layers", type=int, default=0)
+    parser.add_argument("--optimizer-in-backward", action="store_true")
     return parser.parse_args()
 
 
@@ -123,6 +168,10 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
         raise ValueError("Engram CPU offload requires the sparse SGD training path")
     if not 0 <= args.fsdp_cpu_offload_layers <= args.num_layers:
         raise ValueError("fsdp-cpu-offload-layers must be between zero and num-layers")
+    if args.optimizer_in_backward and args.optimizer != "sgd":
+        raise ValueError("optimizer-in-backward requires SGD")
+    if args.optimizer_in_backward and args.fsdp_cpu_offload_layers:
+        raise ValueError("optimizer-in-backward cannot be combined with FSDP CPU offload")
 
 
 def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int | str]:
@@ -188,12 +237,29 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
     parameters = ParallelParameters.collect(model)
     tracked = model.model.layers[0].attention_hc.fn
     before = local_tensor(tracked).detach().float().clone()
+    optimizer_hook_handles: list[torch.utils.hooks.RemovableHandle] = []
+    in_backward_parameter_ids: set[int] = set()
+    if args.optimizer_in_backward:
+        in_backward_parameter_ids, optimizer_hook_handles = register_sgd_in_backward(
+            parameters,
+            learning_rate=args.learning_rate,
+            cp_size=args.cp_size,
+        )
+    optimizer_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if id(parameter) not in in_backward_parameter_ids
+    ]
     if args.optimizer == "adamw":
         optimizer: torch.optim.Optimizer = torch.optim.AdamW(
-            model.parameters(), lr=args.learning_rate, foreach=False
+            optimizer_parameters, lr=args.learning_rate, foreach=False
         )
     else:
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, foreach=False)
+        optimizer = torch.optim.SGD(
+            optimizer_parameters,
+            lr=args.learning_rate,
+            foreach=False,
+        )
 
     generator = torch.Generator(device=runtime.device)
     generator.manual_seed(args.seed + data_parallel_rank(runtime.rank, args.cp_size))
@@ -207,7 +273,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
             generator=generator,
         )
         input_ids[:, 0] = model.config.bos_token_id
-        optimizer.zero_grad(set_to_none=True)
+        model.zero_grad(set_to_none=True)
         distributed_trace(runtime, "forward_start")
         output = model(input_ids, labels=input_ids)
         distributed_trace(runtime, "forward_complete")
@@ -276,6 +342,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         "gradient_checkpointing": args.gradient_checkpointing,
         "engram_cpu_offload": args.offload_engram,
         "fsdp_cpu_offload_layers": args.fsdp_cpu_offload_layers,
+        "optimizer_in_backward": args.optimizer_in_backward,
         "loss": last_loss,
         "aux_loss": last_aux_loss,
         "parameter_delta_max": parameter_delta.item(),
@@ -291,6 +358,8 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
     for handle in backward_trace_handles:
+        handle.remove()
+    for handle in optimizer_hook_handles:
         handle.remove()
     return metrics
 

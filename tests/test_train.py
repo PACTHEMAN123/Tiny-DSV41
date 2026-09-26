@@ -29,6 +29,7 @@ class TrainTest(unittest.TestCase):
             "ep_size": 8,
             "offload_engram": False,
             "fsdp_cpu_offload_layers": 0,
+            "optimizer_in_backward": False,
         }
         values.update(overrides)
         return argparse.Namespace(**values)
@@ -84,6 +85,38 @@ class TrainTest(unittest.TestCase):
                     ),
                     world_size=16,
                 )
+
+    def test_dsv4_validate_args_rejects_overlapping_offload_strategies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "config.json").touch()
+            (folder / "model.safetensors.index.json").touch()
+
+            with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                train_dsv4_checkpoint.validate_args(
+                    self.dsv4_arguments(
+                        temporary,
+                        fsdp_cpu_offload_layers=1,
+                        optimizer_in_backward=True,
+                    ),
+                    world_size=16,
+                )
+
+    def test_sgd_step_in_backward_updates_and_clears_gradient(self):
+        parameter = torch.nn.Parameter(torch.tensor([2.0]))
+        handle = parameter.register_post_accumulate_grad_hook(
+            lambda value: train_dsv4_checkpoint.sgd_step_in_backward(
+                value,
+                learning_rate=0.25,
+                gradient_scale=0.5,
+            )
+        )
+
+        (parameter * 4).sum().backward()
+
+        self.assertEqual(parameter.item(), 1.5)
+        self.assertIsNone(parameter.grad)
+        handle.remove()
 
     def test_dsv4_cp_ranks_on_one_node_share_a_data_rank(self):
         self.assertEqual(

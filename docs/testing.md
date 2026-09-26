@@ -40,10 +40,9 @@ PYTHONPATH=.:tests python3 -m torch.distributed.run \
 ## GPU distributed checks
 
 The full 40-layer DSV4 CP8 smoke in the README uses gradient checkpointing,
-Engram CPU offload, and FSDP2 CPU offload for the final four layers. Engram
+Engram CPU offload, and SGD optimizer steps during FSDP2 backward. Engram
 weights and gradients remain on CPU while only selected rows execute on GPU;
-the bounded FSDP2 offload provides additional headroom without moving the full
-model to host memory.
+reduced FSDP2 gradients are applied and released one parameter group at a time.
 
 Two-GPU Qwen output and gradient parity:
 

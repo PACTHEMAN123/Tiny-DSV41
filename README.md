@@ -32,7 +32,7 @@ python3 -m torch.distributed.run \
   --start-layer 0 --num-layers 40 \
   --ep-size 8 --cp-size 8 \
   --optimizer sgd --steps 1 --batch-size 1 --seq-len 256 \
-  --gradient-checkpointing --offload-engram --fsdp-cpu-offload-layers 4 \
+  --gradient-checkpointing --offload-engram --optimizer-in-backward \
   --metrics-file /mnt/fuse/oss/xiaopac.xjy/dsv41/cp8-fsdp16-256.json
 ```
 
@@ -40,9 +40,10 @@ Each GPU processes 32 query tokens in this first full-model run. Gradient
 checkpointing recomputes the decoder stack during backward, while
 `--offload-engram` keeps the row-sharded sparse Engram tables in host memory and
 copies only the selected rows to the GPU. Engram offload is available with the
-sparse SGD path. The final four decoder layers additionally use FSDP2 CPU
-offload for their parameter shards and reduced gradients; validate this run
-before increasing the sequence length.
+sparse SGD path. `--optimizer-in-backward` applies each FSDP2 SGD update as soon
+as its reduced parameter shard is ready, then releases that gradient instead of
+retaining all 40 layers through the end of backward. Validate this run before
+increasing the sequence length.
 
 ### One node, 8 GPUs, 9-layer prefix
 
