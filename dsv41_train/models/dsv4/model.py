@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -757,6 +758,14 @@ class DecoderLayer(nn.Module):
 
 
 class DeepSeekV41Model(nn.Module):
+    _shared_state_keys = (
+        "compress_lengths",
+        "compressed_kv",
+        "index_keys",
+        "topk_indices",
+        "candidates",
+    )
+
     def __init__(
         self,
         config: DeepSeekV41Config,
@@ -847,26 +856,88 @@ class DeepSeekV41Model(nn.Module):
         ordered_engram_rows = tuple(
             engram_rows[layer_id] for layer_id in self.engram_layer_ids
         )
-        layer_inputs = (
+        if self.gradient_checkpointing and self.training:
+            streams, pre_mix, router_logits = self._checkpointed_layers(
+                streams,
+                pre_mix,
+                positions,
+                causal_mask,
+                attention_mask,
+                engram_rows,
+            )
+        else:
+            layer_outputs = self._forward_layers(
+                streams,
+                pre_mix,
+                positions,
+                causal_mask,
+                attention_mask,
+                *ordered_engram_rows,
+            )
+            streams, pre_mix, *router_logits = layer_outputs
+
+        hidden = DecoderLayer.collapse(streams, pre_mix)
+        return self.norm(hidden), tuple(router_logits)
+
+    def _checkpointed_layers(
+        self,
+        streams: torch.Tensor,
+        pre_mix: torch.Tensor,
+        positions: torch.Tensor,
+        causal_mask: torch.Tensor,
+        attention_mask: torch.Tensor,
+        engram_rows: dict[int, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+        empty = streams.new_empty(0)
+        shared_state = tuple(empty for _ in self._shared_state_keys)
+        router_logits = []
+        for layer in self.layers:
+            engram_row = engram_rows.get(layer.layer_id, empty)
+            outputs = checkpoint(
+                partial(self._forward_checkpointed_layer, layer),
+                streams,
+                pre_mix,
+                positions,
+                causal_mask,
+                attention_mask,
+                engram_row,
+                *shared_state,
+                use_reentrant=False,
+            )
+            streams, pre_mix, logits, *shared_state = outputs
+            router_logits.append(logits)
+        return streams, pre_mix, router_logits
+
+    def _forward_checkpointed_layer(
+        self,
+        layer: DecoderLayer,
+        streams: torch.Tensor,
+        pre_mix: torch.Tensor,
+        positions: torch.Tensor,
+        causal_mask: torch.Tensor,
+        attention_mask: torch.Tensor,
+        engram_row: torch.Tensor,
+        *shared_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        shared = {
+            key: None if value.numel() == 0 else value
+            for key, value in zip(self._shared_state_keys, shared_state)
+        }
+        streams, pre_mix, logits = layer(
             streams,
             pre_mix,
             positions,
             causal_mask,
             attention_mask,
-            *ordered_engram_rows,
+            shared,
+            None if engram_row.numel() == 0 else engram_row,
         )
-        if self.gradient_checkpointing and self.training:
-            layer_outputs = checkpoint(
-                self._forward_layers,
-                *layer_inputs,
-                use_reentrant=False,
-            )
-        else:
-            layer_outputs = self._forward_layers(*layer_inputs)
-        streams, pre_mix, *router_logits = layer_outputs
-
-        hidden = DecoderLayer.collapse(streams, pre_mix)
-        return self.norm(hidden), tuple(router_logits)
+        empty = streams.new_empty(0)
+        packed_state = []
+        for key in self._shared_state_keys:
+            value = shared.get(key)
+            packed_state.append(value if isinstance(value, torch.Tensor) else empty)
+        return streams, pre_mix, logits, *packed_state
 
     def _forward_layers(
         self,
