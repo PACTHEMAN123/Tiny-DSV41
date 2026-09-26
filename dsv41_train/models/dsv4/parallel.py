@@ -132,6 +132,14 @@ def _fully_shard():
     return fully_shard
 
 
+def _cpu_offload_policy():
+    try:
+        from torch.distributed.fsdp import CPUOffloadPolicy
+    except ImportError:
+        from torch.distributed._composable.fsdp import CPUOffloadPolicy
+    return CPUOffloadPolicy(pin_memory=False)
+
+
 def _disable_backward_prefetch(module: nn.Module) -> None:
     """Avoid cross-process-group collective cycles during MoE backward."""
 
@@ -162,8 +170,12 @@ def apply_fsdp2_layer(
     meshes: ParallelMeshes,
     *,
     reshard_after_forward: bool = True,
+    cpu_offload: bool = False,
 ) -> None:
     fully_shard = _fully_shard()
+    offload_options = (
+        {"offload_policy": _cpu_offload_policy()} if cpu_offload else {}
+    )
     replicate_fp32 = meshes.ep is not None and meshes._dense is not None
     if meshes.ep is not None:
         assert meshes.expert_fsdp is not None
@@ -172,6 +184,7 @@ def apply_fsdp2_layer(
             layer.moe.routed,
             mesh=meshes.expert_fsdp,
             reshard_after_forward=reshard_after_forward,
+            **offload_options,
         )
     if replicate_fp32:
         fully_shard(
@@ -179,6 +192,7 @@ def apply_fsdp2_layer(
             mesh=meshes.fsdp,
             reshard_after_forward=reshard_after_forward,
             ignored_params=_replicated_fp32_parameters(layer),
+            **offload_options,
         )
     else:
         for fp32_module in (layer.attention_hc, layer.moe_hc, layer.attention.sinks):
@@ -186,8 +200,14 @@ def apply_fsdp2_layer(
                 fp32_module,
                 mesh=meshes.fsdp,
                 reshard_after_forward=reshard_after_forward,
+                **offload_options,
             )
-        fully_shard(layer, mesh=meshes.fsdp, reshard_after_forward=reshard_after_forward)
+        fully_shard(
+            layer,
+            mesh=meshes.fsdp,
+            reshard_after_forward=reshard_after_forward,
+            **offload_options,
+        )
 
 
 def apply_fsdp2_root(

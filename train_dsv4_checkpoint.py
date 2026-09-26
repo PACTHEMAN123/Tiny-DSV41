@@ -90,6 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics-file")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--offload-engram", action="store_true")
+    parser.add_argument("--fsdp-cpu-offload-layers", type=int, default=0)
     return parser.parse_args()
 
 
@@ -120,6 +121,8 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
         raise ValueError("the checkpoint's 384 experts must divide evenly across ep-size")
     if args.offload_engram and args.optimizer != "sgd":
         raise ValueError("Engram CPU offload requires the sparse SGD training path")
+    if not 0 <= args.fsdp_cpu_offload_layers <= args.num_layers:
+        raise ValueError("fsdp-cpu-offload-layers must be between zero and num-layers")
 
 
 def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int | str]:
@@ -133,6 +136,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
 
     started = time.perf_counter()
     distributed_trace(runtime, "checkpoint_load_start")
+    offload_layer_start = args.start_layer + args.num_layers - args.fsdp_cpu_offload_layers
     model = load_dsv41_backbone_window(
         args.model_path,
         start_layer=args.start_layer,
@@ -144,7 +148,11 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         num_layers=args.num_layers,
         sparse_engram_gradients=args.optimizer == "sgd",
         offload_engram=args.offload_engram,
-        layer_loaded=lambda layer: apply_fsdp2_layer(layer, meshes),
+        layer_loaded=lambda layer: apply_fsdp2_layer(
+            layer,
+            meshes,
+            cpu_offload=layer.layer_id >= offload_layer_start,
+        ),
     )
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -267,6 +275,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         "optimizer": args.optimizer,
         "gradient_checkpointing": args.gradient_checkpointing,
         "engram_cpu_offload": args.offload_engram,
+        "fsdp_cpu_offload_layers": args.fsdp_cpu_offload_layers,
         "loss": last_loss,
         "aux_loss": last_aux_loss,
         "parameter_delta_max": parameter_delta.item(),

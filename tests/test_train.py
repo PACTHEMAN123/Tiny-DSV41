@@ -28,6 +28,7 @@ class TrainTest(unittest.TestCase):
             "cp_size": 8,
             "ep_size": 8,
             "offload_engram": False,
+            "fsdp_cpu_offload_layers": 0,
         }
         values.update(overrides)
         return argparse.Namespace(**values)
@@ -65,6 +66,21 @@ class TrainTest(unittest.TestCase):
                         temporary,
                         optimizer="adamw",
                         offload_engram=True,
+                    ),
+                    world_size=16,
+                )
+
+    def test_dsv4_validate_args_rejects_too_many_offloaded_layers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "config.json").touch()
+            (folder / "model.safetensors.index.json").touch()
+
+            with self.assertRaisesRegex(ValueError, "between zero and num-layers"):
+                train_dsv4_checkpoint.validate_args(
+                    self.dsv4_arguments(
+                        temporary,
+                        fsdp_cpu_offload_layers=41,
                     ),
                     world_size=16,
                 )

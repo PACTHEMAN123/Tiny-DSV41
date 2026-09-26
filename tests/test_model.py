@@ -8,7 +8,11 @@ from dsv41_train.dispatch import DispatchMetadata, TokenDispatcher
 from dsv41_train.models.dsv4 import DeepSeekV41Config, DeepSeekV41ForCausalLM
 from dsv41_train.models.dsv4.model import NgramHash, RowShardedEmbedding
 from dsv41_train.models.dsv4.moe import RoutedExperts
-from dsv41_train.models.dsv4.parallel import ParallelParameters, apply_fsdp2
+from dsv41_train.models.dsv4.parallel import (
+    ParallelParameters,
+    apply_fsdp2,
+    apply_fsdp2_layer,
+)
 from dsv41_train.parallel import ContextParallel, ParallelMeshes
 
 
@@ -186,6 +190,37 @@ class ModelTest(unittest.TestCase):
             apply_fsdp2(model, meshes)
 
         disable.assert_called_once_with(model)
+
+    def test_dsv4_layer_fsdp_can_offload_selected_layers(self):
+        with torch.device("meta"):
+            model = DeepSeekV41ForCausalLM(DeepSeekV41Config.tiny())
+        layer = model.model.layers[-1]
+        meshes = ParallelMeshes(
+            fsdp=Mock(),
+            cp=Mock(),
+            ep=Mock(),
+            expert_fsdp=Mock(),
+            _dense=Mock(),
+        )
+        policy = object()
+        try:
+            from torch.distributed.fsdp import fully_shard
+        except ImportError:
+            shard_path = "torch.distributed._composable.fsdp.fully_shard"
+        else:
+            shard_path = "torch.distributed.fsdp.fully_shard"
+
+        with (
+            patch(shard_path) as shard,
+            patch(
+                "dsv41_train.models.dsv4.parallel._cpu_offload_policy",
+                return_value=policy,
+            ),
+        ):
+            apply_fsdp2_layer(layer, meshes, cpu_offload=True)
+
+        self.assertEqual(shard.call_args_list[0].kwargs["offload_policy"], policy)
+        self.assertEqual(shard.call_args_list[-1].kwargs["offload_policy"], policy)
 
     def test_dsv4_cp_ep_fsdp_replicates_small_fp32_parameters(self):
         with torch.device("meta"):
