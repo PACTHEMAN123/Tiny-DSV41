@@ -2,6 +2,7 @@ import argparse
 import os
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -112,7 +113,10 @@ class TrainTest(unittest.TestCase):
         self.assertEqual(runtime.rank, 2)
         self.assertEqual(runtime.world_size, 4)
         set_device.assert_called_once_with(2)
-        init_process_group.assert_called_once_with(backend="nccl")
+        init_process_group.assert_called_once_with(
+            backend="nccl",
+            timeout=timedelta(seconds=600),
+        )
 
     def test_distributed_training_rejects_a_pinned_device(self):
         with patch.dict(os.environ, {"WORLD_SIZE": "4"}, clear=True):

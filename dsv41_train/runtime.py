@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -60,7 +61,15 @@ def initialize_runtime(
 
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        timeout_seconds = float(
+            os.environ.get("DSV41_DISTRIBUTED_TIMEOUT_SECONDS", "600")
+        )
+        if timeout_seconds <= 0:
+            raise ValueError("DSV41_DISTRIBUTED_TIMEOUT_SECONDS must be positive")
+        dist.init_process_group(
+            backend="nccl",
+            timeout=timedelta(seconds=timeout_seconds),
+        )
     return Runtime(
         device=torch.device("cuda", local_rank),
         rank=dist.get_rank(),
