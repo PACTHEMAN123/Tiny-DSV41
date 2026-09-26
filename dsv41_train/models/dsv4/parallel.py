@@ -142,7 +142,10 @@ def _disable_backward_prefetch(module: nn.Module) -> None:
 
     for child in module.modules():
         if isinstance(child, FSDPModule):
-            child.set_modules_to_backward_prefetch([])
+            # In PyTorch 2.11, an empty explicit list enables the implicit
+            # reverse post-forward prefetch. Targeting the already-unsharded
+            # current module suppresses that implicit cross-layer collective.
+            child.set_modules_to_backward_prefetch([child])
 
 
 def _replicated_fp32_parameters(module: nn.Module) -> set[nn.Parameter]:
