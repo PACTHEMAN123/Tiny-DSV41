@@ -31,12 +31,12 @@ python3 -m torch.distributed.run \
   --model-path /path/to/DeepSeek-V4.1-Flash \
   --start-layer 0 --num-layers 40 \
   --ep-size 8 --cp-size 8 \
-  --optimizer sgd --steps 1 --batch-size 1 --seq-len 512 \
+  --optimizer sgd --steps 1 --batch-size 1 --seq-len 1024 \
   --gradient-checkpointing --offload-engram --optimizer-in-backward \
-  --metrics-file /mnt/fuse/oss/xiaopac.xjy/dsv41/cp8-fsdp16-512.json
+  --metrics-file /mnt/fuse/oss/xiaopac.xjy/dsv41/cp8-fsdp16-1024.json
 ```
 
-Each GPU processes 64 query tokens in this full-model run. Gradient
+Each GPU processes 128 query tokens in this full-model run. Gradient
 checkpointing recomputes the decoder stack during backward, while
 `--offload-engram` keeps the row-sharded sparse Engram tables in host memory and
 copies only the selected rows to the GPU. Engram offload is available with the
@@ -45,9 +45,9 @@ as its reduced parameter shard is ready, then releases that gradient instead of
 retaining all 40 layers through the end of backward.
 
 This configuration completed on two 8x H20 nodes on September 26, 2026. The
-step reached a 76.09 GiB per-GPU peak, produced a finite 14.7346 loss, and
+step reached a 76.43 GiB per-GPU peak, produced a finite 14.2826 loss, and
 updated model parameters. The complete recorded metrics are in
-[`docs/results/cp8-fsdp16-512-e43a04f.json`](docs/results/cp8-fsdp16-512-e43a04f.json).
+[`docs/results/cp8-fsdp16-1024-6633465.json`](docs/results/cp8-fsdp16-1024-6633465.json).
 
 ### One node, 8 GPUs, 9-layer prefix
 

@@ -43,8 +43,9 @@ The full 40-layer DSV4 CP8 smoke in the README uses gradient checkpointing,
 Engram CPU offload, and SGD optimizer steps during FSDP2 backward. Engram
 weights and gradients remain on CPU while only selected rows execute on GPU;
 reduced FSDP2 gradients are applied and released one parameter group at a time.
-The recorded two-node, 16-GPU, 512-token result is available in
-[`results/cp8-fsdp16-512-e43a04f.json`](results/cp8-fsdp16-512-e43a04f.json).
+The recorded two-node, 16-GPU results are available for
+[512 tokens](results/cp8-fsdp16-512-e43a04f.json) and
+[1,024 tokens](results/cp8-fsdp16-1024-6633465.json).
 
 Two-GPU DSV4 parity between regular SGD and SGD steps during FSDP2 backward,
 including CP2/EP2, gradient checkpointing, compressed attention, and sparse
