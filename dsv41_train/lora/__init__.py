@@ -6,6 +6,7 @@ from .checkpoint import (
     load_adapter_state,
     read_adapter,
     save_adapter,
+    save_merged,
     validate_adapter_layout,
 )
 from .config import LoRAConfig
@@ -21,6 +22,7 @@ __all__ = [
     "merge_adapters",
     "read_adapter",
     "save_adapter",
+    "save_merged",
     "unmerge_adapters",
     "validate_adapter_layout",
 ]

@@ -193,6 +193,11 @@ class RowShardedEmbedding(nn.Module):
         self.row_stop = self.row_start + base + int(self.rank < remainder)
         self.weight = nn.Parameter(torch.empty(self.row_stop - self.row_start, embedding_dim))
 
+    def checkpoint_parameter_names(self) -> dict[str, str]:
+        if self.size == 1:
+            return {}
+        return {"weight": f"weight_rows_{self.row_start}_{self.row_stop}_of_{self.global_num_embeddings}"}
+
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         if self.size == 1:
             return F.embedding(indices, self.weight, sparse=self.sparse_gradients)

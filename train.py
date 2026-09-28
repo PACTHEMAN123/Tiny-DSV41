@@ -102,6 +102,9 @@ def train(args: argparse.Namespace, runtime: Runtime) -> None:
             model_config=config.to_dict(),
             data_generator=batch_generator,
             training_config={"lora": asdict(lora)} if lora is not None else None,
+            checkpoint_mode="trainable" if lora is not None else "full",
+            base_model_identity={"kind": "random", "seed": args.seed,
+                                 "initialization": "cpu-float32", "torch": str(torch.__version__)},
         ),
     )
 

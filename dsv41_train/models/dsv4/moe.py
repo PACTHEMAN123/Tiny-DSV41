@@ -68,6 +68,12 @@ class RoutedExperts(nn.Module):
         )
         self.gradient_group = None
 
+    def checkpoint_parameter_names(self) -> dict[str, str]:
+        if self.num_experts == self.global_num_experts:
+            return {}
+        return {f"{group}.{local}": f"{group}.expert_{self.expert_start + local}"
+                for group in ("gate_up", "down") for local in range(self.num_experts)}
+
     @property
     def local_parameter_count(self) -> int:
         return sum(parameter.numel() for parameter in (*self.gate_up, *self.down))

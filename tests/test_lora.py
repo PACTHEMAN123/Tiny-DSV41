@@ -11,7 +11,7 @@ import torch
 from dsv41_train.checkpoint import CheckpointManager, TrainingState
 from dsv41_train.lora import (
     LoRAConfig, adapter_parameters, inject_lora, load_adapter,
-    merge_adapters, save_adapter, unmerge_adapters,
+    merge_adapters, save_adapter, save_merged, unmerge_adapters,
 )
 from dsv41_train.models.dsv4 import DeepSeekV41ForCausalLM
 from lora_helpers import small_config
@@ -158,6 +158,35 @@ class LoRATest(unittest.TestCase):
         torch.testing.assert_close(actual_loss, expected_loss, rtol=0, atol=0)
         for actual, reference in zip(adapter_parameters(model), expected):
             torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+    def test_merged_state_dict_roundtrip_and_plain_inference_export(self):
+        base = torch.nn.Sequential(torch.nn.Linear(7, 5))
+        model = copy.deepcopy(base)
+        inject_lora(model, LoRAConfig(rank=2, alpha=4, targets=("0",)))
+        with torch.no_grad():
+            model[0].lora_b.normal_(std=0.2)
+        model.eval()
+        inputs = torch.randn(3, 7)
+        expected = model(inputs).detach()
+        restored = copy.deepcopy(model)
+        merge_adapters(model)
+        restored.load_state_dict(model.state_dict())
+        torch.testing.assert_close(restored(inputs), expected, rtol=0, atol=0)
+        merged_state = copy.deepcopy(model.state_dict())
+        model.load_state_dict(merged_state)
+        self.assertFalse(model[0].merged)
+        torch.testing.assert_close(model(inputs), expected, rtol=0, atol=0)
+        with tempfile.TemporaryDirectory() as directory:
+            for merged in (False, True):
+                if merged:
+                    merge_adapters(model)
+                path = Path(directory) / "model.pt"
+                save_merged(model, path)
+                state = torch.load(path, weights_only=True)
+                self.assertFalse(any("lora_" in name for name in state))
+                base.load_state_dict(state, strict=True)
+                torch.testing.assert_close(base(inputs), expected, rtol=1e-5, atol=1e-6)
+                self.assertEqual(model[0].merged, merged)
 
     def test_shared_kv_survives_wrappers_that_copy_input_containers(self):
         def copy_containers(module, args):

@@ -1,6 +1,7 @@
 """The local computation: linear(x, W) + (alpha / rank) * B(A(dropout(x)))."""
 
 import math
+from dataclasses import asdict
 
 import torch
 from torch import nn
@@ -33,6 +34,20 @@ class LoRALinear(nn.Linear):
     @property
     def merged(self) -> bool:
         return self._unmerged_weight is not None
+
+    def checkpoint_metadata(self) -> dict:
+        return asdict(self.config)
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        if self.merged:
+            # A training state always stores W, A, B, even during merged inference.
+            weight = self._unmerged_weight
+            destination[prefix + "weight"] = weight if keep_vars else weight.detach()
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        self.unmerge()
+        super()._load_from_state_dict(*args, **kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         result = F.linear(x, self.weight, self.bias)

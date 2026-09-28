@@ -93,9 +93,41 @@ There are two different checkpoint purposes:
 | Operation | Contents and use |
 | --- | --- |
 | `--adapter-out` / `--adapter-in` | Version-1 adapter metadata and A/B tensors only; requires the same base model |
-| `--output-dir` / `--resume` | Full DCP model, optimizer, step, data generator, and LoRA dropout RNG state |
+| `--output-dir` / `--resume` with LoRA | Trainable parameters, model buffers, optimizer, step, data generator, and CPU/CUDA RNG; frozen base parameters are omitted |
+| `--output-dir` / `--resume` without LoRA | Full model plus the same training state |
 
-Keep the same model, adapter configuration, and world size when resuming.
+Keep the same model, global layer IDs, adapter configuration, optimizer options,
+and parallel topology when resuming. Learning rate is restored from the saved
+optimizer groups. Metadata is read and checked on every rank before exposing
+live model or optimizer tensors to DCP. A mismatch on one rank rejects the load
+on every rank. Metadata includes actual adapter module configurations, parameter
+shapes/dtypes, FSDP placements, global layer IDs, and the base model identity.
+
+For manually sharded Engram tables and routed experts, modules implement
+`checkpoint_parameter_names()`. It maps local parameter names to names containing
+global row ranges or expert IDs. DCP then distinguishes independent manual shards
+while retaining DTensor's FSDP placement information. Optimizer moments use the
+same names; parameter groups and RNG state are saved per rank. Parameters that
+have never received a gradient retain an empty optimizer state after restore.
+This format supports the same topology; changing EP/CP/Engram partitioning or
+world size is intentionally rejected rather than implicitly resharded.
+
+The Python `TrainingState` API defaults to `checkpoint_mode="full"`. Select
+`checkpoint_mode="trainable"` and supply `base_model_identity` to omit frozen
+parameters. Reconstruct the same frozen base before loading. The tiny-model CLI
+records its CPU initialization seed and PyTorch version. The released-checkpoint
+CLI hashes the configuration/index/tokenizer files and records each tensor file's
+absolute path, size and modification time. This is a fast check of immutable local
+files, not a content hash of all model weights; moving or replacing files requires
+an explicit migration. Custom callers are responsible for a truthful base identity.
+
+Training checkpoints now use format version 2. Older training checkpoints lack
+the metadata and shard names needed to validate recovery and are rejected with a
+migration error. Version-1 portable adapter files remain supported.
+To carry forward an old LoRA run, use its original code to restore and export a
+portable adapter, then start a new run with `--adapter-in`. That path starts a
+fresh optimizer; automatic migration of old optimizer checkpoints is not provided.
+
 `--steps` is the final total step, not the number of extra steps. `--adapter-in`
 starts from adapter weights with a fresh optimizer; it cannot be combined with
 `--resume`. The adapter file records layer IDs and hyperparameters, but does not
@@ -104,18 +136,27 @@ fingerprint the base weights: the caller must choose the correct base checkpoint
 ## Merge for inference
 
 ```python
-from dsv41_train.lora import merge_adapters, unmerge_adapters
+from dsv41_train.lora import merge_adapters, save_merged, unmerge_adapters
 
 model.eval()
 merge_adapters(model)
 # Inference now uses W + (alpha / rank) * B @ A.
 unmerge_adapters(model)
+# Writes ordinary model weights; load into the base architecture without LoRA.
+save_merged(model, "outputs/merged-model.pt")
 ```
 
 Merge is supported only on unsharded models in eval mode. The implementation
 retains an exact copy of each base weight so BF16 unmerge does not accumulate
-rounding error. Returning to `train()` automatically unmerges. Unmerge before
-saving a full training checkpoint; use `save_adapter` for portable adapters.
+rounding error. Returning to `train()` automatically unmerges. A normal
+`state_dict()` always contains the unmerged base weight plus A/B, even when the
+live module is merged. Loading it unmerges the destination first. This prevents
+adding the adapter twice after a save/load round trip.
+
+Use `save_merged` for a plain inference state dict containing merged weights and
+no A/B tensors. It requires a materialized, unsharded model in eval mode and
+leaves the live model's merge state unchanged. Use `save_adapter` for portable
+adapters.
 
 ## Verification
 
@@ -125,12 +166,43 @@ PYTHONPATH=.:tests CUDA_VISIBLE_DEVICES=0 python3 tests/dsv4_lora_cuda.py
 PYTHONPATH=.:tests CUDA_VISIBLE_DEVICES=0,1 \
   python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
   tests/dsv4_lora_fsdp.py
+PYTHONPATH=.:tests python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
+  tests/dsv4_checkpoint_resume.py --device cpu
+PYTHONPATH=.:tests CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  python3 -m torch.distributed.run --standalone --nproc-per-node=4 \
+  tests/dsv4_checkpoint_resume.py --device cuda
 ```
 
 Tests cover dense-update output/gradient equivalence, base freezing, adapter
 updates, file round trips, merge/unmerge, exact dropout/optimizer resume, and
 injection/restore before each loader callback. GPU checks use small random
 models and do not establish full released-model precision parity.
+
+The checkpoint regression additionally covers config/alpha/dropout/base identity
+mismatches before mutation, different global layer windows, a fresh optimizer,
+unused parameters, merged state dicts, and plain inference export. The distributed
+matrix tests full training and LoRA with sparse Engram/SGD and dense Engram/AdamW.
+The CUDA version uses a five-layer DSV4 model, EP=2, dense FSDP over all ranks,
+expert FSDP over two ranks, and Engram rows partitioned over four ranks. It checks
+all local parameters and the next update with zero tolerance after restore, plus
+collective rejection when only one rank has incompatible metadata.
+
+Validation on 2026-09-29 used PyTorch 2.10.0+cu129 and H20 GPUs:
+
+- All 65 unit tests passed, with no skips.
+- Single-GPU FP32 and BF16-autocast LoRA learning/freezing/export checks passed.
+- Two-GPU FSDP2 gradient parity remained within `7.45e-9`; adapter export and
+  trainable-only checkpoint resume passed.
+- All four CPU/Gloo cases and all four four-GPU EP/FSDP/Engram cases passed,
+  including an empty optimizer, exact next-step recovery, and rank-local mismatch
+  rejection. Full training covers sparse Engram with SGD and dense Engram with
+  AdamW; LoRA covers both configurations with a frozen base.
+- Separate CLI processes trained 2 steps, resumed to step 3, and matched a
+  continuous 3-step run exactly: step-3 loss `3.429243564605713`, identical adapter
+  tensors, LoRA dropout `0.1`. The checkpoint omitted the frozen embedding.
+
+These are random-weight reduced-model checks. They do not validate a full
+released-weight run, different-world-size recovery, or HF numerical parity.
 
 Validation on 2026-09-28 used PyTorch 2.10.0+cu129 and NVIDIA H20 GPUs:
 

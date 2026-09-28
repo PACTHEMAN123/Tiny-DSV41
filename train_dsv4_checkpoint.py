@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 
 from dsv41_train.checkpoint import CheckpointManager, TrainingState
+from dsv41_train.checkpoint_layout import checkpoint_identity
 from dsv41_train.lora import adapter_parameters, save_adapter
 from dsv41_train.lora.cli import adapter_config, add_lora_options
 from dsv41_train.models.dsv4 import load_dsv41_backbone_window
@@ -156,7 +157,10 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, object]:
             args.output_dir,
             TrainingState(
                 model, optimizer, model_config=model.config.to_dict(), data_generator=generator,
-                training_config={"lora": asdict(lora)} if lora is not None else None,
+                training_config={"lora": asdict(lora) if lora is not None else None,
+                                 "cp_size": args.cp_size, "ep_size": args.ep_size},
+                checkpoint_mode="trainable" if lora is not None else "full",
+                base_model_identity=checkpoint_identity(args.model_path),
             ),
         )
     start_step = checkpointer.load() if args.resume else 0

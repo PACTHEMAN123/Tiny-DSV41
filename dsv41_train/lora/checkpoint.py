@@ -84,3 +84,29 @@ def load_adapter(model: nn.Module, path: str | Path) -> None:
     payload = read_adapter(path)
     validate_adapter_layout(model, payload)
     load_adapter_state(model, payload)
+
+
+@torch.no_grad()
+def save_merged(model: nn.Module, path: str | Path) -> None:
+    """Export plain model weights loadable without injecting LoRA; leave the model intact."""
+    modules = _adapter_modules(model)
+    if model.training or any(module.training for module in modules.values()):
+        raise ValueError("call eval() before exporting merged weights")
+    if any(hasattr(p, "to_local") or p.is_meta for p in model.parameters()):
+        raise ValueError("merged export requires a materialized, unsharded model")
+    if any(getattr(module, "checkpoint_parameter_names", lambda: {})()
+           for module in model.modules()):
+        raise ValueError("merged export requires a model without manual parameter shards")
+    state = {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()}
+    for name, module in modules.items():
+        namespace = name + "." if name else ""
+        if module.merged:
+            weight = module.weight
+        else:
+            delta = module.lora_b.float() @ module.lora_a.float()
+            weight = (module.weight.float() + module.scaling * delta).to(module.weight.dtype)
+        state[namespace + "weight"] = weight.detach().cpu()
+        del state[namespace + "lora_a"], state[namespace + "lora_b"]
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(state, path)

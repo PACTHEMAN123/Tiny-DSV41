@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,33 +21,34 @@ class TrainingStateTest(unittest.TestCase):
             data_generator=self.generator,
         )
 
-    @patch("dsv41_train.checkpoint.get_state_dict")
+    @patch("dsv41_train.checkpoint.get_model_state_dict")
     def test_state_dict_collects_resumable_training_state(self, get_state_dict):
-        get_state_dict.return_value = ({"weight": Mock()}, {"state": Mock()})
+        get_state_dict.return_value = {"weight": Mock()}
         self.state.step = 7
 
         state_dict = self.state.state_dict()
 
         self.assertEqual(state_dict["step"], 7)
-        self.assertEqual(state_dict["model_config"], {"hidden_size": 2})
+        self.assertEqual(json.loads(state_dict["metadata"]["rank-0"])["model_config"], {"hidden_size": 2})
         self.assertEqual(state_dict["data_generator"]["world_size"], 1)
         self.assertTrue(
             torch.equal(
                 state_dict["data_generator"]["rank-0"], self.generator.get_state()
             )
         )
-        get_state_dict.assert_called_once_with(self.model, self.optimizer)
+        get_state_dict.assert_called_once_with(self.model, options=self.state.options)
 
-    @patch("dsv41_train.checkpoint.set_state_dict")
-    def test_load_state_dict_restores_all_mutable_state(self, set_state_dict):
+    @patch("torch.optim.AdamW.load_state_dict")
+    @patch("dsv41_train.checkpoint.set_model_state_dict")
+    def test_load_state_dict_restores_all_mutable_state(self, set_state_dict, set_optimizer):
         restored_generator = torch.Generator().manual_seed(456)
         generator_state = restored_generator.get_state()
 
         self.state.load_state_dict(
             {
                 "model": {"weight": Mock()},
-                "optimizer": {"state": Mock()},
-                "model_config": {"hidden_size": 2},
+                "optimizer": {"state": {}, "param_groups": {"rank-0": []}},
+                "metadata": {"rank-0": json.dumps(self.state.metadata())},
                 "data_generator": {
                     "world_size": 1,
                     "rank-0": generator_state,
@@ -58,10 +60,13 @@ class TrainingStateTest(unittest.TestCase):
         self.assertEqual(self.state.step, 11)
         self.assertTrue(torch.equal(self.generator.get_state(), generator_state))
         set_state_dict.assert_called_once()
+        set_optimizer.assert_called_once()
 
     def test_load_state_dict_rejects_a_different_model_config(self):
+        metadata = self.state.metadata()
+        metadata["model_config"] = {"hidden_size": 4}
         with self.assertRaisesRegex(ValueError, "model config"):
-            self.state.load_state_dict({"model_config": {"hidden_size": 4}})
+            self.state.load_state_dict({"metadata": {"rank-0": json.dumps(metadata)}})
 
     def test_cpu_checkpoint_rng_layout_does_not_depend_on_cuda_initialization(self):
         self.state.training_config = {}
@@ -75,7 +80,9 @@ class TrainingStateTest(unittest.TestCase):
     def test_load_rejects_different_adapter_hyperparameters(self):
         self.state.training_config = {"lora": {"rank": 8, "alpha": 16}}
         state = self.state.state_dict()
-        state["training_config"] = {"lora": {"rank": 8, "alpha": 32}}
+        metadata = json.loads(state["metadata"]["rank-0"])
+        metadata["training_config"] = {"lora": {"rank": 8, "alpha": 32}}
+        state["metadata"]["rank-0"] = json.dumps(metadata)
         with self.assertRaisesRegex(ValueError, "training config"):
             self.state.load_state_dict(state)
 
@@ -109,8 +116,9 @@ class CheckpointManagerTest(unittest.TestCase):
 
         self.assertEqual(self.manager.latest_step(), 10)
 
+    @patch.object(CheckpointManager, "_validate_checkpoint")
     @patch("dsv41_train.checkpoint.dcp.load")
-    def test_load_defaults_to_the_latest_complete_checkpoint(self, load):
+    def test_load_defaults_to_the_latest_complete_checkpoint(self, load, validate):
         checkpoint = self.folder / "step-8"
         checkpoint.mkdir(parents=True)
         (checkpoint / ".metadata").touch()
@@ -120,8 +128,10 @@ class CheckpointManagerTest(unittest.TestCase):
 
         self.assertEqual(loaded_step, 8)
         load.assert_called_once_with(
-            {"train": self.state}, checkpoint_id=str(checkpoint)
+            {"train": self.state.load_template.return_value}, checkpoint_id=str(checkpoint)
         )
+        self.state.load_state_dict.assert_called_once_with(self.state.load_template.return_value)
+        validate.assert_called_once_with(checkpoint)
 
 
 if __name__ == "__main__":

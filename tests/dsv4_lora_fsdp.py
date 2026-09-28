@@ -86,7 +86,8 @@ def main():
                                    rtol=3e-4, atol=3e-6)
 
         state = TrainingState(model, optimizer, model_config=model.config.to_dict(),
-                              data_generator=generator, training_config={"lora": asdict(config)})
+                              data_generator=generator, training_config={"lora": asdict(config)},
+                              checkpoint_mode="trainable", base_model_identity={"seed": 42})
         manager = CheckpointManager(Path(paths[0]) / "checkpoint", state)
         manager.save(2)
 
