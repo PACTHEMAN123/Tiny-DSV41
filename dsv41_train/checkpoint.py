@@ -24,17 +24,19 @@ class TrainingState(Stateful):
         *,
         model_config: dict[str, Any],
         data_generator: torch.Generator,
+        training_config: dict[str, Any] | None = None,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
         self.model_config = model_config
         self.data_generator = data_generator
+        self.training_config = training_config
         self.step = 0
 
     def state_dict(self) -> dict[str, Any]:
         model_state, optimizer_state = get_state_dict(self.model, self.optimizer)
         rank, world_size = self._distributed_position()
-        return {
+        state = {
             "model": model_state,
             "optimizer": optimizer_state,
             "model_config": self.model_config,
@@ -44,11 +46,22 @@ class TrainingState(Stateful):
             },
             "step": self.step,
         }
+        if self.training_config is not None:
+            cuda_device = next((p.device for p in self.model.parameters() if p.is_cuda), None)
+            state["training_config"] = self.training_config
+            state["rng"] = {f"rank-{rank}": {
+                "cpu": torch.get_rng_state(),
+                "cuda": (torch.cuda.get_rng_state(cuda_device) if cuda_device is not None
+                         else torch.empty(0, dtype=torch.uint8)),
+            }}
+        return state
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         checkpoint_config = state_dict["model_config"]
         if checkpoint_config != self.model_config:
             raise ValueError("checkpoint model config does not match the current model")
+        if state_dict.get("training_config") != self.training_config:
+            raise ValueError("checkpoint training config does not match the current model")
 
         rank, world_size = self._distributed_position()
         generator_state = state_dict["data_generator"]
@@ -64,6 +77,13 @@ class TrainingState(Stateful):
             optim_state_dict=state_dict["optimizer"],
         )
         self.data_generator.set_state(generator_state[f"rank-{rank}"])
+        rng = state_dict.get("rng", {}).get(f"rank-{rank}")
+        if rng is not None:
+            torch.set_rng_state(rng["cpu"].cpu())
+            if rng["cuda"].numel():
+                cuda_device = next((p.device for p in self.model.parameters() if p.is_cuda), None)
+                if cuda_device is not None:
+                    torch.cuda.set_rng_state(rng["cuda"].cpu(), cuda_device)
         self.step = int(state_dict["step"])
 
     @staticmethod

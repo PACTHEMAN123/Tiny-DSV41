@@ -728,7 +728,7 @@ class DecoderLayer(nn.Module):
         token_mask: torch.Tensor,
         shared: dict[str, torch.Tensor | None],
         engram_rows: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor | None]]:
         if self.engram is not None:
             streams = self.engram(streams, engram_rows, token_mask)
 
@@ -745,7 +745,7 @@ class DecoderLayer(nn.Module):
         collapsed = self.collapse(streams, next_pre)
         value, router_logits = self.moe(self.post_attention_norm(collapsed))
         streams = self.expand(value, residual, post, combine)
-        return streams, final_pre, router_logits
+        return streams, final_pre, router_logits, shared
 
 
 class DeepSeekV41Model(nn.Module):
@@ -838,7 +838,8 @@ class DeepSeekV41Model(nn.Module):
         pre_mix[..., 0] = 1
         router_logits = []
         for layer in self.layers:
-            streams, pre_mix, logits = layer(
+            # FSDP may reconstruct input containers; propagate the returned KV state.
+            streams, pre_mix, logits, shared = layer(
                 streams,
                 pre_mix,
                 positions,

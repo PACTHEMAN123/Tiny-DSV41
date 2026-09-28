@@ -12,6 +12,7 @@ from pathlib import Path
 import torch
 
 from ...dispatch import TokenDispatcher
+from ...lora import LoRAConfig, inject_lora, load_adapter_state, read_adapter, validate_adapter_layout
 from ...parallel import ContextParallel
 from .config import DeepSeekV41Config
 from .model import (
@@ -298,10 +299,15 @@ def load_dsv41_backbone_window(
     engram_mesh: DeviceMesh | None = None,
     sparse_engram_gradients: bool = False,
     layer_loaded: Callable[[DecoderLayer], None] | None = None,
+    lora_config: LoRAConfig | None = None,
+    adapter_path: str | Path | None = None,
 ) -> DeepSeekV41ForCausalLM:
     """Load a trainable prefix or source-anchored layer window."""
 
     folder = Path(folder)
+    if adapter_path is not None and lora_config is None:
+        raise ValueError("adapter_path requires lora_config")
+    adapter = read_adapter(adapter_path) if adapter_path is not None else None
     if start_layer == 0:
         config = _prefix_config(folder, num_layers)
         layer_ids = list(range(num_layers))
@@ -325,6 +331,10 @@ def load_dsv41_backbone_window(
             layer_ids,
             sparse_engram_gradients,
         )
+    if lora_config is not None:
+        model.requires_grad_(False)
+    if adapter is not None:
+        validate_adapter_layout(model, adapter)
 
     target_device = torch.device(device)
     rotary = model.model.rotary
@@ -351,7 +361,7 @@ def load_dsv41_backbone_window(
         assign(model.model.norm, {"weight": read("norm.weight").to(dtype)})
         assign(model.lm_head, {"weight": read("head.weight").to(dtype)})
 
-        for layer in model.model.layers:
+        for index, layer in enumerate(model.model.layers):
             layer_id = layer.layer_id
             source = f"layers.{layer_id}"
             state: dict[str, torch.Tensor] = {
@@ -468,6 +478,10 @@ def load_dsv41_backbone_window(
                 state["engram.proj.weight"] = fp8(f"{source}.engram.wkv")
 
             assign(layer, state)
+            if lora_config is not None:
+                inject_lora(layer, lora_config)
+                if adapter is not None:
+                    load_adapter_state(layer, adapter, prefix=f"model.layers.{index}")
             if layer_loaded is not None:
                 layer_loaded(layer)
 
@@ -502,6 +516,8 @@ def load_dsv41_backbone_prefix(
     engram_mesh: DeviceMesh | None = None,
     sparse_engram_gradients: bool = False,
     layer_loaded: Callable[[DecoderLayer], None] | None = None,
+    lora_config: LoRAConfig | None = None,
+    adapter_path: str | Path | None = None,
 ) -> DeepSeekV41ForCausalLM:
     """Load a trainable prefix directly from the released checkpoint."""
 
@@ -516,6 +532,8 @@ def load_dsv41_backbone_prefix(
         engram_mesh=engram_mesh,
         sparse_engram_gradients=sparse_engram_gradients,
         layer_loaded=layer_loaded,
+        lora_config=lora_config,
+        adapter_path=adapter_path,
     )
 
 

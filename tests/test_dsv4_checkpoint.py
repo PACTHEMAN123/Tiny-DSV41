@@ -25,7 +25,9 @@ def write_safetensors(path: Path, tensors: dict[str, torch.Tensor]) -> None:
         raw = tensor.contiguous().view(torch.uint8).numpy().tobytes()
         start = len(payload)
         payload.extend(raw)
-        dtype = {torch.float32: "F32", torch.int8: "I8"}[tensor.dtype]
+        dtype = {
+            torch.float32: "F32", torch.int8: "I8", torch.float8_e4m3fn: "F8_E4M3",
+        }[tensor.dtype]
         header[name] = {
             "dtype": dtype,
             "shape": list(tensor.shape),

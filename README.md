@@ -6,6 +6,17 @@ Run all commands from the repository root.
 
 ## DeepSeek V4.1
 
+### LoRA post-training
+
+```bash
+python3 train.py --steps 10 --seq-len 32 --lora \
+  --output-dir outputs/lora --adapter-out outputs/lora/adapter.pt
+```
+
+Both DSV4 training scripts support native PyTorch LoRA. See
+[`docs/lora.md`](docs/lora.md) for the module map, Python API, target selection,
+adapter export, merge/unmerge, and training resume.
+
 ### Two nodes, 16 GPUs, full 40 layers
 
 Run this command on both 8-GPU nodes. Set `NODE_RANK=0` on the first node and

@@ -63,6 +63,22 @@ class TrainingStateTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "model config"):
             self.state.load_state_dict({"model_config": {"hidden_size": 4}})
 
+    def test_cpu_checkpoint_rng_layout_does_not_depend_on_cuda_initialization(self):
+        self.state.training_config = {}
+        with patch("torch.cuda.get_rng_state") as cuda_rng:
+            for initialized in (False, True):
+                with patch("torch.cuda.is_initialized", return_value=initialized):
+                    rng = self.state.state_dict()["rng"]["rank-0"]
+                self.assertEqual(rng["cuda"].numel(), 0)
+            cuda_rng.assert_not_called()
+
+    def test_load_rejects_different_adapter_hyperparameters(self):
+        self.state.training_config = {"lora": {"rank": 8, "alpha": 16}}
+        state = self.state.state_dict()
+        state["training_config"] = {"lora": {"rank": 8, "alpha": 32}}
+        with self.assertRaisesRegex(ValueError, "training config"):
+            self.state.load_state_dict(state)
+
 
 class CheckpointManagerTest(unittest.TestCase):
     def setUp(self):

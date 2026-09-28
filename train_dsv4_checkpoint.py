@@ -6,11 +6,15 @@ import argparse
 import json
 import os
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 
+from dsv41_train.checkpoint import CheckpointManager, TrainingState
+from dsv41_train.lora import adapter_parameters, save_adapter
+from dsv41_train.lora.cli import adapter_config, add_lora_options
 from dsv41_train.models.dsv4 import load_dsv41_backbone_window
 from dsv41_train.models.dsv4.parallel import (
     apply_fsdp2_layer,
@@ -47,6 +51,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ep-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--metrics-file")
+    parser.add_argument("--output-dir")
+    parser.add_argument("--resume", action="store_true")
+    add_lora_options(parser)
     return parser.parse_args()
 
 
@@ -75,8 +82,11 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
         raise ValueError("the checkpoint's 384 experts must divide evenly across ep-size")
 
 
-def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int | str]:
+def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, object]:
     validate_args(args, runtime.world_size)
+    if args.resume and not args.output_dir:
+        raise ValueError("resume requires output-dir")
+    lora = adapter_config(args)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
     torch.cuda.reset_peak_memory_stats(runtime.device)
@@ -96,6 +106,8 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         num_layers=args.num_layers,
         sparse_engram_gradients=args.optimizer == "sgd",
         layer_loaded=lambda layer: apply_fsdp2_layer(layer, meshes),
+        lora_config=lora,
+        adapter_path=args.adapter_in,
     )
     model.train()
     loaded_at = time.perf_counter()
@@ -124,18 +136,35 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
     apply_fsdp2_root(model, meshes)
     sharded_at = time.perf_counter()
     tracked = model.model.layers[0].attention_hc.fn
-    before = local_tensor(tracked).detach().float().clone()
+    if lora is not None:
+        # B starts at zero, so A may have no gradient on the first step.
+        tracked = next(parameter for name, parameter in model.named_parameters()
+                       if name.endswith("lora_b"))
+    trainable = list(adapter_parameters(model)) if lora is not None else list(model.parameters())
     if args.optimizer == "adamw":
         optimizer: torch.optim.Optimizer = torch.optim.AdamW(
-            model.parameters(), lr=args.learning_rate, foreach=False
+            trainable, lr=args.learning_rate, foreach=False
         )
     else:
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, foreach=False)
+        optimizer = torch.optim.SGD(trainable, lr=args.learning_rate, foreach=False)
 
     generator = torch.Generator(device=runtime.device)
     generator.manual_seed(args.seed + runtime.rank)
+    checkpointer = None
+    if args.output_dir:
+        checkpointer = CheckpointManager(
+            args.output_dir,
+            TrainingState(
+                model, optimizer, model_config=model.config.to_dict(), data_generator=generator,
+                training_config={"lora": asdict(lora)} if lora is not None else None,
+            ),
+        )
+    start_step = checkpointer.load() if args.resume else 0
+    if start_step >= args.steps:
+        raise ValueError("steps must exceed the resumed step")
+    before = local_tensor(tracked).detach().float().clone()
     last_loss = last_aux_loss = 0.0
-    for step in range(1, args.steps + 1):
+    for step in range(start_step + 1, args.steps + 1):
         input_ids = torch.randint(
             3,
             model.config.vocab_size,
@@ -174,7 +203,11 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
     torch.cuda.synchronize(runtime.device)
     distributed_trace(runtime, "cuda_synchronize_complete")
     finished = time.perf_counter()
-    metrics: dict[str, float | int | str] = {
+    if checkpointer is not None:
+        checkpointer.save(args.steps)
+    if args.adapter_out:
+        save_adapter(model, args.adapter_out)
+    metrics: dict[str, object] = {
         "model": (
             f"DeepSeek-V4.1-Flash {args.num_layers}-layer prefix"
             if args.start_layer == 0
@@ -199,6 +232,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         "sequence_length": args.seq_len,
         "start_layer": args.start_layer,
         "optimizer": args.optimizer,
+        "lora": asdict(lora) if lora is not None else None,
         "loss": last_loss,
         "aux_loss": last_aux_loss,
         "parameter_delta_max": parameter_delta.item(),
