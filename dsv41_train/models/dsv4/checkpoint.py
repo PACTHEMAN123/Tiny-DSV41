@@ -11,7 +11,7 @@ from pathlib import Path
 
 import torch
 
-from ...dispatch import TokenDispatcher
+from .moe import TokenDispatcher
 from ...cp import ContextParallel
 from .config import DeepSeekV41Config
 from .model import (
@@ -387,6 +387,10 @@ def load_dsv41_backbone_window(
             }
 
             routed = layer.moe.routed
+            gate_up = torch.empty(
+                routed.gate_up.shape, device=target_device, dtype=dtype
+            )
+            down = torch.empty(routed.down.shape, device=target_device, dtype=dtype)
             for local_id, global_id in enumerate(
                 range(routed.expert_start, routed.expert_start + routed.num_experts)
             ):
@@ -401,14 +405,17 @@ def load_dsv41_backbone_window(
                     read(f"{prefix}.w3.scale"),
                     dtype=dtype,
                 )
-                state[f"moe.routed.gate_up.{local_id}"] = torch.cat(
-                    (gate, up), dim=0
+                gate_up[local_id, :, 0].copy_(gate)
+                gate_up[local_id, :, 1].copy_(up)
+                down[local_id].copy_(
+                    dequantize_fp4_rows(
+                        read(f"{prefix}.w2.weight"),
+                        read(f"{prefix}.w2.scale"),
+                        dtype=dtype,
+                    )
                 )
-                state[f"moe.routed.down.{local_id}"] = dequantize_fp4_rows(
-                    read(f"{prefix}.w2.weight"),
-                    read(f"{prefix}.w2.scale"),
-                    dtype=dtype,
-                )
+            state["moe.routed.gate_up"] = gate_up
+            state["moe.routed.down"] = down
 
             compressor = layer.attention.compressor
             if compressor is not None:

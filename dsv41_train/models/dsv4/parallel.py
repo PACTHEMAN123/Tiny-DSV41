@@ -7,7 +7,6 @@ from dataclasses import replace
 import torch.distributed as dist
 from torch import nn
 
-from ...dispatch import AllToAllTokenDispatcher, TokenDispatcher
 from ...cp import ContextParallel
 from ...parallel import ParallelMeshes
 from ...runtime import local_tensor
@@ -18,7 +17,7 @@ from .model import (
     DeepSeekV41Model,
     HyperConnection,
 )
-from .moe import RoutedExperts
+from .moe import AllToAllTokenDispatcher, RoutedExperts, TokenDispatcher
 
 
 def build_parallelism(
@@ -98,7 +97,6 @@ def apply_fsdp2_layer(
     replicate_fp32 = meshes.ep is not None and meshes._dense is not None
     if meshes.ep is not None:
         assert meshes.expert_fsdp is not None
-        layer.moe.routed.set_gradient_group(meshes.expert_fsdp.get_group())
         fully_shard(
             layer.moe.routed,
             mesh=meshes.expert_fsdp,

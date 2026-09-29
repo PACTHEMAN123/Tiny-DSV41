@@ -25,9 +25,8 @@ from torch.utils.checkpoint import checkpoint
 
 from .config import DeepSeekV41Config
 from ...cp import ContextParallel, ModelContext
-from .moe import RoutedExperts, SparseMoE, TopKRouter
+from .moe import RoutedExperts, SparseMoE, TokenDispatcher, TopKRouter
 from .triton_indexer import fused_index_scores
-from ...dispatch import TokenDispatcher
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -1057,20 +1056,16 @@ class DeepSeekV41ForCausalLM(nn.Module):
             nn.init.normal_(module.weight, std=std)
             nn.init.zeros_(module.selection_bias)
         elif isinstance(module, RoutedExperts):
-            if not module.gate_up or module.gate_up[0].is_meta:
+            if module.gate_up.is_meta:
                 return
             if module.num_experts == module.global_num_experts:
-                for parameter in module.gate_up:
-                    nn.init.normal_(parameter, std=std)
-                for parameter in module.down:
-                    nn.init.normal_(parameter, std=std)
+                nn.init.normal_(module.gate_up, std=std)
+                nn.init.normal_(module.down, std=std)
             else:
-                generator = torch.Generator(device=module.gate_up[0].device)
+                generator = torch.Generator(device=module.gate_up.device)
                 generator.manual_seed(torch.initial_seed() + module.expert_start)
-                for parameter in module.gate_up:
-                    nn.init.normal_(parameter, std=std, generator=generator)
-                for parameter in module.down:
-                    nn.init.normal_(parameter, std=std, generator=generator)
+                nn.init.normal_(module.gate_up, std=std, generator=generator)
+                nn.init.normal_(module.down, std=std, generator=generator)
 
     def gradient_checkpointing_enable(self) -> None:
         self.model.gradient_checkpointing = True

@@ -1,14 +1,14 @@
-"""Sparse MoE routing, token dispatch, and expert computation."""
+"""DSV4 routers and grouped expert modules."""
 
 from __future__ import annotations
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-from ...dispatch import TokenDispatcher
-from .config import DeepSeekV41Config
+from ..config import DeepSeekV41Config
+from .dispatch import TokenDispatcher
+from .kernels import clamped_swiglu, clamped_swiglu_reference
 
 
 def _activation(name: str, x: torch.Tensor) -> torch.Tensor:
@@ -41,12 +41,23 @@ class TopKRouter(nn.Module):
         return logits, weights * self.scale, indices
 
 
-def _clamped_swiglu(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor:
-    gate, up = gate.float(), up.float()
-    if limit > 0:
-        gate = gate.clamp(max=limit)
-        up = up.clamp(-limit, limit)
-    return F.silu(gate) * up
+def _grouped_mm(
+    x: torch.Tensor, weight: torch.Tensor, counts: torch.Tensor
+) -> torch.Tensor:
+    if x.is_cuda:
+        offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
+        return torch._grouped_mm(x, weight.transpose(-2, -1), offs=offsets)
+
+    outputs = []
+    start = 0
+    for expert, count in enumerate(counts.tolist()):
+        stop = start + count
+        if stop > start:
+            outputs.append(F.linear(x[start:stop], weight[expert]))
+        start = stop
+    if outputs:
+        return torch.cat(outputs)
+    return x.new_empty((0, weight.shape[1]))
 
 
 class RoutedExperts(nn.Module):
@@ -56,53 +67,39 @@ class RoutedExperts(nn.Module):
         self.global_num_experts = config.n_routed_experts
         self.expert_start, expert_stop = dispatcher.expert_range(config.n_routed_experts)
         self.num_experts = expert_stop - self.expert_start
+        self.hidden_size = config.hidden_size
         self.intermediate = config.moe_intermediate_size
         self.limit = config.swiglu_limit
-        self.gate_up = nn.ParameterList(
-            nn.Parameter(torch.empty(2 * self.intermediate, config.hidden_size))
-            for _ in range(self.num_experts)
+        self.gate_up = nn.Parameter(
+            torch.empty(self.num_experts, self.intermediate, 2, self.hidden_size)
         )
-        self.down = nn.ParameterList(
-            nn.Parameter(torch.empty(config.hidden_size, self.intermediate))
-            for _ in range(self.num_experts)
+        self.down = nn.Parameter(
+            torch.empty(self.num_experts, self.hidden_size, self.intermediate)
         )
-        self.gradient_group = None
 
     @property
     def local_parameter_count(self) -> int:
-        return sum(parameter.numel() for parameter in (*self.gate_up, *self.down))
-
-    def set_gradient_group(self, group) -> None:
-        self.gradient_group = group
+        return self.gate_up.numel() + self.down.numel()
 
     def forward(
         self, x: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor
     ) -> torch.Tensor:
-        x, indices, weights, metadata = self.dispatcher.dispatch(x, indices, weights)
-        output = torch.zeros_like(x, dtype=torch.float32) + x.float().sum() * 0
-        used = torch.zeros(self.num_experts, dtype=torch.int32, device=indices.device)
-        used.scatter_(0, indices, 1)
-        if self.gradient_group is not None:
-            dist.all_reduce(used, op=dist.ReduceOp.MAX, group=self.gradient_group)
-        for expert_id in used.nonzero().flatten().tolist():
-            token_ids = torch.where(indices == expert_id)[0]
-            if token_ids.numel() == 0:
-                anchor = (
-                    self.gate_up[expert_id].flatten()[0]
-                    + self.down[expert_id].flatten()[0]
-                )
-                output = output + anchor.to(output.dtype) * 0
-                continue
-            current = x[token_ids]
-            weight = self.gate_up[expert_id]
-            gate = F.linear(current, weight[: self.intermediate])
-            up = F.linear(current, weight[self.intermediate :])
-            current = _clamped_swiglu(gate, up, self.limit)
-            current = current * weights[token_ids, None]
-            current = F.linear(current.to(x.dtype), self.down[expert_id])
-            output.index_add_(0, token_ids, current.float())
-        output = self.dispatcher.combine(output, metadata)
-        return output
+        x, counts, weights, metadata = self.dispatcher.dispatch(x, indices, weights)
+        if x.shape[0] == 0:
+            anchor = self.gate_up.flatten()[0] + self.down.flatten()[0]
+            output = x.new_empty((0, self.hidden_size)) + anchor.to(x.dtype) * 0
+        else:
+            gate_up = _grouped_mm(
+                x,
+                self.gate_up.reshape(
+                    self.num_experts, 2 * self.intermediate, self.hidden_size
+                ),
+                counts,
+            )
+            gate, up = gate_up.reshape(-1, self.intermediate, 2).unbind(-1)
+            hidden = clamped_swiglu(gate, up, weights, self.limit)
+            output = _grouped_mm(hidden, self.down, counts)
+        return self.dispatcher.combine(output, metadata)
 
 
 class SharedExpert(nn.Module):
@@ -114,7 +111,8 @@ class SharedExpert(nn.Module):
         self.limit = config.swiglu_limit
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(_clamped_swiglu(self.gate(x), self.up(x), self.limit).to(x.dtype))
+        hidden = clamped_swiglu_reference(self.gate(x), self.up(x), self.limit)
+        return self.down(hidden.to(x.dtype))
 
 
 class SparseMoE(nn.Module):
@@ -142,8 +140,4 @@ class SparseMoE(nn.Module):
         return output.to(x.dtype).view(shape), logits
 
 
-__all__ = [
-    "RoutedExperts",
-    "SparseMoE",
-    "TopKRouter",
-]
+__all__ = ["RoutedExperts", "SparseMoE", "TopKRouter"]

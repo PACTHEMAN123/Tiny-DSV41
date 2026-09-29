@@ -3,11 +3,10 @@ from unittest.mock import Mock, call, patch
 
 import torch
 
-from dsv41_train.dispatch import DispatchMetadata, TokenDispatcher
 from dsv41_train.models.dsv4 import DeepSeekV41Config, DeepSeekV41ForCausalLM
 from dsv41_train.cp import ContextParallel
 from dsv41_train.models.dsv4.model import NgramHash
-from dsv41_train.models.dsv4.moe import RoutedExperts
+from dsv41_train.models.dsv4.moe import DispatchMetadata, RoutedExperts, TokenDispatcher
 from dsv41_train.models.dsv4.parallel import apply_fsdp2
 from dsv41_train.parallel import ParallelMeshes
 
@@ -17,11 +16,12 @@ class ModelTest(unittest.TestCase):
         class EmptyReceiveDispatcher(TokenDispatcher):
             def dispatch(self, hidden, expert_ids, weights):
                 metadata = DispatchMetadata(
-                    token_count=hidden.shape[0], topk=expert_ids.shape[-1]
+                    token_count=hidden.shape[0],
+                    token_indices=expert_ids.reshape(-1)[:0],
                 )
                 return (
                     hidden[:0],
-                    expert_ids.reshape(-1)[:0],
+                    torch.zeros(self.num_experts, dtype=torch.int32),
                     weights.reshape(-1)[:0],
                     metadata,
                 )
@@ -38,22 +38,24 @@ class ModelTest(unittest.TestCase):
 
         experts(hidden, expert_ids, weights).sum().backward()
 
-        self.assertTrue(all(parameter.grad is None for parameter in experts.gate_up))
-        self.assertTrue(all(parameter.grad is None for parameter in experts.down))
+        self.assertEqual(experts.gate_up.grad.abs().sum(), 0)
+        self.assertEqual(experts.down.grad.abs().sum(), 0)
 
     def test_expert_gradients_are_allocated_only_for_used_experts(self):
         config = DeepSeekV41Config.tiny()
         experts = RoutedExperts(config, TokenDispatcher())
+        torch.nn.init.normal_(experts.gate_up)
+        torch.nn.init.normal_(experts.down)
         hidden = torch.randn(3, config.hidden_size)
         expert_ids = torch.zeros(3, config.num_experts_per_tok, dtype=torch.long)
         weights = torch.ones(3, config.num_experts_per_tok)
 
         experts(hidden, expert_ids, weights).sum().backward()
 
-        self.assertIsNotNone(experts.gate_up[0].grad)
-        self.assertIsNotNone(experts.down[0].grad)
-        self.assertTrue(all(parameter.grad is None for parameter in experts.gate_up[1:]))
-        self.assertTrue(all(parameter.grad is None for parameter in experts.down[1:]))
+        self.assertGreater(experts.gate_up.grad[0].abs().sum(), 0)
+        self.assertGreater(experts.down.grad[0].abs().sum(), 0)
+        self.assertEqual(experts.gate_up.grad[1:].abs().sum(), 0)
+        self.assertEqual(experts.down.grad[1:].abs().sum(), 0)
 
     def test_layer_window_selects_global_layers(self):
         config = DeepSeekV41Config.tiny()
@@ -178,17 +180,17 @@ class ModelTest(unittest.TestCase):
 
     def test_explicit_local_parallel_primitives(self):
         dispatcher = TokenDispatcher()
+        self.assertEqual(dispatcher.expert_range(2), (0, 2))
         x = torch.arange(12, dtype=torch.float32).view(3, 4)
         expert_ids = torch.tensor([[0, 1], [1, 0], [0, 1]])
         weights = torch.ones(3, 2)
 
-        routed, routed_ids, routed_weights, metadata = dispatcher.dispatch(
+        routed, counts, routed_weights, metadata = dispatcher.dispatch(
             x, expert_ids, weights
         )
         combined = dispatcher.combine(routed * routed_weights[:, None], metadata)
 
-        self.assertEqual(dispatcher.expert_range(2), (0, 2))
-        self.assertTrue(torch.equal(routed_ids, expert_ids.flatten()))
+        self.assertTrue(torch.equal(counts, torch.tensor([3, 3], dtype=torch.int32)))
         self.assertTrue(torch.equal(combined, x * 2))
 
         cp = ContextParallel()
