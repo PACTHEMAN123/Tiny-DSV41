@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import json
-import math
-import mmap
-import struct
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import torch
 
 from ...dispatch import TokenDispatcher
+from ...lora import LoRAConfig, inject_lora, load_adapter_state, read_adapter, validate_adapter_layout
 from ...parallel import ContextParallel
 from .config import DeepSeekV41Config
 from .model import (
@@ -28,225 +27,12 @@ except ImportError:  # pragma: no cover - only needed for older PyTorch type che
     DeviceMesh = object
 
 
-_FP4_VALUES = (
-    0.0,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    4.0,
-    6.0,
-    0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-)
-
-
-def _torch_dtype(name: str) -> torch.dtype:
-    if name == "BF16":
-        return torch.bfloat16
-    if name == "F32":
-        return torch.float32
-    if name == "I8":
-        return torch.int8
-    attribute = {
-        "F8_E4M3": "float8_e4m3fn",
-        "F8_E8M0": "float8_e8m0fnu",
-    }.get(name)
-    dtype = None if attribute is None else getattr(torch, attribute, None)
-    if dtype is None:
-        raise RuntimeError(f"this PyTorch build does not support safetensors dtype {name}")
-    return dtype
-
-
-class _SafeTensorShard:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._file = path.open("rb")
-        header_size_bytes = self._file.read(8)
-        if len(header_size_bytes) != 8:
-            raise ValueError(f"invalid safetensors header: {path}")
-        self.header_size = struct.unpack("<Q", header_size_bytes)[0]
-        self.header = json.loads(self._file.read(self.header_size))
-        self.data_start = 8 + self.header_size
-        self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_COPY)
-
-    def tensor(self, name: str, device: torch.device | str) -> torch.Tensor:
-        metadata = self.header[name]
-        dtype = _torch_dtype(metadata["dtype"])
-        shape = tuple(metadata["shape"])
-        start, stop = metadata["data_offsets"]
-        numel = math.prod(shape)
-        expected_bytes = numel * torch.empty((), dtype=dtype).element_size()
-        if stop - start != expected_bytes:
-            raise ValueError(
-                f"invalid byte range for {name}: expected {expected_bytes}, got {stop - start}"
-            )
-        source = torch.frombuffer(
-            self._mapping,
-            dtype=dtype,
-            count=numel,
-            offset=self.data_start + start,
-        ).reshape(shape)
-        target = torch.device(device)
-        return source.clone() if target.type == "cpu" else source.to(target)
-
-    def tensor_rows(
-        self,
-        name: str,
-        row_start: int,
-        row_stop: int,
-        device: torch.device | str,
-    ) -> torch.Tensor:
-        metadata = self.header[name]
-        shape = tuple(metadata["shape"])
-        if not shape:
-            raise ValueError(f"cannot slice rows from scalar tensor {name}")
-        if not 0 <= row_start <= row_stop <= shape[0]:
-            raise IndexError(
-                f"invalid row range for {name}: [{row_start}, {row_stop}) of {shape[0]}"
-            )
-        dtype = _torch_dtype(metadata["dtype"])
-        start, stop = metadata["data_offsets"]
-        row_numel = math.prod(shape[1:])
-        element_size = torch.empty((), dtype=dtype).element_size()
-        expected_bytes = math.prod(shape) * element_size
-        if stop - start != expected_bytes:
-            raise ValueError(
-                f"invalid byte range for {name}: expected {expected_bytes}, got {stop - start}"
-            )
-        source = torch.frombuffer(
-            self._mapping,
-            dtype=dtype,
-            count=(row_stop - row_start) * row_numel,
-            offset=self.data_start + start + row_start * row_numel * element_size,
-        ).reshape(row_stop - row_start, *shape[1:])
-        target = torch.device(device)
-        return source.clone() if target.type == "cpu" else source.to(target)
-
-    def close(self) -> None:
-        self._mapping.close()
-        self._file.close()
-
-
-class ShardedSafeTensorReader:
-    """Read selected tensors from an indexed safetensors checkpoint."""
-
-    def __init__(self, folder: str | Path) -> None:
-        self.folder = Path(folder)
-        with (self.folder / "model.safetensors.index.json").open(encoding="utf-8") as file:
-            self.weight_map: dict[str, str] = json.load(file)["weight_map"]
-        self._shards: dict[str, _SafeTensorShard] = {}
-
-    def tensor(self, name: str, device: torch.device | str) -> torch.Tensor:
-        try:
-            shard_name = self.weight_map[name]
-        except KeyError as error:
-            raise KeyError(f"checkpoint tensor is missing: {name}") from error
-        shard = self._shards.get(shard_name)
-        if shard is None:
-            shard = self._shards[shard_name] = _SafeTensorShard(self.folder / shard_name)
-        return shard.tensor(name, device)
-
-    def tensor_rows(
-        self,
-        name: str,
-        row_start: int,
-        row_stop: int,
-        device: torch.device | str,
-    ) -> torch.Tensor:
-        try:
-            shard_name = self.weight_map[name]
-        except KeyError as error:
-            raise KeyError(f"checkpoint tensor is missing: {name}") from error
-        shard = self._shards.get(shard_name)
-        if shard is None:
-            shard = self._shards[shard_name] = _SafeTensorShard(self.folder / shard_name)
-        return shard.tensor_rows(name, row_start, row_stop, device)
-
-    def close(self) -> None:
-        for shard in self._shards.values():
-            shard.close()
-        self._shards.clear()
-
-    def __enter__(self) -> ShardedSafeTensorReader:
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.close()
-
-
-@torch.no_grad()
-def dequantize_fp8_blocks(
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    *,
-    dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Dequantize a 32x32 E4M3 weight using its E8M0 block scales."""
-
-    if weight.ndim != 2 or scale.ndim != 2:
-        raise ValueError("FP8 weight and scale must both be matrices")
-    out_features, in_features = weight.shape
-    out_blocks, in_blocks = scale.shape
-    if out_features != out_blocks * 32 or in_features != in_blocks * 32:
-        raise ValueError(
-            f"FP8 shape mismatch: weight={tuple(weight.shape)}, scale={tuple(scale.shape)}"
-        )
-    blocks = weight.view(out_blocks, 32, in_blocks, 32).float()
-    return (blocks * scale.float()[:, None, :, None]).reshape(weight.shape).to(dtype)
-
-
-@torch.no_grad()
-def dequantize_fp8_rows(
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    *,
-    dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Dequantize E4M3 rows with one E8M0 scale per 32 columns."""
-
-    if weight.ndim != 2 or scale.ndim != 2:
-        raise ValueError("FP8 weight and scale must both be matrices")
-    rows, features = weight.shape
-    if scale.shape[0] != rows or features != scale.shape[1] * 32:
-        raise ValueError(
-            f"row-scaled FP8 shape mismatch: weight={tuple(weight.shape)}, "
-            f"scale={tuple(scale.shape)}"
-        )
-    blocks = weight.view(rows, scale.shape[1], 32).float()
-    return (blocks * scale.float().unsqueeze(-1)).flatten(1).to(dtype)
-
-
-@torch.no_grad()
-def dequantize_fp4_rows(
-    packed: torch.Tensor,
-    scale: torch.Tensor,
-    *,
-    dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Unpack E2M1 pairs and apply one E8M0 scale per 32 input values."""
-
-    if packed.dtype != torch.int8 or packed.ndim != 2 or scale.ndim != 2:
-        raise ValueError("FP4 weight must be an int8 matrix with a matrix of scales")
-    out_features, packed_features = packed.shape
-    if scale.shape[0] != out_features or packed_features * 2 != scale.shape[1] * 32:
-        raise ValueError(
-            f"FP4 shape mismatch: weight={tuple(packed.shape)}, scale={tuple(scale.shape)}"
-        )
-    values = torch.tensor(_FP4_VALUES, device=packed.device, dtype=torch.float32)
-    raw = packed.view(torch.uint8)
-    low = values[(raw & 0x0F).long()]
-    high = values[((raw >> 4) & 0x0F).long()]
-    unpacked = torch.stack((low, high), dim=-1).flatten(1)
-    blocks = unpacked.view(out_features, scale.shape[1], 32)
-    return (blocks * scale.float().unsqueeze(-1)).flatten(1).to(dtype)
+from ...loading import ShardedSafeTensorReader
+from ...loading import LoadPolicy, ParameterMaterializer, WeightSource
+from ...layout import local_tensor, local_slice
+from .engram import EngramPolicy
+from .weights import layer_sources
+from ...loading.quantization import dequantize_fp4_rows, dequantize_fp8_blocks, dequantize_fp8_rows
 
 
 def _prefix_config(folder: Path, num_layers: int) -> DeepSeekV41Config:
@@ -298,10 +84,29 @@ def load_dsv41_backbone_window(
     engram_mesh: DeviceMesh | None = None,
     sparse_engram_gradients: bool = False,
     layer_loaded: Callable[[DecoderLayer], None] | None = None,
+    lora_config: LoRAConfig | None = None,
+    cache_quantization: str | None = None,
+    adapter_path: str | Path | None = None,
+    load_policy: LoadPolicy | None = None,
+    engram_policy: EngramPolicy | None = None,
+    materializer: ParameterMaterializer | None = None,
 ) -> DeepSeekV41ForCausalLM:
     """Load a trainable prefix or source-anchored layer window."""
 
     folder = Path(folder)
+    load_policy = load_policy or LoadPolicy()
+    engram_policy = engram_policy or EngramPolicy()
+    direct = load_policy.mode == "direct_shard"
+    if materializer is not None and layer_loaded is not None:
+        raise ValueError("materializer and layer_loaded are mutually exclusive")
+    if direct and materializer is None:
+        raise ValueError("direct_shard requires a ParameterMaterializer")
+    if lora_config is not None and (direct or engram_policy.device == "cpu"
+                                    or getattr(getattr(materializer, "policy", None), "cpu_offload_layers", ())):
+        raise ValueError("LoRA with direct loading or CPU offload is not supported")
+    if adapter_path is not None and lora_config is None:
+        raise ValueError("adapter_path requires lora_config")
+    adapter = read_adapter(adapter_path) if adapter_path is not None else None
     if start_layer == 0:
         config = _prefix_config(folder, num_layers)
         layer_ids = list(range(num_layers))
@@ -315,6 +120,8 @@ def load_dsv41_backbone_window(
                 "a non-prefix layer window must start at a KV source layer"
             )
         layer_ids = list(range(start_layer, stop_layer))
+    if cache_quantization is not None:
+        config = replace(config, cache_quantization=cache_quantization)
     dispatcher = token_dispatcher or TokenDispatcher()
     with torch.device("meta"):
         model = DeepSeekV41ForCausalLM(
@@ -324,9 +131,16 @@ def load_dsv41_backbone_window(
             engram_mesh,
             layer_ids,
             sparse_engram_gradients,
+            engram_policy=engram_policy,
         )
+    if lora_config is not None:
+        model.requires_grad_(False)
+    if adapter is not None:
+        validate_adapter_layout(model, adapter)
 
     target_device = torch.device(device)
+    if materializer is not None:
+        materializer.prepare(model, dtype=dtype, device=target_device, direct=direct)
     rotary = model.model.rotary
     _materialize_rotary(rotary, config, target_device)
     with ShardedSafeTensorReader(folder) as checkpoint:
@@ -347,11 +161,16 @@ def load_dsv41_backbone_window(
                     f"unexpected={result.unexpected_keys[:5]}"
                 )
 
-        assign(model.model.embedding, {"weight": read("embed.weight").to(dtype)})
-        assign(model.model.norm, {"weight": read("norm.weight").to(dtype)})
-        assign(model.lm_head, {"weight": read("head.weight").to(dtype)})
+        if direct:
+            _load_direct(model, checkpoint, load_policy)
+        else:
+            assign(model.model.embedding, {"weight": read("embed.weight").to(dtype)})
+            assign(model.model.norm, {"weight": read("norm.weight").to(dtype)})
+            assign(model.lm_head, {"weight": read("head.weight").to(dtype)})
+            if materializer is not None:
+                materializer.roots_loaded(model)
 
-        for layer in model.model.layers:
+        def load_layer(layer: DecoderLayer) -> None:
             layer_id = layer.layer_id
             source = f"layers.{layer_id}"
             state: dict[str, torch.Tensor] = {
@@ -441,23 +260,24 @@ def load_dsv41_backbone_window(
 
             if layer.engram is not None:
                 table = model.model.engram_tables[str(layer_id)]
+                table_device = torch.device("cpu") if engram_policy.device == "cpu" else target_device
                 table_weight = torch.empty(
-                    table.weight.shape, device=target_device, dtype=dtype
+                    table.weight.shape, device=table_device, dtype=dtype
                 )
-                chunk_rows = 131072
+                chunk_rows = min(load_policy.chunk_rows, max(1, load_policy.staging_bytes // (16 * config.engram_head_dim * 2)))
                 for chunk_start in range(table.row_start, table.row_stop, chunk_rows):
                     chunk_stop = min(chunk_start + chunk_rows, table.row_stop)
                     weight = checkpoint.tensor_rows(
                         f"{source}.engram.embed.weight",
                         chunk_start,
                         chunk_stop,
-                        target_device,
+                        table_device,
                     )
                     scale = checkpoint.tensor_rows(
                         f"{source}.engram.embed.scale",
                         chunk_start,
                         chunk_stop,
-                        target_device,
+                        table_device,
                     )
                     table_weight[chunk_start - table.row_start : chunk_stop - table.row_start].copy_(
                         dequantize_fp8_rows(weight, scale, dtype=dtype)
@@ -468,8 +288,24 @@ def load_dsv41_backbone_window(
                 state["engram.proj.weight"] = fp8(f"{source}.engram.wkv")
 
             assign(layer, state)
+
+        for index, layer in enumerate(model.model.layers):
+            if direct:
+                continue
+            # The helper's temporary tensors die before FSDP replaces full weights.
+            load_layer(layer)
+            if lora_config is not None:
+                inject_lora(layer, lora_config)
+                if adapter is not None:
+                    load_adapter_state(layer, adapter, prefix=f"model.layers.{index}")
             if layer_loaded is not None:
                 layer_loaded(layer)
+            elif materializer is not None:
+                materializer.layer_loaded(layer)
+        model.loading_metrics = {"logical_bytes_read": checkpoint.bytes_read, "mode": load_policy.mode}
+
+    if materializer is not None:
+        materializer.finish(model)
 
     if model.model.hash is not None:
         token_map, compressed_vocab_size = build_compressed_token_map(
@@ -491,6 +327,32 @@ def load_dsv41_backbone_window(
     return model
 
 
+def _load_direct(model, reader, policy):
+    def fill(parameter, source, offset=None, shape=None):
+        offsets, _ = local_slice(parameter)
+        source.fill(reader, local_tensor(parameter), offset or offsets,
+                    shape or tuple(parameter.shape), policy)
+
+    for parameter, name in ((model.model.embedding.weight, "embed.weight"),
+                            (model.model.norm.weight, "norm.weight"),
+                            (model.lm_head.weight, "head.weight")):
+        fill(parameter, WeightSource((name,)))
+    for layer in model.model.layers:
+        parameters = dict(layer.named_parameters())
+        buffers = dict(layer.named_buffers())
+        sources = layer_sources(layer)
+        if set(parameters) - set(sources):
+            raise RuntimeError(f"unmapped checkpoint parameters: {set(parameters) - set(sources)}")
+        for name, source in sources.items():
+            fill(parameters[name] if name in parameters else buffers[name], source)
+        if layer.engram is not None:
+            table = model.model.engram_tables[str(layer.layer_id)]
+            offsets, _ = local_slice(table.weight)
+            fill(table.weight, WeightSource((f"layers.{layer.layer_id}.engram.embed",), "fp8_rows"),
+                 (table.row_start + offsets[0], 0),
+                 (table.global_num_embeddings, table.embedding_dim))
+
+
 def load_dsv41_backbone_prefix(
     folder: str | Path,
     *,
@@ -502,6 +364,12 @@ def load_dsv41_backbone_prefix(
     engram_mesh: DeviceMesh | None = None,
     sparse_engram_gradients: bool = False,
     layer_loaded: Callable[[DecoderLayer], None] | None = None,
+    lora_config: LoRAConfig | None = None,
+    cache_quantization: str | None = None,
+    adapter_path: str | Path | None = None,
+    load_policy: LoadPolicy | None = None,
+    engram_policy: EngramPolicy | None = None,
+    materializer: ParameterMaterializer | None = None,
 ) -> DeepSeekV41ForCausalLM:
     """Load a trainable prefix directly from the released checkpoint."""
 
@@ -516,6 +384,12 @@ def load_dsv41_backbone_prefix(
         engram_mesh=engram_mesh,
         sparse_engram_gradients=sparse_engram_gradients,
         layer_loaded=layer_loaded,
+        lora_config=lora_config,
+        cache_quantization=cache_quantization,
+        adapter_path=adapter_path,
+        load_policy=load_policy,
+        engram_policy=engram_policy,
+        materializer=materializer,
     )
 
 
