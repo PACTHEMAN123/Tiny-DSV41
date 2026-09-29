@@ -13,17 +13,22 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
 import torch.nn.functional as F
 from torch import nn
+from torch.utils._pytree import register_pytree_node
 
 from .config import DeepSeekV41Config
+from .engram.hash import NgramHash, build_compressed_token_map
+from .engram.table import RowShardedEmbedding
+from .engram.policy import EngramPolicy
 from .moe import RoutedExperts, SparseMoE, TopKRouter
+from .quantization import quantize_activation
+from ...activation import ActivationCheckpointConfig, recompute
 from ...dispatch import TokenDispatcher
 from ...parallel import ContextParallel
 
@@ -55,8 +60,12 @@ class HyperConnection(nn.Module):
         self.base = nn.Parameter(torch.zeros(mix_size))
         self.scale = nn.Parameter(torch.ones(3))
         self.norm_eps = config.rms_norm_eps
+        self.checkpoint_enabled = False
 
     def forward(self, streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return recompute(self.checkpoint_enabled and self.training, self._compute, streams)
+
+    def _compute(self, streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = streams.flatten(2).float()
         flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
         hc = self.hc_mult
@@ -148,112 +157,11 @@ class AttentionSinks(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(num_heads))
 
-    def forward(self) -> torch.Tensor:
+    def forward(self, reference: torch.Tensor | None = None) -> torch.Tensor:
+        # A tensor argument also anchors FSDP device handling during recomputation.
         # The result outlives this nested FSDP module's forward. Materialize it
         # before FSDP reshards and releases the unsharded parameter storage.
         return self.weight.clone()
-
-
-class _ScaleGradient(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, tensor: torch.Tensor, scale: float) -> torch.Tensor:
-        ctx.scale = scale
-        return tensor
-
-    @staticmethod
-    def backward(ctx, gradient: torch.Tensor) -> tuple[torch.Tensor, None]:
-        return gradient * ctx.scale, None
-
-
-class RowShardedEmbedding(nn.Module):
-    """Shard embedding rows over a mesh and route lookups to their owner."""
-
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        mesh: DeviceMesh | None = None,
-        sparse_gradients: bool = False,
-    ) -> None:
-        super().__init__()
-        if mesh is not None and mesh.ndim != 1:
-            raise ValueError("the embedding mesh must be one-dimensional")
-        self.global_num_embeddings = num_embeddings
-        self.embedding_dim = embedding_dim
-        self.mesh = mesh
-        self.sparse_gradients = sparse_gradients
-        self.size = 1 if mesh is None else mesh.size()
-        self.rank = 0 if mesh is None else mesh.get_local_rank()
-        self.group = None if mesh is None else mesh.get_group()
-        if num_embeddings < self.size:
-            raise ValueError("embedding rows must be at least the embedding mesh size")
-
-        base, remainder = divmod(num_embeddings, self.size)
-        self.row_start = self.rank * base + min(self.rank, remainder)
-        self.row_stop = self.row_start + base + int(self.rank < remainder)
-        self.weight = nn.Parameter(torch.empty(self.row_stop - self.row_start, embedding_dim))
-
-    def forward(self, indices: torch.Tensor) -> torch.Tensor:
-        if self.size == 1:
-            return F.embedding(indices, self.weight, sparse=self.sparse_gradients)
-        if indices.numel() and (indices.min() < 0 or indices.max() >= self.global_num_embeddings):
-            raise IndexError("embedding index is outside the configured row range")
-
-        shape = indices.shape
-        flat = indices.reshape(-1)
-        base, remainder = divmod(self.global_num_embeddings, self.size)
-        large_rows = (base + 1) * remainder
-        owners = torch.where(
-            flat < large_rows,
-            torch.div(flat, base + 1, rounding_mode="floor"),
-            remainder + torch.div(flat - large_rows, base, rounding_mode="floor"),
-        )
-        order = torch.argsort(owners, stable=True)
-        send_counts = torch.bincount(owners, minlength=self.size).to(torch.int64)
-        recv_counts = torch.empty_like(send_counts)
-        dist.all_to_all_single(recv_counts, send_counts, group=self.group)
-        send_splits = send_counts.tolist()
-        recv_splits = recv_counts.tolist()
-
-        routed = self._exchange(
-            flat[order].contiguous(), recv_splits, send_splits, autograd=False
-        )
-        rows = F.embedding(
-            routed - self.row_start,
-            self.weight,
-            sparse=self.sparse_gradients,
-        )
-        rows = _ScaleGradient.apply(rows, 1.0 / self.size)
-        returned = self._exchange(
-            rows.contiguous(), send_splits, recv_splits, autograd=True
-        )
-        return returned[torch.argsort(order)].view(*shape, self.embedding_dim)
-
-    def _exchange(
-        self,
-        tensor: torch.Tensor,
-        output_splits: list[int],
-        input_splits: list[int],
-        *,
-        autograd: bool,
-    ) -> torch.Tensor:
-        output = tensor.new_empty((sum(output_splits), *tensor.shape[1:]))
-        if autograd:
-            return dist_nn.all_to_all_single(
-                output,
-                tensor,
-                output_split_sizes=output_splits,
-                input_split_sizes=input_splits,
-                group=self.group,
-            )
-        dist.all_to_all_single(
-            output,
-            tensor,
-            output_split_sizes=output_splits,
-            input_split_sizes=input_splits,
-            group=self.group,
-        )
-        return output
 
 
 class Compressor(nn.Module):
@@ -332,6 +240,7 @@ class SparseIndexer(nn.Module):
         self.topk = config.index_topk
         self.topk_blocks = config.candidate_topk_blocks
         self.block_size = config.candidate_block_size
+        self.quantized_cache = config.cache_quantization == "hf"
         self.rotary = rotary
         self.q_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
         self.weight_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
@@ -354,7 +263,10 @@ class SparseIndexer(nn.Module):
             if latent is not None:
                 keys = self.k_norm(self.k_proj(latent))
                 cos, sin = self.rotary(keys, group_positions, compressed=True)
-                shared["index_keys"] = apply_rope(keys, cos, sin).unsqueeze(1)
+                keys = apply_rope(keys, cos, sin)
+                if self.quantized_cache:
+                    keys = quantize_activation(keys, "fp4_index")
+                shared["index_keys"] = keys.unsqueeze(1)
 
         index_keys = shared.get("index_keys")
         if index_keys is None:
@@ -366,7 +278,10 @@ class SparseIndexer(nn.Module):
         keys = index_keys[:, 0].float()
         query = self.q_proj(q_residual).view(batch, length, self.num_heads, self.head_dim)
         cos, sin = self.rotary(query, positions, compressed=True)
-        query = apply_rope(query, cos, sin).float()
+        query = apply_rope(query, cos, sin)
+        if self.quantized_cache:
+            query = quantize_activation(query, "fp4_index")
+        query = query.float()
         head_weights = self.weight_proj(x).float() * self.num_heads**-0.5
         scores = torch.einsum("bshd,btd->bsht", query, keys).relu_() * self.head_dim**-0.5
         scores = (scores * head_weights.unsqueeze(-1)).sum(2)
@@ -382,7 +297,7 @@ class SparseIndexer(nn.Module):
         elif previous_candidates is not None:
             scores = scores.masked_fill(~previous_candidates, float("-inf"))
 
-        picked = scores.topk(min(self.topk, keys.shape[1]), dim=-1, sorted=False)
+        picked = scores.topk(min(self.topk, keys.shape[1]), dim=-1, sorted=self.quantized_cache)
         shared["topk_indices"] = torch.where(
             picked.values > float("-inf"), picked.indices, torch.full_like(picked.indices, -1)
         )
@@ -405,6 +320,7 @@ class CompressedAttention(nn.Module):
         self.dropout = config.attention_dropout
         self.rotary = rotary
         self.context_parallel = context_parallel
+        self.checkpoint_enabled = False
         self.q_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = RMSNorm(config.q_lora_rank, config.rms_norm_eps)
         self.q_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
@@ -434,6 +350,8 @@ class CompressedAttention(nn.Module):
         query = self.q_b(q_residual).view(batch, length, self.num_heads, self.head_dim)
         query = apply_rope(query, cos, sin).transpose(1, 2)
         kv = apply_rope(self.kv_norm(self.kv_proj(x)), cos, sin).unsqueeze(1)
+        if self.config.cache_quantization == "hf":
+            kv = quantize_activation(kv, "fp8")
         kv = self.context_parallel.gather(kv, dim=2)
 
         selected = selected_valid = None
@@ -458,7 +376,10 @@ class CompressedAttention(nn.Module):
 
             if latent is not None:
                 latent_cos, latent_sin = self.rotary(latent, group_positions, compressed=True)
-                shared["compressed_kv"] = apply_rope(latent, latent_cos, latent_sin).unsqueeze(1)
+                rotated = apply_rope(latent, latent_cos, latent_sin)
+                if self.config.cache_quantization == "hf":
+                    rotated = quantize_activation(rotated, "fp4_kv")
+                shared["compressed_kv"] = rotated.unsqueeze(1)
 
             compressed_kv = shared.get("compressed_kv")
             topk_indices = shared.get("topk_indices")
@@ -468,7 +389,10 @@ class CompressedAttention(nn.Module):
                 rows = torch.arange(batch, device=x.device).view(batch, 1, 1)
                 selected = entries[rows, topk_indices.clamp_min(0)]
 
-        output = self._attend(query, kv, attention_mask, selected, selected_valid)
+        output = recompute(
+            self.checkpoint_enabled and self.training,
+            self._attend, query, kv, attention_mask, selected, selected_valid, self.sinks(x),
+        )
         output = apply_rope(output, cos, sin, inverse=True)
         grouped = output.reshape(batch, length, self.config.o_groups, -1)
         return self.o_b(self.o_a(grouped).flatten(2))
@@ -480,6 +404,7 @@ class CompressedAttention(nn.Module):
         mask: torch.Tensor,
         selected: torch.Tensor | None,
         selected_valid: torch.Tensor | None,
+        sink_weights: torch.Tensor,
     ) -> torch.Tensor:
         logits = torch.matmul(query, kv.transpose(2, 3)) * self.head_dim**-0.5
         logits = logits + mask
@@ -490,7 +415,7 @@ class CompressedAttention(nn.Module):
             picked = picked.masked_fill(~selected_valid.unsqueeze(1), float("-inf"))
             logits = torch.cat((logits, picked), dim=-1)
 
-        sinks = self.sinks().view(1, -1, 1, 1).expand(
+        sinks = sink_weights.view(1, -1, 1, 1).expand(
             query.shape[0], -1, query.shape[-2], -1
         )
         combined = torch.cat((logits.float(), sinks), dim=-1)
@@ -503,157 +428,6 @@ class CompressedAttention(nn.Module):
                 "bhsk,bskd->bhsd", probabilities[..., window:], selected.to(probabilities.dtype)
             )
         return output.transpose(1, 2).contiguous()
-
-
-def _is_prime(value: int) -> bool:
-    if value < 2 or value % 2 == 0:
-        return value == 2
-    divisor = 3
-    while divisor * divisor <= value:
-        if value % divisor == 0:
-            return False
-        divisor += 2
-    return True
-
-
-def _next_prime(value: int, used: set[int]) -> int:
-    value += 1
-    while value in used or not _is_prime(value):
-        value += 1
-    return value
-
-
-def build_compressed_token_map(tokenizer_file: str | Path) -> tuple[torch.Tensor, int]:
-    try:
-        from tokenizers import Regex, Tokenizer, normalizers
-    except ImportError as error:
-        raise RuntimeError(
-            "loading Engram checkpoint weights requires the tokenizers package"
-        ) from error
-
-    tokenizer = Tokenizer.from_file(str(tokenizer_file))
-    sentinel = "\ue000"
-    normalizer = normalizers.Sequence(
-        [
-            normalizers.NFKC(),
-            normalizers.NFD(),
-            normalizers.StripAccents(),
-            normalizers.Lowercase(),
-            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
-            normalizers.Replace(Regex(r"^ $"), sentinel),
-            normalizers.Strip(),
-            normalizers.Replace(sentinel, " "),
-        ]
-    )
-    compressed: dict[str, int] = {}
-    mapping = []
-    for token_id in range(tokenizer.get_vocab_size(with_added_tokens=True)):
-        text = tokenizer.decode([token_id], skip_special_tokens=False)
-        if "\ufffd" in text:
-            key = tokenizer.id_to_token(token_id)
-        else:
-            normalized = normalizer.normalize_str(text)
-            key = normalized or text
-        new_id = compressed.get(key)
-        if new_id is None:
-            new_id = len(compressed)
-            compressed[key] = new_id
-        mapping.append(new_id)
-    return torch.tensor(mapping, dtype=torch.long), len(compressed)
-
-
-def _build_hash_multipliers(
-    layer_ids: list[int], max_ngram: int, compressed_vocab_size: int
-) -> torch.Tensor:
-    """Rebuild the fixed hash constants used to address pretrained Engram rows."""
-    bound = max(1, (np.iinfo(np.int64).max // compressed_vocab_size) // 2)
-    rows = []
-    for layer_id in layer_ids:
-        generator = np.random.default_rng(10007 * layer_id)
-        values = generator.integers(0, bound, size=max_ngram, dtype=np.int64)
-        rows.append(torch.from_numpy(values * 2 + 1))
-    return torch.stack(rows)
-
-
-class NgramHash(nn.Module):
-    def __init__(
-        self,
-        config: DeepSeekV41Config,
-        layer_ids: list[int] | None = None,
-        token_map: torch.Tensor | None = None,
-    ) -> None:
-        super().__init__()
-        self.max_ngram = config.engram_max_ngram_size
-        if token_map is None:
-            token_map = torch.arange(config.vocab_size).remainder(
-                config.engram_compressed_vocab_size
-            )
-        if token_map.ndim != 1 or token_map.shape[0] != config.vocab_size:
-            raise ValueError("Engram token map must contain one entry per vocabulary id")
-        if not token_map.is_meta and token_map.numel() and (
-            token_map.min() < 0
-            or token_map.max() >= config.engram_compressed_vocab_size
-        ):
-            raise ValueError("Engram token map contains an out-of-range compressed id")
-        self.pad_id = (
-            config.engram_pad_id % config.engram_compressed_vocab_size
-            if token_map.is_meta
-            else int(token_map[config.engram_pad_id])
-        )
-        layer_ids = list(config.engram_layer_ids if layer_ids is None else layer_ids)
-        if not set(layer_ids).issubset(config.engram_layer_ids):
-            raise ValueError("Engram hash layers must be configured Engram layers")
-        selected = set(layer_ids)
-        layer_primes, layer_offsets, used = [], [], set()
-        for layer_id, table_size in zip(
-            config.engram_layer_ids, config.engram_num_embeddings
-        ):
-            primes, offsets, offset = [], [], 0
-            current = config.engram_vocab_size - 1
-            for _ in range((self.max_ngram - 1) * config.engram_n_heads):
-                current = _next_prime(current, used)
-                used.add(current)
-                primes.append(current)
-                offsets.append(offset)
-                offset += current
-            if offset > table_size:
-                raise ValueError(f"engram table needs {offset} rows, got {table_size}")
-            if layer_id in selected:
-                layer_primes.append(primes)
-                layer_offsets.append(offsets)
-
-        primes = torch.tensor(layer_primes).view(
-            len(layer_ids), self.max_ngram - 1, config.engram_n_heads
-        )
-        offsets = torch.tensor(layer_offsets)
-        multipliers = _build_hash_multipliers(
-            layer_ids, self.max_ngram, config.engram_compressed_vocab_size
-        )
-        self.compressed_vocab_size = config.engram_compressed_vocab_size
-        self.register_buffer("token_map", token_map.to(torch.long), persistent=False)
-        self.register_buffer("primes", primes, persistent=False)
-        self.register_buffer("offsets", offsets, persistent=False)
-        self.register_buffer("multipliers", multipliers, persistent=False)
-
-    def forward(self, input_ids: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
-        tokens = self.token_map[input_ids]
-        dead = -1
-        tokens = tokens.masked_fill(~token_mask, dead)
-        context = self.max_ngram - 1
-        history = F.pad(tokens, (context, 0), value=dead)
-        shifted, blocked = [], torch.zeros_like(tokens, dtype=torch.bool)
-        for distance in range(self.max_ngram):
-            source = history[:, context - distance : context - distance + tokens.shape[1]]
-            blocked |= source == dead
-            shifted.append(torch.where(blocked, self.pad_id, source))
-        windows = torch.stack(shifted, dim=-1)
-
-        products = windows.unsqueeze(2) * self.multipliers
-        rolling, hashes = products[..., 0], []
-        for index in range(1, self.max_ngram):
-            rolling = torch.bitwise_xor(rolling, products[..., index])
-            hashes.append(rolling.unsqueeze(-1) % self.primes[:, index - 1])
-        return torch.cat(hashes, dim=-1) + self.offsets
 
 
 class Engram(nn.Module):
@@ -684,6 +458,14 @@ class Engram(nn.Module):
         gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
         gate = gate.masked_fill(~mask.unsqueeze(-1), 0)
         return (hidden + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(streams.dtype)
+
+
+class AttentionState(NamedTuple):
+    compress_lengths: torch.Tensor | None = None
+    compressed_kv: torch.Tensor | None = None
+    index_keys: torch.Tensor | None = None
+    topk_indices: torch.Tensor | None = None
+    candidates: torch.Tensor | None = None
 
 
 class DecoderLayer(nn.Module):
@@ -726,9 +508,10 @@ class DecoderLayer(nn.Module):
         positions: torch.Tensor,
         attention_mask: torch.Tensor,
         token_mask: torch.Tensor,
-        shared: dict[str, torch.Tensor | None],
+        state: AttentionState,
         engram_rows: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, AttentionState]:
+        shared = state._asdict()
         if self.engram is not None:
             streams = self.engram(streams, engram_rows, token_mask)
 
@@ -745,7 +528,7 @@ class DecoderLayer(nn.Module):
         collapsed = self.collapse(streams, next_pre)
         value, router_logits = self.moe(self.post_attention_norm(collapsed))
         streams = self.expand(value, residual, post, combine)
-        return streams, final_pre, router_logits
+        return streams, final_pre, router_logits, AttentionState(**shared)
 
 
 class DeepSeekV41Model(nn.Module):
@@ -757,10 +540,13 @@ class DeepSeekV41Model(nn.Module):
         engram_mesh: DeviceMesh | None = None,
         layer_ids: list[int] | None = None,
         sparse_engram_gradients: bool = False,
+        *,
+        engram_policy: EngramPolicy | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.context_parallel = context_parallel or ContextParallel()
+        self.activation_checkpointing = ActivationCheckpointConfig()
         token_dispatcher = token_dispatcher or TokenDispatcher()
         layer_ids = (
             list(range(config.num_hidden_layers)) if layer_ids is None else layer_ids
@@ -797,6 +583,7 @@ class DeepSeekV41Model(nn.Module):
                     config.engram_head_dim,
                     engram_mesh,
                     sparse_gradients=sparse_engram_gradients,
+                    policy=engram_policy,
                 )
                 for layer_id in self.engram_layer_ids
             }
@@ -831,21 +618,29 @@ class DeepSeekV41Model(nn.Module):
         if hashes is not None:
             hashes = self.context_parallel.shard(hashes)
             for index, layer_id in enumerate(self.engram_layer_ids):
-                engram_rows[layer_id] = self.engram_tables[str(layer_id)](hashes[:, :, index])
+                table = self.engram_tables[str(layer_id)]
+                indices = hashes[:, :, index]
+                engram_rows[layer_id] = table.prefetch(indices) if table.sparse_gradients else table(indices)
 
-        shared: dict[str, torch.Tensor | None] = {}
+        state = AttentionState()
         pre_mix = hidden.new_zeros(batch, length, self.config.hc_mult, dtype=torch.float32)
         pre_mix[..., 0] = 1
         router_logits = []
         for layer in self.layers:
-            streams, pre_mix, logits = layer(
+            rows = None
+            if layer.layer_id in engram_rows:
+                pending = engram_rows.pop(layer.layer_id)
+                rows = pending if isinstance(pending, torch.Tensor) else self.engram_tables[str(layer.layer_id)].resolve(pending)
+            streams, pre_mix, logits, state = recompute(
+                self.activation_checkpointing.mode == "full" and self.training,
+                layer,
                 streams,
                 pre_mix,
                 positions,
                 causal_mask,
                 attention_mask,
-                shared,
-                engram_rows.get(layer.layer_id),
+                state,
+                rows,
             )
             router_logits.append(logits)
 
@@ -904,6 +699,14 @@ class CausalLMOutput:
     router_logits: tuple[torch.Tensor, ...]
 
 
+# FSDP discovers output tensors through pytree to install its pre-backward hook.
+register_pytree_node(
+    CausalLMOutput,
+    lambda output: ([output.loss, output.logits, output.aux_loss, output.router_logits], None),
+    lambda values, context: CausalLMOutput(*values),
+)
+
+
 class DeepSeekV41ForCausalLM(nn.Module):
     def __init__(
         self,
@@ -913,6 +716,8 @@ class DeepSeekV41ForCausalLM(nn.Module):
         engram_mesh: DeviceMesh | None = None,
         layer_ids: list[int] | None = None,
         sparse_engram_gradients: bool = False,
+        *,
+        engram_policy: EngramPolicy | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -924,9 +729,37 @@ class DeepSeekV41ForCausalLM(nn.Module):
             engram_mesh,
             layer_ids,
             sparse_engram_gradients,
+            engram_policy=engram_policy,
         )
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._initialize)
+
+    def configure_engram(self, policy: EngramPolicy) -> None:
+        for table in self.model.engram_tables.values():
+            table.configure(policy)
+
+    def synchronize_engram(self) -> None:
+        for table in self.model.engram_tables.values():
+            table.synchronize()
+
+    def close(self) -> None:
+        for table in self.model.engram_tables.values():
+            table.close()
+
+    def set_activation_checkpointing(self, policy: ActivationCheckpointConfig) -> None:
+        self.model.activation_checkpointing = policy
+        for layer in self.model.layers:
+            layer.attention.checkpoint_enabled = policy.selects("attention")
+            layer.moe.routed.checkpoint_enabled = policy.selects("moe")
+            layer.moe.shared.checkpoint_enabled = policy.selects("moe")
+            layer.attention_hc.checkpoint_enabled = policy.selects("hc")
+            layer.moe_hc.checkpoint_enabled = policy.selects("hc")
+
+    def gradient_checkpointing_enable(self) -> None:
+        self.set_activation_checkpointing(ActivationCheckpointConfig("full"))
+
+    def gradient_checkpointing_disable(self) -> None:
+        self.set_activation_checkpointing(ActivationCheckpointConfig())
 
     def _initialize(self, module: nn.Module) -> None:
         if any(parameter.is_meta for parameter in module.parameters(recurse=False)):

@@ -23,6 +23,7 @@ class DeepSeekV41Config:
     rope_scaling: dict | None = None
     max_position_embeddings: int = 1048576
     attention_dropout: float = 0.0
+    cache_quantization: str = "none"
 
     sliding_window: int = 128
     compress_ratios: list[int] | None = None
@@ -108,6 +109,8 @@ class DeepSeekV41Config:
         self._validate()
 
     def _validate(self) -> None:
+        if self.cache_quantization not in {"none", "hf"}:
+            raise ValueError("cache_quantization must be none or hf")
         if self.hidden_size <= 0 or self.num_hidden_layers <= 0:
             raise ValueError("hidden_size and num_hidden_layers must be positive")
         if self.head_dim < self.qk_rope_head_dim or self.qk_rope_head_dim % 2:

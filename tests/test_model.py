@@ -33,10 +33,11 @@ class ModelTest(unittest.TestCase):
         experts = RoutedExperts(config, EmptyReceiveDispatcher())
         hidden = torch.randn(3, config.hidden_size, requires_grad=True)
         expert_ids = torch.zeros(3, config.num_experts_per_tok, dtype=torch.long)
-        weights = torch.ones(3, config.num_experts_per_tok)
+        weights = torch.ones(3, config.num_experts_per_tok, requires_grad=True)
 
         experts(hidden, expert_ids, weights).sum().backward()
 
+        torch.testing.assert_close(weights.grad, torch.zeros_like(weights))
         self.assertTrue(all(parameter.grad is None for parameter in experts.gate_up))
         self.assertTrue(all(parameter.grad is None for parameter in experts.down))
 
@@ -99,6 +100,9 @@ class ModelTest(unittest.TestCase):
         for expert_parallel in (False, True):
             for target in (model, model.model):
                 with self.subTest(expert_parallel=expert_parallel, target=type(target).__name__):
+                    for module in model.modules():
+                        if hasattr(module, "_dsv41_sharded"):
+                            del module._dsv41_sharded
                     meshes = ParallelMeshes(
                         fsdp=Mock(), cp=None,
                         ep=Mock() if expert_parallel else None,
@@ -116,11 +120,10 @@ class ModelTest(unittest.TestCase):
                         apply_fsdp2(target, meshes, reshard_after_forward=False)
                     expected = []
                     for layer in model.model.layers:
-                        if expert_parallel:
-                            expected.append(call(
-                                layer.moe.routed, mesh=meshes.expert_fsdp,
-                                reshard_after_forward=False,
-                            ))
+                        expected.append(call(
+                            layer.moe.routed, mesh=meshes.expert_fsdp if expert_parallel else meshes.fsdp,
+                            reshard_after_forward=False,
+                        ))
                         for fp32_module in (
                             layer.attention_hc,
                             layer.moe_hc,
@@ -132,13 +135,16 @@ class ModelTest(unittest.TestCase):
                                 reshard_after_forward=False,
                             ))
                         expected.append(call(layer, mesh=meshes.fsdp, reshard_after_forward=False))
+                    expected.append(call(model.model.embedding, mesh=meshes.fsdp, reshard_after_forward=False))
+                    if target is model:
+                        expected.append(call(model.lm_head, mesh=meshes.fsdp, reshard_after_forward=False))
                     if expert_parallel:
                         for table in model.model.engram_tables.values():
                             expected.append(call(
                                 table, mesh=meshes.engram_fsdp,
                                 reshard_after_forward=False,
                             ))
-                    expected.append(call(target, mesh=meshes.fsdp))
+                    expected.append(call(target, mesh=meshes.fsdp, reshard_after_forward=False))
                     self.assertEqual(shard.call_args_list, expected)
 
     def test_dsv4_fsdp_leaves_sparse_engram_tables_row_sharded(self):
@@ -172,6 +178,7 @@ class ModelTest(unittest.TestCase):
                 model,
                 mesh=meshes.fsdp,
                 ignored_params={table.weight},
+                reshard_after_forward=True,
             ),
         )
 

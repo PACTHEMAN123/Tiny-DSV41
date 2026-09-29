@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ...dispatch import TokenDispatcher
+from ...activation import recompute
 from .config import DeepSeekV41Config
 
 
@@ -67,6 +68,7 @@ class RoutedExperts(nn.Module):
             for _ in range(self.num_experts)
         )
         self.gradient_group = None
+        self.checkpoint_enabled = False
 
     @property
     def local_parameter_count(self) -> int:
@@ -79,12 +81,21 @@ class RoutedExperts(nn.Module):
         self, x: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor
     ) -> torch.Tensor:
         x, indices, weights, metadata = self.dispatcher.dispatch(x, indices, weights)
-        output = torch.zeros_like(x, dtype=torch.float32) + x.float().sum() * 0
         used = torch.zeros(self.num_experts, dtype=torch.int32, device=indices.device)
         used.scatter_(0, indices, 1)
         if self.gradient_group is not None:
             dist.all_reduce(used, op=dist.ReduceOp.MAX, group=self.gradient_group)
-        for expert_id in used.nonzero().flatten().tolist():
+        expert_ids = used.nonzero().flatten().tolist()
+        output = recompute(
+            self.checkpoint_enabled and self.training,
+            self._compute, x, indices, weights, expert_ids,
+        )
+        return self.dispatcher.combine(output, metadata)
+
+    def _compute(self, x, indices, weights, expert_ids):
+        # Both dispatch collectives must participate in backward on empty ranks.
+        output = torch.zeros_like(x, dtype=torch.float32) + (x.float().sum() + weights.float().sum()) * 0
+        for expert_id in expert_ids:
             token_ids = torch.where(indices == expert_id)[0]
             if token_ids.numel() == 0:
                 anchor = (
@@ -101,7 +112,6 @@ class RoutedExperts(nn.Module):
             current = current * weights[token_ids, None]
             current = F.linear(current.to(x.dtype), self.down[expert_id])
             output.index_add_(0, token_ids, current.float())
-        output = self.dispatcher.combine(output, metadata)
         return output
 
 
@@ -112,8 +122,12 @@ class SharedExpert(nn.Module):
         self.up = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False)
         self.down = nn.Linear(config.moe_intermediate_size, config.hidden_size, bias=False)
         self.limit = config.swiglu_limit
+        self.checkpoint_enabled = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return recompute(self.checkpoint_enabled and self.training, self._compute, x)
+
+    def _compute(self, x: torch.Tensor) -> torch.Tensor:
         return self.down(_clamped_swiglu(self.gate(x), self.up(x), self.limit).to(x.dtype))
 
 
