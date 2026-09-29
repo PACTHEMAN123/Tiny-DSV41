@@ -34,8 +34,11 @@ if triton is not None:
         rows: tl.constexpr,
         columns: tl.constexpr,
         gate_row_stride: tl.constexpr,
+        gate_column_stride: tl.constexpr,
         up_row_stride: tl.constexpr,
+        up_column_stride: tl.constexpr,
         output_row_stride: tl.constexpr,
+        output_column_stride: tl.constexpr,
         limit: tl.constexpr,
         block: tl.constexpr,
     ):
@@ -43,10 +46,16 @@ if triton is not None:
         columns_offset = tl.program_id(1) * block + tl.arange(0, block)
         mask = (row < rows) & (columns_offset < columns)
         gate_value = tl.load(
-            gate + row * gate_row_stride + columns_offset, mask=mask, other=0.0
+            gate
+            + row * gate_row_stride
+            + columns_offset * gate_column_stride,
+            mask=mask,
+            other=0.0,
         ).to(tl.float32)
         up_value = tl.load(
-            up + row * up_row_stride + columns_offset, mask=mask, other=0.0
+            up + row * up_row_stride + columns_offset * up_column_stride,
+            mask=mask,
+            other=0.0,
         ).to(tl.float32)
         if limit > 0:
             gate_value = tl.minimum(gate_value, limit)
@@ -54,7 +63,9 @@ if triton is not None:
         silu = gate_value * tl.sigmoid(gate_value)
         weight = tl.load(weights + row).to(tl.float32)
         tl.store(
-            output + row * output_row_stride + columns_offset,
+            output
+            + row * output_row_stride
+            + columns_offset * output_column_stride,
             silu * up_value * weight,
             mask=mask,
         )
@@ -71,10 +82,15 @@ if triton is not None:
         rows: tl.constexpr,
         columns: tl.constexpr,
         grad_output_row_stride: tl.constexpr,
+        grad_output_column_stride: tl.constexpr,
         gate_row_stride: tl.constexpr,
+        gate_column_stride: tl.constexpr,
         up_row_stride: tl.constexpr,
+        up_column_stride: tl.constexpr,
         grad_gate_row_stride: tl.constexpr,
+        grad_gate_column_stride: tl.constexpr,
         grad_up_row_stride: tl.constexpr,
+        grad_up_column_stride: tl.constexpr,
         limit: tl.constexpr,
         block: tl.constexpr,
     ):
@@ -82,15 +98,23 @@ if triton is not None:
         columns_offset = tl.program_id(1) * block + tl.arange(0, block)
         mask = (row < rows) & (columns_offset < columns)
         grad = tl.load(
-            grad_output + row * grad_output_row_stride + columns_offset,
+            grad_output
+            + row * grad_output_row_stride
+            + columns_offset * grad_output_column_stride,
             mask=mask,
             other=0.0,
         ).to(tl.float32)
         raw_gate = tl.load(
-            gate + row * gate_row_stride + columns_offset, mask=mask, other=0.0
+            gate
+            + row * gate_row_stride
+            + columns_offset * gate_column_stride,
+            mask=mask,
+            other=0.0,
         ).to(tl.float32)
         raw_up = tl.load(
-            up + row * up_row_stride + columns_offset, mask=mask, other=0.0
+            up + row * up_row_stride + columns_offset * up_column_stride,
+            mask=mask,
+            other=0.0,
         ).to(tl.float32)
         gate_value = raw_gate
         up_value = raw_up
@@ -106,12 +130,16 @@ if triton is not None:
         silu_grad = sigmoid * (1.0 + gate_value * (1.0 - sigmoid))
         weight = tl.load(weights + row).to(tl.float32)
         tl.store(
-            grad_gate + row * grad_gate_row_stride + columns_offset,
+            grad_gate
+            + row * grad_gate_row_stride
+            + columns_offset * grad_gate_column_stride,
             grad * weight * up_value * silu_grad * gate_mask,
             mask=mask,
         )
         tl.store(
-            grad_up + row * grad_up_row_stride + columns_offset,
+            grad_up
+            + row * grad_up_row_stride
+            + columns_offset * grad_up_column_stride,
             grad * weight * silu * up_mask,
             mask=mask,
         )
@@ -134,8 +162,11 @@ if triton is not None:
             rows=gate.shape[0],
             columns=gate.shape[1],
             gate_row_stride=gate.stride(0),
+            gate_column_stride=gate.stride(1),
             up_row_stride=up.stride(0),
+            up_column_stride=up.stride(1),
             output_row_stride=output.stride(0),
+            output_column_stride=output.stride(1),
             limit=limit,
             block=block,
             num_warps=8,
@@ -165,10 +196,15 @@ if triton is not None:
             rows=gate.shape[0],
             columns=gate.shape[1],
             grad_output_row_stride=grad_output.stride(0),
+            grad_output_column_stride=grad_output.stride(1),
             gate_row_stride=gate.stride(0),
+            gate_column_stride=gate.stride(1),
             up_row_stride=up.stride(0),
+            up_column_stride=up.stride(1),
             grad_gate_row_stride=grad_gate.stride(0),
+            grad_gate_column_stride=grad_gate.stride(1),
             grad_up_row_stride=grad_up.stride(0),
+            grad_up_column_stride=grad_up.stride(1),
             limit=limit,
             block=block,
             num_warps=8,
