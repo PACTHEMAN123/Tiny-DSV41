@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +12,9 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch import nn
-from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+from torch.distributed.checkpoint.state_dict import (
+    get_state_dict, set_state_dict, get_model_state_dict, set_model_state_dict,
+)
 from torch.distributed.checkpoint.stateful import Stateful
 
 
@@ -24,31 +28,65 @@ class TrainingState(Stateful):
         *,
         model_config: dict[str, Any],
         data_generator: torch.Generator,
+        training_config: dict[str, Any] | None = None,
+        state_adapter=None,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
         self.model_config = model_config
         self.data_generator = data_generator
+        self.training_config = training_config
+        self.state_adapter = state_adapter
+        self._optimizer_schema = None
         self.step = 0
 
+    def checkpoint_configuration(self):
+        optimizer = self.optimizer
+        name = ("sgd" if isinstance(optimizer, torch.optim.SGD) else
+                "adamw" if isinstance(optimizer, torch.optim.AdamW) else
+                type(optimizer).__module__ + "." + type(optimizer).__qualname__)
+        return {"model": self.model_config, "training": self.training_config, "optimizer": name}
+
     def state_dict(self) -> dict[str, Any]:
-        model_state, optimizer_state = get_state_dict(self.model, self.optimizer)
+        if self.state_adapter is not None:
+            model_state = get_model_state_dict(self.model)
+            optimizer_state = self.state_adapter.optimizer_state(self.optimizer, self._optimizer_schema)
+            optimizer_schema = self.state_adapter.optimizer_schema(optimizer_state)
+            model_state, optimizer_state = self.state_adapter.encode(model_state, optimizer_state)
+        else:
+            model_state, optimizer_state = get_state_dict(self.model, self.optimizer)
         rank, world_size = self._distributed_position()
-        return {
+        state = {
             "model": model_state,
             "optimizer": optimizer_state,
-            "model_config": self.model_config,
+            "model_config": deepcopy(self.model_config),
             "data_generator": {
                 "world_size": world_size,
                 f"rank-{rank}": self.data_generator.get_state(),
             },
             "step": self.step,
         }
+        if self.state_adapter is not None:
+            state["layout"] = self.state_adapter.signature()
+            state["optimizer_schema"] = optimizer_schema
+            state["configuration"] = json.dumps(self.checkpoint_configuration(), sort_keys=True)
+        if self.training_config is not None:
+            state["training_config"] = deepcopy(self.training_config)
+        if self.training_config is not None or self.state_adapter is not None:
+            cuda_device = next((p.device for p in self.model.parameters() if p.is_cuda), None)
+            state["rng"] = {f"rank-{rank}": {
+                "cpu": torch.get_rng_state(),
+                "cuda": (torch.cuda.get_rng_state(cuda_device) if cuda_device is not None
+                         else torch.empty(0, dtype=torch.uint8)),
+            }}
+        return state
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         checkpoint_config = state_dict["model_config"]
         if checkpoint_config != self.model_config:
             raise ValueError("checkpoint model config does not match the current model")
+        if state_dict.get("training_config") != self.training_config:
+            raise ValueError("checkpoint training config does not match the current model")
 
         rank, world_size = self._distributed_position()
         generator_state = state_dict["data_generator"]
@@ -57,13 +95,23 @@ class TrainingState(Stateful):
                 "cannot restore the data generator after changing world size"
             )
 
-        set_state_dict(
-            self.model,
-            self.optimizer,
-            model_state_dict=state_dict["model"],
-            optim_state_dict=state_dict["optimizer"],
-        )
+        model_state, optimizer_state = state_dict["model"], state_dict["optimizer"]
+        if self.state_adapter is not None:
+            self.state_adapter.validate(state_dict.get("layout"))
+            model_state, optimizer_state = self.state_adapter.decode(model_state, optimizer_state)
+            set_model_state_dict(self.model, model_state)
+            self.optimizer.load_state_dict(optimizer_state)
+        else:
+            set_state_dict(self.model, self.optimizer,
+                           model_state_dict=model_state, optim_state_dict=optimizer_state)
         self.data_generator.set_state(generator_state[f"rank-{rank}"])
+        rng = state_dict.get("rng", {}).get(f"rank-{rank}")
+        if rng is not None:
+            torch.set_rng_state(rng["cpu"].cpu())
+            if rng["cuda"].numel():
+                cuda_device = next((p.device for p in self.model.parameters() if p.is_cuda), None)
+                if cuda_device is not None:
+                    torch.cuda.set_rng_state(rng["cuda"].cpu(), cuda_device)
         self.step = int(state_dict["step"])
 
     @staticmethod
@@ -89,7 +137,12 @@ class CheckpointManager:
 
         self.state.step = step
         checkpoint_path = self._path_for_step(step)
-        dcp.save({"train": self.state}, checkpoint_id=str(checkpoint_path))
+        options = {}
+        if getattr(self.state, "state_adapter", None) is not None:
+            from .sharded_state import ShardSavePlanner
+            options["planner"] = ShardSavePlanner()
+            self.state.model.synchronize_engram()
+        dcp.save({"train": self.state}, checkpoint_id=str(checkpoint_path), **options)
         return checkpoint_path
 
     @torch.no_grad()
@@ -106,7 +159,29 @@ class CheckpointManager:
                 f"checkpoint is incomplete or missing: {checkpoint_path}"
             )
 
-        dcp.load({"train": self.state}, checkpoint_id=str(checkpoint_path))
+        options = {}
+        if getattr(self.state, "state_adapter", None) is not None:
+            from .sharded_state import ShardLoadPlanner
+            metadata = dcp.FileSystemReader(str(checkpoint_path)).read_metadata()
+            if "train.layout.version" not in metadata.state_dict_metadata:
+                raise ValueError("checkpoint lacks global parameter layout metadata; unsafe legacy shards cannot be restored")
+            rank = f"rank-{self.state.state_adapter.rank}"
+            if f"train.optimizer_schema.{rank}" not in metadata.state_dict_metadata:
+                raise ValueError("checkpoint lacks optimizer state schema; unsafe legacy state cannot be restored")
+            if "train.configuration" not in metadata.state_dict_metadata:
+                raise ValueError("checkpoint lacks configuration metadata; unsafe legacy state cannot be restored")
+            preflight = {"train": {"layout": self.state.state_adapter.signature(),
+                                    "optimizer_schema": {rank: ""}, "configuration": ""}}
+            dcp.load(preflight, checkpoint_id=str(checkpoint_path))
+            self.state.state_adapter.validate(preflight["train"]["layout"])
+            if preflight["train"]["configuration"] != json.dumps(self.state.checkpoint_configuration(), sort_keys=True):
+                raise ValueError("checkpoint model/training/optimizer configuration is incompatible")
+            self.state._optimizer_schema = json.loads(preflight["train"]["optimizer_schema"][rank])
+            options["planner"] = ShardLoadPlanner()
+        try:
+            dcp.load({"train": self.state}, checkpoint_id=str(checkpoint_path), **options)
+        finally:
+            self.state._optimizer_schema = None
         return self.state.step
 
     def latest_step(self) -> int | None:
