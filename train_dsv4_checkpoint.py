@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 
 from dsv41_train.models.dsv4 import load_dsv41_backbone_window
-from dsv41_train.models.dsv4.context import pack_sequences
+from dsv41_train.cp import pack_sequences
 from dsv41_train.models.dsv4.parallel import (
     apply_fsdp2_layer,
     apply_fsdp2_root,

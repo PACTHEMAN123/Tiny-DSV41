@@ -8,7 +8,8 @@ import torch.distributed as dist
 from torch import nn
 
 from ...dispatch import AllToAllTokenDispatcher, TokenDispatcher
-from ...parallel import ContextParallel, ParallelMeshes
+from ...cp import ContextParallel
+from ...parallel import ParallelMeshes
 from ...runtime import local_tensor
 from .model import (
     AttentionSinks,

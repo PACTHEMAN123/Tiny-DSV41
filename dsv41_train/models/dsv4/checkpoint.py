@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 
 from ...dispatch import TokenDispatcher
-from ...parallel import ContextParallel
+from ...cp import ContextParallel
 from .config import DeepSeekV41Config
 from .model import (
     DecoderLayer,
