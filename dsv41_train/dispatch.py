@@ -22,6 +22,27 @@ class DispatchMetadata:
     recv_splits: list[int] | None = None
 
 
+class _DispatchExchange(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hidden, weights, output_splits, input_splits, group):
+        ctx.output_splits, ctx.input_splits, ctx.group = output_splits, input_splits, group
+        outputs = []
+        for tensor in (hidden, weights):
+            output = tensor.new_empty((sum(output_splits), *tensor.shape[1:]))
+            dist.all_to_all_single(output, tensor.contiguous(), output_split_sizes=output_splits,
+                                   input_split_sizes=input_splits, group=group)
+            outputs.append(output)
+        return tuple(outputs)
+
+    @staticmethod
+    def backward(ctx, hidden_grad, weights_grad):
+        # Keep both exchanges in the same autograd node, including empty routes.
+        # Independent nodes can be scheduled in different orders on EP ranks.
+        hidden, weights = _DispatchExchange.apply(hidden_grad, weights_grad,
+            ctx.input_splits, ctx.output_splits, ctx.group)
+        return hidden, weights, None, None, None
+
+
 class TokenDispatcher:
     """Keep token routing local when expert parallelism is disabled."""
 
@@ -90,13 +111,8 @@ class AllToAllTokenDispatcher(TokenDispatcher):
 
         tokens = hidden[:, None, :].expand(-1, topk, -1).reshape(-1, hidden.shape[-1])[order]
         routed_ids = self._exchange(flat_ids[order].contiguous(), recv_splits, send_splits)
-        routed_hidden = self._exchange(tokens.contiguous(), recv_splits, send_splits, autograd=True)
-        routed_weights = self._exchange(
-            weights.reshape(-1)[order].contiguous(),
-            recv_splits,
-            send_splits,
-            autograd=True,
-        )
+        routed_hidden, routed_weights = _DispatchExchange.apply(
+            tokens, weights.reshape(-1)[order], recv_splits, send_splits, self.group)
         metadata = DispatchMetadata(
             token_count=hidden.shape[0],
             topk=topk,
