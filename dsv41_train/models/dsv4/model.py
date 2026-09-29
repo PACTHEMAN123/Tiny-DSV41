@@ -21,14 +21,20 @@ import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from .config import DeepSeekV41Config
+from .context import ModelContext
 from .moe import RoutedExperts, SparseMoE, TopKRouter
 from ...dispatch import TokenDispatcher
 from ...parallel import ContextParallel
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
+
+
+def _direct(function, *args, **_kwargs):
+    return function(*args)
 
 
 class RMSNorm(nn.Module):
@@ -269,13 +275,21 @@ class Compressor(nn.Module):
         self.norm = RMSNorm(config.head_dim, config.rms_norm_eps)
 
     def forward(
-        self, x: torch.Tensor, positions: torch.Tensor, token_mask: torch.Tensor
-    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        token_mask: torch.Tensor,
+        sequence_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch, length, _ = x.shape
         live = token_mask.bool()
-        counts = live.long().sum(-1)
-        group_counts = counts // self.ratio
-        query_lengths = live.long().cumsum(-1)
+        end_indices = torch.arange(length, device=x.device) + self.ratio - 1
+        safe_ends = end_indices.clamp_max(length - 1).expand(batch, -1)
+        complete = live & positions.remainder(self.ratio).eq(0) & end_indices.lt(length)
+        complete &= live.gather(1, safe_ends) & sequence_ids.eq(
+            sequence_ids.gather(1, safe_ends)
+        )
+        group_counts = complete.long().sum(-1)
 
         if self.gate_proj is None:
             kv = self.kv_proj(x)
@@ -283,15 +297,21 @@ class Compressor(nn.Module):
         else:
             kv = F.linear(x.float(), self.kv_proj.weight.float())
             gate = F.linear(x.float(), self.gate_proj.weight.float())
-        destinations = torch.where(live, live.long().cumsum(-1) - 1, length)
+        destinations = torch.where(complete, complete.long().cumsum(-1) - 1, length)
         order = positions.new_zeros(batch, length + 1)
         order.scatter_(1, destinations, torch.arange(length, device=x.device).expand(batch, -1))
 
         max_groups = length // self.ratio
-        indices = order[:, : max_groups * self.ratio]
-        group_positions = positions.gather(1, indices[:, :: self.ratio])
+        starts = order[:, :max_groups]
+        indices = starts.unsqueeze(-1) + torch.arange(self.ratio, device=x.device)
+        indices = indices.flatten(1)
+        group_positions = positions.gather(1, starts)
+        group_sequence_ids = sequence_ids.gather(1, starts)
+        valid = torch.arange(max_groups, device=x.device) < group_counts.unsqueeze(-1)
+        group_positions = group_positions.masked_fill(~valid, 0)
+        group_sequence_ids = group_sequence_ids.masked_fill(~valid, -1)
         if max_groups == 0:
-            return None, group_positions, query_lengths
+            return None, group_positions, group_sequence_ids, valid
 
         gathered = kv.gather(1, indices.unsqueeze(-1).expand(-1, -1, kv.shape[-1]))
         if gate is None:
@@ -301,9 +321,35 @@ class Compressor(nn.Module):
             gathered = gathered.view(batch, max_groups, self.ratio, -1).float()
             gathered_gate = gathered_gate.view(batch, max_groups, self.ratio, -1)
             latent = (gathered * gathered_gate.softmax(dim=2)).sum(dim=2)
-        valid = torch.arange(max_groups, device=x.device) < group_counts.unsqueeze(-1)
         latent = latent.masked_fill(~valid.unsqueeze(-1), 0)
-        return self.norm(latent.to(x.dtype)), group_positions, query_lengths
+        return self.norm(latent.to(x.dtype)), group_positions, group_sequence_ids, valid
+
+
+@dataclass
+class ShadowIndexers:
+    """CSA tensors shared by indexer and attention modules across layers."""
+
+    compressed_sequence_ids: torch.Tensor | None = None
+    compressed_kv: torch.Tensor | None = None
+    index_keys: torch.Tensor | None = None
+    topk_indices: torch.Tensor | None = None
+    candidates: torch.Tensor | None = None
+
+    @classmethod
+    def load(cls, tensors: tuple[torch.Tensor, ...]) -> "ShadowIndexers":
+        return cls(*(None if tensor.numel() == 0 else tensor for tensor in tensors))
+
+    def dump(self, empty: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            value if value is not None else empty
+            for value in (
+                self.compressed_sequence_ids,
+                self.compressed_kv,
+                self.index_keys,
+                self.topk_indices,
+                self.candidates,
+            )
+        )
 
 
 def select_candidate_blocks(
@@ -314,7 +360,7 @@ def select_candidate_blocks(
     block_scores = block_scores.unflatten(-1, (-1, block_size)).amax(-1)
     last = (visible - 1) // block_size
     block_ids = torch.arange(block_scores.shape[-1], device=scores.device)
-    block_scores = block_scores.masked_fill(block_ids == last, torch.inf)
+    block_scores = block_scores.masked_fill(block_ids == last.unsqueeze(-1), torch.inf)
     picked = block_scores.topk(min(topk_blocks, block_scores.shape[-1]), dim=-1)
     keep = torch.zeros_like(block_scores, dtype=torch.bool)
     keep.scatter_(-1, picked.indices, picked.values > float("-inf"))
@@ -332,6 +378,7 @@ class SparseIndexer(nn.Module):
         self.topk = config.index_topk
         self.topk_blocks = config.candidate_topk_blocks
         self.block_size = config.candidate_block_size
+        self.ratio = config.compress_ratios[layer_id]
         self.rotary = rotary
         self.q_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
         self.weight_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
@@ -345,46 +392,74 @@ class SparseIndexer(nn.Module):
         q_residual: torch.Tensor,
         latent: torch.Tensor | None,
         group_positions: torch.Tensor,
-        positions: torch.Tensor,
-        shared: dict[str, torch.Tensor | None],
+        context: ModelContext,
+        shadow: ShadowIndexers,
     ) -> None:
         batch, length, _ = x.shape
         if self.owns_keys:
-            shared["index_keys"] = None
+            shadow.index_keys = None
             if latent is not None:
                 keys = self.k_norm(self.k_proj(latent))
                 cos, sin = self.rotary(keys, group_positions, compressed=True)
-                shared["index_keys"] = apply_rope(keys, cos, sin).unsqueeze(1)
+                shadow.index_keys = apply_rope(keys, cos, sin).unsqueeze(1)
 
-        index_keys = shared.get("index_keys")
+        index_keys = shadow.index_keys
         if index_keys is None:
-            shared["topk_indices"] = None
+            shadow.topk_indices = None
             if self.is_candidate_source:
-                shared["candidates"] = None
+                shadow.candidates = None
             return
 
-        keys = index_keys[:, 0].float()
-        query = self.q_proj(q_residual).view(batch, length, self.num_heads, self.head_dim)
-        cos, sin = self.rotary(query, positions, compressed=True)
-        query = apply_rope(query, cos, sin).float()
-        head_weights = self.weight_proj(x).float() * self.num_heads**-0.5
-        scores = torch.einsum("bshd,btd->bsht", query, keys).relu_() * self.head_dim**-0.5
-        scores = (scores * head_weights.unsqueeze(-1)).sum(2)
+        keys = index_keys[:, 0]
+        key_sequence_ids = shadow.compressed_sequence_ids
+        assert key_sequence_ids is not None
+        sentinel = torch.iinfo(key_sequence_ids.dtype).max
+        searchable_ids = key_sequence_ids.masked_fill(key_sequence_ids < 0, sentinel).contiguous()
+        query_ids = context.sequence_ids.contiguous()
+        key_starts = torch.searchsorted(searchable_ids, query_ids, right=False)
+        sequence_ends = torch.searchsorted(searchable_ids, query_ids, right=True)
+        visible_counts = (context.positions + 1) // self.ratio
+        key_ends = torch.minimum(sequence_ends, key_starts + visible_counts)
+        valid_queries = (context.sequence_ids >= 0) & (key_starts < key_ends)
+        key_ends = torch.where(valid_queries, key_ends, key_starts)
 
-        visible = shared["compress_lengths"].unsqueeze(-1)
-        key_ids = torch.arange(keys.shape[1], device=x.device)
-        scores = scores.masked_fill(key_ids >= visible, float("-inf"))
-        previous_candidates = shared.get("candidates") if self.uses_candidates else None
+        query = self.q_proj(q_residual).view(batch, length, self.num_heads, self.head_dim)
+        cos, sin = self.rotary(query, context.positions, compressed=True)
+        query = apply_rope(query, cos, sin)
+        head_weights = self.weight_proj(x).float() * self.num_heads**-0.5
+        sequence_widths = sequence_ends - key_starts
+        max_sequence_width = int(sequence_widths.max().item())
+        offsets = torch.arange(max_sequence_width, device=x.device)
+        global_indices = key_starts.unsqueeze(-1) + offsets
+        valid_keys = global_indices < sequence_ends.unsqueeze(-1)
+        safe_indices = global_indices.clamp_max(keys.shape[1] - 1)
+        rows = torch.arange(batch, device=x.device).view(batch, 1, 1)
+        local_keys = keys[rows, safe_indices]
+        scores = torch.einsum(
+            "bshd,bstd->bsht", query.float(), local_keys.float()
+        ).relu_()
+        scores.mul_(self.head_dim**-0.5)
+        scores = (scores * head_weights.unsqueeze(-1)).sum(2)
+        visible = valid_keys & (global_indices < key_ends.unsqueeze(-1))
+        scores = scores.masked_fill(~visible, float("-inf"))
+
+        previous_candidates = shadow.candidates if self.uses_candidates else None
         if self.is_candidate_source:
-            shared["candidates"] = select_candidate_blocks(
-                scores, visible, self.topk_blocks, self.block_size
+            shadow.candidates = select_candidate_blocks(
+                scores,
+                key_ends - key_starts,
+                self.topk_blocks,
+                self.block_size,
             )
         elif previous_candidates is not None:
             scores = scores.masked_fill(~previous_candidates, float("-inf"))
 
-        picked = scores.topk(min(self.topk, keys.shape[1]), dim=-1, sorted=False)
-        shared["topk_indices"] = torch.where(
-            picked.values > float("-inf"), picked.indices, torch.full_like(picked.indices, -1)
+        picked = scores.topk(min(self.topk, scores.shape[-1]), dim=-1, sorted=False)
+        picked_indices = key_starts.unsqueeze(-1) + picked.indices
+        shadow.topk_indices = torch.where(
+            picked.values > float("-inf"),
+            picked_indices,
+            torch.full_like(picked_indices, -1),
         )
 
 
@@ -394,7 +469,6 @@ class CompressedAttention(nn.Module):
         config: DeepSeekV41Config,
         layer_id: int,
         rotary: RotaryEmbedding,
-        context_parallel: ContextParallel,
     ) -> None:
         super().__init__()
         self.config = config
@@ -404,7 +478,6 @@ class CompressedAttention(nn.Module):
         self.head_dim = config.head_dim
         self.dropout = config.attention_dropout
         self.rotary = rotary
-        self.context_parallel = context_parallel
         self.q_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = RMSNorm(config.q_lora_rank, config.rms_norm_eps)
         self.q_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
@@ -422,53 +495,70 @@ class CompressedAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        positions: torch.Tensor,
-        attention_mask: torch.Tensor,
-        token_mask: torch.Tensor,
-        shared: dict[str, torch.Tensor | None],
+        context: ModelContext,
+        shadow: ShadowIndexers,
     ) -> torch.Tensor:
         batch, length, _ = x.shape
         compressed = self.ratio > 0
-        cos, sin = self.rotary(x, positions, compressed=compressed)
+        cos, sin = self.rotary(x, context.positions, compressed=compressed)
         q_residual = self.q_norm(self.q_a(x))
         query = self.q_b(q_residual).view(batch, length, self.num_heads, self.head_dim)
         query = apply_rope(query, cos, sin).transpose(1, 2)
         kv = apply_rope(self.kv_norm(self.kv_proj(x)), cos, sin).unsqueeze(1)
-        kv = self.context_parallel.gather(kv, dim=2)
+        kv = context.gather(kv, dim=2)
+        rows = torch.arange(batch, device=x.device).view(batch, 1, 1)
+        attention_kv = kv[:, 0][rows, context.attention_indices]
 
         selected = selected_valid = None
         if compressed:
             latent = None
-            group_positions = positions[:, :0]
+            group_positions = context.positions[:, :0]
             if self.compressor is not None:
-                full_x = self.context_parallel.gather(x)
-                full_positions = self.context_parallel.gather(positions)
-                full_token_mask = self.context_parallel.gather(token_mask)
-                latent, group_positions, query_lengths = self.compressor(
-                    full_x, full_positions, full_token_mask
+                full_x = context.gather(x)
+                latent, group_positions, group_sequence_ids, _ = self.compressor(
+                    full_x,
+                    context.gather(context.positions),
+                    context.gather(context.token_mask),
+                    context.gather(context.sequence_ids),
                 )
-                shared["compress_lengths"] = self.context_parallel.shard(query_lengths) // self.ratio
-                shared["compressed_kv"] = None
-                shared["index_keys"] = None
-                shared["topk_indices"] = None
-                shared["candidates"] = None
+                shadow.compressed_sequence_ids = group_sequence_ids
+                shadow.compressed_kv = None
+                shadow.index_keys = None
+                shadow.topk_indices = None
+                shadow.candidates = None
 
             if self.indexer is not None:
-                self.indexer(x, q_residual, latent, group_positions, positions, shared)
+                # The discrete top-k path has no differentiable objective for
+                # indexer parameters. Match the production CSA implementation
+                # and avoid retaining a graph that cannot affect the loss.
+                with torch.no_grad():
+                    self.indexer(
+                        x,
+                        q_residual,
+                        latent,
+                        group_positions,
+                        context,
+                        shadow,
+                    )
 
             if latent is not None:
                 latent_cos, latent_sin = self.rotary(latent, group_positions, compressed=True)
-                shared["compressed_kv"] = apply_rope(latent, latent_cos, latent_sin).unsqueeze(1)
+                shadow.compressed_kv = apply_rope(latent, latent_cos, latent_sin).unsqueeze(1)
 
-            compressed_kv = shared.get("compressed_kv")
-            topk_indices = shared.get("topk_indices")
+            compressed_kv = shadow.compressed_kv
+            topk_indices = shadow.topk_indices
             if compressed_kv is not None and topk_indices is not None and topk_indices.shape[-1]:
                 entries = compressed_kv[:, 0]
                 selected_valid = topk_indices >= 0
-                rows = torch.arange(batch, device=x.device).view(batch, 1, 1)
                 selected = entries[rows, topk_indices.clamp_min(0)]
 
-        output = self._attend(query, kv, attention_mask, selected, selected_valid)
+        output = self._attend(
+            query,
+            attention_kv,
+            context.attention_mask,
+            selected,
+            selected_valid,
+        )
         output = apply_rope(output, cos, sin, inverse=True)
         grouped = output.reshape(batch, length, self.config.o_groups, -1)
         return self.o_b(self.o_a(grouped).flatten(2))
@@ -481,8 +571,8 @@ class CompressedAttention(nn.Module):
         selected: torch.Tensor | None,
         selected_valid: torch.Tensor | None,
     ) -> torch.Tensor:
-        logits = torch.matmul(query, kv.transpose(2, 3)) * self.head_dim**-0.5
-        logits = logits + mask
+        logits = torch.einsum("bhld,blwd->bhlw", query, kv) * self.head_dim**-0.5
+        logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
         window = logits.shape[-1]
         if selected is not None:
             picked = torch.einsum("bhsd,bskd->bhsk", query, selected.to(query.dtype))
@@ -497,7 +587,9 @@ class CompressedAttention(nn.Module):
         combined = combined - combined.max(dim=-1, keepdim=True).values
         probabilities = torch.softmax(combined, dim=-1, dtype=combined.dtype)[..., :-1]
         probabilities = F.dropout(probabilities, self.dropout, self.training).to(kv.dtype)
-        output = torch.matmul(probabilities[..., :window], kv)
+        output = torch.einsum(
+            "bhlw,blwd->bhld", probabilities[..., :window], kv
+        )
         if selected is not None:
             output = output + torch.einsum(
                 "bhsk,bskd->bhsd", probabilities[..., window:], selected.to(probabilities.dtype)
@@ -635,16 +727,28 @@ class NgramHash(nn.Module):
         self.register_buffer("offsets", offsets, persistent=False)
         self.register_buffer("multipliers", multipliers, persistent=False)
 
-    def forward(self, input_ids: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        token_mask: torch.Tensor,
+        sequence_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if sequence_ids is None:
+            sequence_ids = torch.zeros_like(input_ids)
         tokens = self.token_map[input_ids]
         dead = -1
         tokens = tokens.masked_fill(~token_mask, dead)
+        sequence_ids = sequence_ids.masked_fill(~token_mask, dead)
         context = self.max_ngram - 1
         history = F.pad(tokens, (context, 0), value=dead)
+        sequence_history = F.pad(sequence_ids, (context, 0), value=dead)
         shifted, blocked = [], torch.zeros_like(tokens, dtype=torch.bool)
         for distance in range(self.max_ngram):
             source = history[:, context - distance : context - distance + tokens.shape[1]]
-            blocked |= source == dead
+            source_sequence_ids = sequence_history[
+                :, context - distance : context - distance + tokens.shape[1]
+            ]
+            blocked |= (source == dead) | (source_sequence_ids != sequence_ids)
             shifted.append(torch.where(blocked, self.pad_id, source))
         windows = torch.stack(shifted, dim=-1)
 
@@ -692,12 +796,11 @@ class DecoderLayer(nn.Module):
         config: DeepSeekV41Config,
         layer_id: int,
         rotary: RotaryEmbedding,
-        context_parallel: ContextParallel,
         token_dispatcher: TokenDispatcher,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
-        self.attention = CompressedAttention(config, layer_id, rotary, context_parallel)
+        self.attention = CompressedAttention(config, layer_id, rotary)
         self.moe = SparseMoE(config, token_dispatcher)
         self.input_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -723,20 +826,20 @@ class DecoderLayer(nn.Module):
         self,
         streams: torch.Tensor,
         pre_mix: torch.Tensor,
-        positions: torch.Tensor,
-        attention_mask: torch.Tensor,
-        token_mask: torch.Tensor,
-        shared: dict[str, torch.Tensor | None],
+        context: ModelContext,
+        shadow: ShadowIndexers,
         engram_rows: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.engram is not None:
-            streams = self.engram(streams, engram_rows, token_mask)
+            streams = self.engram(streams, engram_rows, context.token_mask)
 
         residual = streams
         next_pre, post, combine = self.attention_hc(streams)
         collapsed = self.collapse(streams, pre_mix)
         value = self.attention(
-            self.input_norm(collapsed), positions, attention_mask, token_mask, shared
+            self.input_norm(collapsed),
+            context,
+            shadow,
         )
         streams = self.expand(value, residual, post, combine)
 
@@ -777,7 +880,6 @@ class DeepSeekV41Model(nn.Module):
                 config,
                 layer_id,
                 self.rotary,
-                self.context_parallel,
                 token_dispatcher,
             )
             for layer_id in self.layer_ids
@@ -801,31 +903,41 @@ class DeepSeekV41Model(nn.Module):
                 for layer_id in self.engram_layer_ids
             }
         )
+        self.gradient_checkpointing = False
 
     def forward(
-        self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        sequence_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, sequence]")
-        batch, global_length = input_ids.shape
+        _, global_length = input_ids.shape
         if global_length > self.config.max_position_embeddings:
             raise ValueError("sequence is longer than max_position_embeddings")
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
         else:
             attention_mask = attention_mask.bool()
+        if sequence_ids is None:
+            sequence_ids = torch.zeros_like(input_ids)
+        elif sequence_ids.shape != input_ids.shape:
+            raise ValueError("sequence_ids must have the same shape as input_ids")
+        sequence_ids = sequence_ids.masked_fill(~attention_mask, -1)
 
-        global_positions = (attention_mask.long().cumsum(-1) - 1).clamp_min(0)
-        causal_mask = self._causal_mask(attention_mask, self.embedding.weight.dtype)
-        hashes = self.hash(input_ids, attention_mask) if self.hash is not None else None
+        context = ModelContext.build(
+            self.context_parallel,
+            input_ids,
+            attention_mask,
+            sequence_ids,
+            self.config.sliding_window,
+        )
+        hashes = self.hash(input_ids, attention_mask, sequence_ids) if self.hash else None
 
-        input_ids = self.context_parallel.shard(input_ids)
-        positions = self.context_parallel.shard(global_positions)
-        attention_mask = self.context_parallel.shard(attention_mask)
-        hidden = self.embedding(input_ids)
-        length = hidden.shape[1]
+        hidden = self.embedding(context.input_ids)
+        batch, length = context.input_ids.shape
         streams = hidden.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
-        causal_mask = causal_mask.to(hidden.dtype)
 
         engram_rows: dict[int, torch.Tensor] = {}
         if hashes is not None:
@@ -833,37 +945,44 @@ class DeepSeekV41Model(nn.Module):
             for index, layer_id in enumerate(self.engram_layer_ids):
                 engram_rows[layer_id] = self.engram_tables[str(layer_id)](hashes[:, :, index])
 
-        shared: dict[str, torch.Tensor | None] = {}
         pre_mix = hidden.new_zeros(batch, length, self.config.hc_mult, dtype=torch.float32)
         pre_mix[..., 0] = 1
+        empty = hidden.new_empty(0)
+        shadow = ShadowIndexers().dump(empty)
+        loader = checkpoint if self.gradient_checkpointing and self.training else _direct
         router_logits = []
         for layer in self.layers:
-            streams, pre_mix, logits = layer(
+            streams, pre_mix, logits, *shadow = loader(
+                lambda *args, current=layer: self._forward_layer(current, context, *args),
                 streams,
                 pre_mix,
-                positions,
-                causal_mask,
-                attention_mask,
-                shared,
-                engram_rows.get(layer.layer_id),
+                engram_rows.get(layer.layer_id, empty),
+                *shadow,
+                use_reentrant=False,
             )
             router_logits.append(logits)
 
         hidden = DecoderLayer.collapse(streams, pre_mix)
         return self.norm(hidden), tuple(router_logits)
 
-    def _causal_mask(self, token_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        length = token_mask.shape[1]
-        key_positions = torch.arange(length, device=token_mask.device)
-        query_positions = self.context_parallel.shard(key_positions, dim=0)
-        query_mask = self.context_parallel.shard(token_mask)
-        distance = query_positions[:, None] - key_positions[None, :]
-        allowed = (distance >= 0) & (distance < self.config.sliding_window)
-        allowed = allowed.view(1, 1, query_positions.numel(), length)
-        allowed = allowed & token_mask[:, None, None, :] & query_mask[:, None, :, None]
-        return torch.zeros((), dtype=dtype, device=token_mask.device).expand_as(allowed).masked_fill(
-            ~allowed, torch.finfo(dtype).min
+    def _forward_layer(
+        self,
+        layer: DecoderLayer,
+        context: ModelContext,
+        streams: torch.Tensor,
+        pre_mix: torch.Tensor,
+        engram_row: torch.Tensor,
+        *shadow_tensors: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        shadow = ShadowIndexers.load(shadow_tensors)
+        streams, pre_mix, logits = layer(
+            streams,
+            pre_mix,
+            context,
+            shadow,
+            None if engram_row.numel() == 0 else engram_row,
         )
+        return streams, pre_mix, logits, *shadow.dump(streams.new_empty(0))
 
 
 def load_balancing_loss(
@@ -961,24 +1080,32 @@ class DeepSeekV41ForCausalLM(nn.Module):
                 for parameter in module.down:
                     nn.init.normal_(parameter, std=std, generator=generator)
 
+    def gradient_checkpointing_enable(self) -> None:
+        self.model.gradient_checkpointing = True
+
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
+        sequence_ids: torch.Tensor | None = None,
     ) -> CausalLMOutput:
         token_mask = (
             torch.ones_like(input_ids, dtype=torch.bool)
             if attention_mask is None
             else attention_mask.bool()
         )
-        hidden, router_logits = self.model(input_ids, token_mask)
+        hidden, router_logits = self.model(input_ids, token_mask, sequence_ids)
         logits = self.lm_head(hidden)
         loss = None
         if labels is not None:
             targets = torch.full_like(labels, -100)
             targets[:, :-1] = labels[:, 1:]
             targets[:, :-1].masked_fill_(~token_mask[:, 1:], -100)
+            if sequence_ids is not None:
+                targets[:, :-1].masked_fill_(
+                    sequence_ids[:, :-1] != sequence_ids[:, 1:], -100
+                )
             targets = self.context_parallel.shard(targets)
             loss_sum = F.cross_entropy(
                 logits.float().reshape(-1, self.config.vocab_size),
@@ -989,15 +1116,21 @@ class DeepSeekV41ForCausalLM(nn.Module):
             loss = self.context_parallel.mean_loss(loss_sum, (targets != -100).sum())
 
         local_token_mask = self.context_parallel.shard(token_mask)
+        auxiliary_logits = tuple(logits.detach().requires_grad_() for logits in router_logits)
         aux_loss = load_balancing_loss(
-            router_logits,
+            auxiliary_logits,
             self.config.n_routed_experts,
             self.config.num_experts_per_tok,
             local_token_mask,
             self.context_parallel,
         )
         if loss is not None:
-            loss = loss + self.config.router_aux_loss_coef * aux_loss
+            coefficient = self.config.router_aux_loss_coef
+            if torch.is_grad_enabled() and coefficient:
+                gradients = torch.autograd.grad(aux_loss, auxiliary_logits)
+                for layer, gradient in zip(self.model.layers, gradients):
+                    layer.moe.stage_router_aux_gradient(gradient * coefficient)
+            loss = loss + coefficient * aux_loss.detach()
         return CausalLMOutput(loss, logits, aux_loss, router_logits)
 
 
