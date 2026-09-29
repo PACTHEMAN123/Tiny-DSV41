@@ -45,6 +45,10 @@ only difference is whether the selected loader is `checkpoint` or a direct call.
 Engram tables stay on GPU and retain row-wise all-to-all lookup; CPU offload is
 not part of this path. CP and EP must currently use the same group size.
 
+The routed MoE uses expert-major all-to-all, grouped GEMMs, and a Triton
+clamped-SwiGLU kernel. Its expert-FSDP topology and memory results are documented
+in [`moe.md`](moe.md).
+
 ## End-to-end command
 
 Run this on four 4-GPU nodes, setting `NODE_RANK` to `0`, `1`, `2`, or `3`:
@@ -59,7 +63,12 @@ python3 -m torch.distributed.run \
   --master-addr="$MASTER_ADDR" --master-port=29500 \
   train_dsv4_checkpoint.py \
   --model-path /mnt/fuse/deepseek-ai/DeepSeek-V4.1-Flash \
-  --start-layer 0 --num-layers 40 --cp-size 8 --ep-size 8 \
-  --steps 1 --batch-size 8 --seq-len 8192 --optimizer sgd \
-  --sequence-packing --gradient-checkpointing --optimizer-in-backward
+  --start-layer 0 --num-layers 40 --cp-size 16 --ep-size 16 \
+  --steps 1 --batch-size 16 --seq-len 8192 --optimizer sgd \
+  --sequence-packing --gradient-checkpointing --optimizer-in-backward \
+  --metrics-file /path/to/ep16-cp16-bs16.json
 ```
+
+This CP16/EP16 batch-16 configuration is the largest validated training run.
+The batch-32 limit experiment reaches 168.96 GiB peak allocated memory but
+produces a non-finite parameter update.

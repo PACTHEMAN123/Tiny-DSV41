@@ -62,3 +62,6 @@ Testing and distributed diagnostics are documented in
 
 Packed context-parallel training is documented in
 [`docs/context-parallel.md`](docs/context-parallel.md).
+
+DSV4 expert parallelism, expert FSDP, grouped GEMMs, Triton activation kernels,
+and four-node memory results are documented in [`docs/moe.md`](docs/moe.md).
