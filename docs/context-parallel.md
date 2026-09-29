@@ -19,6 +19,22 @@ next sample or produce a cross-sample training target.
 indices, and attention mask once per forward. It also owns CP gather operations,
 so attention modules do not retain process-group or CP topology state.
 
+Sliding-window attention does not reconstruct the full sequence. Each CP rank
+exchanges only the previous rank's `sliding_window - 1` KV tail and indexes its
+local queries from that halo plus its local KV shard. The backward pass sends
+the halo gradient back to its owning rank. If a local shard is shorter than one
+window, the implementation falls back to the full gather path.
+
+The sparse indexer requires CUDA and Triton. Its score kernel fuses QK, ReLU,
+per-head weighting, and head reduction, and writes only the reduced score
+matrix. There is no unfused PyTorch execution path that materializes the
+`[batch, query, head, key]` intermediate.
+
+Compressor source layers still gather their input sequence before compression.
+YATT instead exchanges only the boundary tokens required by the compression
+window, compresses locally, and all-gathers the compressed result. That
+compressor stage-1 optimization remains separate from the SWA halo path above.
+
 `ShadowIndexers` owns the compressed sequence IDs, compressed KV tensors,
 indexer keys, selected indices, and candidate blocks shared across CSA layers.
 At a checkpoint boundary it is explicitly flattened to tensors and reconstructed

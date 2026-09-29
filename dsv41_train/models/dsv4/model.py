@@ -24,10 +24,10 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from .config import DeepSeekV41Config
-from .context import ModelContext
+from ...cp import ContextParallel, ModelContext
 from .moe import RoutedExperts, SparseMoE, TopKRouter
+from .triton_indexer import fused_index_scores
 from ...dispatch import TokenDispatcher
-from ...parallel import ContextParallel
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -427,23 +427,16 @@ class SparseIndexer(nn.Module):
         cos, sin = self.rotary(query, context.positions, compressed=True)
         query = apply_rope(query, cos, sin)
         head_weights = self.weight_proj(x).float() * self.num_heads**-0.5
-        sequence_widths = sequence_ends - key_starts
-        max_sequence_width = int(sequence_widths.max().item())
-        offsets = torch.arange(max_sequence_width, device=x.device)
-        global_indices = key_starts.unsqueeze(-1) + offsets
-        valid_keys = global_indices < sequence_ends.unsqueeze(-1)
-        safe_indices = global_indices.clamp_max(keys.shape[1] - 1)
-        rows = torch.arange(batch, device=x.device).view(batch, 1, 1)
-        local_keys = keys[rows, safe_indices]
-        scores = torch.einsum(
-            "bshd,bstd->bsht", query.float(), local_keys.float()
-        ).relu_()
-        scores.mul_(self.head_dim**-0.5)
-        scores = (scores * head_weights.unsqueeze(-1)).sum(2)
-        visible = valid_keys & (global_indices < key_ends.unsqueeze(-1))
-        scores = scores.masked_fill(~visible, float("-inf"))
-
+        max_sequence_width = int((sequence_ends - key_starts).max().item())
         previous_candidates = shadow.candidates if self.uses_candidates else None
+        scores = fused_index_scores(
+            query,
+            keys,
+            head_weights,
+            key_starts,
+            key_ends,
+            max_sequence_width,
+        )
         if self.is_candidate_source:
             shadow.candidates = select_candidate_blocks(
                 scores,
@@ -452,8 +445,7 @@ class SparseIndexer(nn.Module):
                 self.block_size,
             )
         elif previous_candidates is not None:
-            scores = scores.masked_fill(~previous_candidates, float("-inf"))
-
+            scores.masked_fill_(~previous_candidates, float("-inf"))
         picked = scores.topk(min(self.topk, scores.shape[-1]), dim=-1, sorted=False)
         picked_indices = key_starts.unsqueeze(-1) + picked.indices
         shadow.topk_indices = torch.where(
@@ -505,7 +497,7 @@ class CompressedAttention(nn.Module):
         query = self.q_b(q_residual).view(batch, length, self.num_heads, self.head_dim)
         query = apply_rope(query, cos, sin).transpose(1, 2)
         kv = apply_rope(self.kv_norm(self.kv_proj(x)), cos, sin).unsqueeze(1)
-        kv = context.gather(kv, dim=2)
+        kv = context.gather_attention(kv, dim=2)
         rows = torch.arange(batch, device=x.device).view(batch, 1, 1)
         attention_kv = kv[:, 0][rows, context.attention_indices]
 

@@ -12,7 +12,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from ...dispatch import TokenDispatcher
-from ...parallel import ContextParallel
+from ...cp import ContextParallel
 from .config import Qwen3MoeConfig
 
 

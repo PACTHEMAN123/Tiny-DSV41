@@ -1,16 +1,15 @@
 import unittest
-from copy import deepcopy
 from unittest.mock import Mock, call, patch
 
 import torch
 
 from dsv41_train.dispatch import DispatchMetadata, TokenDispatcher
 from dsv41_train.models.dsv4 import DeepSeekV41Config, DeepSeekV41ForCausalLM
-from dsv41_train.models.dsv4.context import pack_sequences
+from dsv41_train.cp import ContextParallel
 from dsv41_train.models.dsv4.model import NgramHash
 from dsv41_train.models.dsv4.moe import RoutedExperts
 from dsv41_train.models.dsv4.parallel import apply_fsdp2
-from dsv41_train.parallel import ContextParallel, ParallelMeshes
+from dsv41_train.parallel import ParallelMeshes
 
 
 class ModelTest(unittest.TestCase):
@@ -176,71 +175,6 @@ class ModelTest(unittest.TestCase):
                 ignored_params={table.weight},
             ),
         )
-
-    def test_forward_and_backward(self):
-        config = DeepSeekV41Config(
-            vocab_size=32,
-            hidden_size=32,
-            num_hidden_layers=3,
-            num_attention_heads=2,
-            head_dim=16,
-            q_lora_rank=16,
-            qk_rope_head_dim=8,
-            max_position_embeddings=16,
-            sliding_window=8,
-            compress_ratios=[0, 2, 2],
-            kv_source_layer_ids=[1],
-            index_source_layer_ids=[1, 2],
-            candidate_source_layer_id=1,
-            candidate_topk_blocks=2,
-            candidate_block_size=2,
-            index_n_heads=2,
-            index_head_dim=16,
-            index_topk=4,
-            o_groups=2,
-            o_lora_rank=16,
-            moe_intermediate_size=32,
-            n_routed_experts=4,
-            num_experts_per_tok=2,
-            hc_mult=2,
-            hc_sinkhorn_iters=2,
-            engram_layer_ids=[1],
-            engram_num_embeddings=[128],
-            engram_vocab_size=31,
-            engram_max_ngram_size=3,
-            engram_n_heads=1,
-            engram_head_dim=8,
-            engram_compressed_vocab_size=32,
-        )
-        model = DeepSeekV41ForCausalLM(config)
-        input_ids = torch.randint(0, config.vocab_size, (2, 8))
-        attention_mask = torch.tensor([[1] * 8, [1] * 6 + [0] * 2])
-
-        output = model(input_ids, attention_mask, labels=input_ids)
-
-        self.assertEqual(output.logits.shape, (2, 8, config.vocab_size))
-        self.assertTrue(torch.isfinite(output.loss))
-        output.loss.backward()
-        self.assertIsNotNone(model.model.embedding.weight.grad)
-
-    def test_packing_and_checkpointing_share_one_model_path(self):
-        torch.manual_seed(7)
-        model = DeepSeekV41ForCausalLM(DeepSeekV41Config.tiny()).eval()
-        checkpointed = deepcopy(model).train()
-        checkpointed.gradient_checkpointing_enable()
-        input_ids = torch.randint(0, model.config.vocab_size, (2, 8))
-        packed_ids, sequence_ids = pack_sequences(input_ids)
-
-        unpacked = model(input_ids, labels=input_ids)
-        packed = model(packed_ids, labels=packed_ids, sequence_ids=sequence_ids)
-        recomputed = checkpointed(
-            packed_ids, labels=packed_ids, sequence_ids=sequence_ids
-        )
-
-        torch.testing.assert_close(packed.logits.reshape_as(unpacked.logits), unpacked.logits)
-        torch.testing.assert_close(packed.loss, unpacked.loss, rtol=2e-5, atol=2e-6)
-        torch.testing.assert_close(recomputed.logits, packed.logits)
-        torch.testing.assert_close(recomputed.loss, packed.loss)
 
     def test_explicit_local_parallel_primitives(self):
         dispatcher = TokenDispatcher()

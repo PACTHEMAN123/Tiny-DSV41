@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 
 from ...dispatch import TokenDispatcher
-from ...parallel import ContextParallel
+from ...cp import ContextParallel
 from .config import Qwen3MoeConfig
 from .model import Qwen3MoeExperts, Qwen3MoeForCausalLM
 
