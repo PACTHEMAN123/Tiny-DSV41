@@ -12,10 +12,12 @@ import torch
 import torch.distributed as dist
 
 from dsv41_train.models.dsv4 import load_dsv41_backbone_window
+from dsv41_train.models.dsv4.context import pack_sequences
 from dsv41_train.models.dsv4.parallel import (
     apply_fsdp2_layer,
     apply_fsdp2_root,
     build_parallelism,
+    synchronize_cp_gradients,
 )
 from dsv41_train.runtime import Runtime, distributed_mean, initialize_runtime, local_tensor
 
@@ -33,6 +35,34 @@ def maximum_parameter_delta(before: torch.Tensor, after: torch.Tensor) -> torch.
     return (after.float() - before.float()).abs().max()
 
 
+def install_sgd_in_backward(
+    model: torch.nn.Module, learning_rate: float, cp_size: int
+) -> set[int]:
+    expert_ids = {
+        id(parameter)
+        for layer in model.model.layers
+        for parameter in layer.moe.routed.parameters()
+    }
+    installed = set()
+    for parameter in model.parameters():
+        if not hasattr(parameter, "to_local"):
+            continue
+        installed.add(id(parameter))
+
+        scale = cp_size if id(parameter) in expert_ids else 1
+
+        def step(value: torch.nn.Parameter, divisor: int = scale) -> None:
+            if value.grad is not None:
+                with torch.no_grad():
+                    value.to_local().add_(
+                        value.grad.to_local(), alpha=-learning_rate / divisor
+                    )
+                value.grad = None
+
+        parameter.register_post_accumulate_grad_hook(step)
+    return installed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
@@ -47,6 +77,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ep-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--metrics-file")
+    parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--optimizer-in-backward", action="store_true")
+    parser.add_argument("--sequence-packing", action="store_true")
     return parser.parse_args()
 
 
@@ -69,10 +102,15 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
         raise ValueError("cp-size and ep-size must be positive")
     if world_size % args.cp_size or world_size % args.ep_size:
         raise ValueError("cp-size and ep-size must both divide world size")
-    if args.seq_len % args.cp_size:
-        raise ValueError("seq-len must divide evenly across cp-size")
+    if args.cp_size > 1 and args.cp_size != args.ep_size:
+        raise ValueError("DSV4 context parallelism requires cp-size == ep-size")
+    length = args.seq_len * args.batch_size if args.sequence_packing else args.seq_len
+    if length % args.cp_size:
+        raise ValueError("sequence length after packing must divide evenly across cp-size")
     if 384 % args.ep_size:
         raise ValueError("the checkpoint's 384 experts must divide evenly across ep-size")
+    if args.optimizer_in_backward and args.optimizer != "sgd":
+        raise ValueError("optimizer-in-backward requires SGD")
 
 
 def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int | str]:
@@ -97,6 +135,8 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         sparse_engram_gradients=args.optimizer == "sgd",
         layer_loaded=lambda layer: apply_fsdp2_layer(layer, meshes),
     )
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
     model.train()
     loaded_at = time.perf_counter()
 
@@ -125,15 +165,21 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
     sharded_at = time.perf_counter()
     tracked = model.model.layers[0].attention_hc.fn
     before = local_tensor(tracked).detach().float().clone()
+    stepped = (
+        install_sgd_in_backward(model, args.learning_rate, args.cp_size)
+        if args.optimizer_in_backward
+        else set()
+    )
+    optimizer_parameters = [parameter for parameter in model.parameters() if id(parameter) not in stepped]
     if args.optimizer == "adamw":
         optimizer: torch.optim.Optimizer = torch.optim.AdamW(
-            model.parameters(), lr=args.learning_rate, foreach=False
+            optimizer_parameters, lr=args.learning_rate, foreach=False
         )
     else:
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, foreach=False)
+        optimizer = torch.optim.SGD(optimizer_parameters, lr=args.learning_rate, foreach=False)
 
     generator = torch.Generator(device=runtime.device)
-    generator.manual_seed(args.seed + runtime.rank)
+    generator.manual_seed(args.seed + runtime.rank // args.cp_size)
     last_loss = last_aux_loss = 0.0
     for step in range(1, args.steps + 1):
         input_ids = torch.randint(
@@ -144,11 +190,15 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
             generator=generator,
         )
         input_ids[:, 0] = model.config.bos_token_id
+        sequence_ids = None
+        if args.sequence_packing:
+            input_ids, sequence_ids = pack_sequences(input_ids)
         optimizer.zero_grad(set_to_none=True)
-        output = model(input_ids, labels=input_ids)
+        output = model(input_ids, labels=input_ids, sequence_ids=sequence_ids)
         if output.loss is None or not torch.isfinite(output.loss):
             raise RuntimeError("training produced a non-finite loss")
         output.loss.backward()
+        synchronize_cp_gradients(model, context_parallel)
         optimizer.step()
         distributed_trace(runtime, "optimizer_step_complete")
         last_loss = distributed_mean(output.loss, runtime)

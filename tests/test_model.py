@@ -1,10 +1,12 @@
 import unittest
+from copy import deepcopy
 from unittest.mock import Mock, call, patch
 
 import torch
 
 from dsv41_train.dispatch import DispatchMetadata, TokenDispatcher
 from dsv41_train.models.dsv4 import DeepSeekV41Config, DeepSeekV41ForCausalLM
+from dsv41_train.models.dsv4.context import pack_sequences
 from dsv41_train.models.dsv4.model import NgramHash
 from dsv41_train.models.dsv4.moe import RoutedExperts
 from dsv41_train.models.dsv4.parallel import apply_fsdp2
@@ -220,6 +222,25 @@ class ModelTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(output.loss))
         output.loss.backward()
         self.assertIsNotNone(model.model.embedding.weight.grad)
+
+    def test_packing_and_checkpointing_share_one_model_path(self):
+        torch.manual_seed(7)
+        model = DeepSeekV41ForCausalLM(DeepSeekV41Config.tiny()).eval()
+        checkpointed = deepcopy(model).train()
+        checkpointed.gradient_checkpointing_enable()
+        input_ids = torch.randint(0, model.config.vocab_size, (2, 8))
+        packed_ids, sequence_ids = pack_sequences(input_ids)
+
+        unpacked = model(input_ids, labels=input_ids)
+        packed = model(packed_ids, labels=packed_ids, sequence_ids=sequence_ids)
+        recomputed = checkpointed(
+            packed_ids, labels=packed_ids, sequence_ids=sequence_ids
+        )
+
+        torch.testing.assert_close(packed.logits.reshape_as(unpacked.logits), unpacked.logits)
+        torch.testing.assert_close(packed.loss, unpacked.loss, rtol=2e-5, atol=2e-6)
+        torch.testing.assert_close(recomputed.logits, packed.logits)
+        torch.testing.assert_close(recomputed.loss, packed.loss)
 
     def test_explicit_local_parallel_primitives(self):
         dispatcher = TokenDispatcher()

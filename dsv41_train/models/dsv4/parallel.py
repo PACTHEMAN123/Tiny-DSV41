@@ -1,12 +1,23 @@
 """DSV4 parallel topology and FSDP wrapping."""
 
+from __future__ import annotations
+
 from dataclasses import replace
 
 import torch.distributed as dist
+from torch import nn
 
 from ...dispatch import AllToAllTokenDispatcher, TokenDispatcher
 from ...parallel import ContextParallel, ParallelMeshes
-from .model import DecoderLayer, DeepSeekV41ForCausalLM, DeepSeekV41Model
+from ...runtime import local_tensor
+from .model import (
+    AttentionSinks,
+    DecoderLayer,
+    DeepSeekV41ForCausalLM,
+    DeepSeekV41Model,
+    HyperConnection,
+)
+from .moe import RoutedExperts
 
 
 def build_parallelism(
@@ -14,9 +25,18 @@ def build_parallelism(
     ep: int = 1,
     device_type: str = "cuda",
 ) -> tuple[ParallelMeshes, ContextParallel, TokenDispatcher]:
+    if cp > 1 and cp != ep:
+        raise ValueError("DSV4 context parallelism requires cp-size == ep-size")
     meshes = ParallelMeshes.build(cp=cp, ep=ep, device_type=device_type)
     from torch.distributed.device_mesh import init_device_mesh
 
+    if cp > 1:
+        dense_fsdp = init_device_mesh(
+            device_type,
+            (dist.get_world_size(),),
+            mesh_dim_names=("fsdp",),
+        )
+        meshes = replace(meshes, fsdp=dense_fsdp)
     engram_sparse = init_device_mesh(
         device_type,
         (dist.get_world_size(), 1),
@@ -42,6 +62,31 @@ def _fully_shard():
     return fully_shard
 
 
+def _disable_backward_prefetch(module: nn.Module) -> None:
+    """Avoid cross-process-group collective cycles during MoE backward."""
+
+    try:
+        from torch.distributed.fsdp import FSDPModule
+    except ImportError:
+        from torch.distributed._composable.fsdp import FSDPModule
+
+    for child in module.modules():
+        if isinstance(child, FSDPModule):
+            # In PyTorch 2.11, an empty explicit list enables the implicit
+            # reverse post-forward prefetch. Targeting the already-unsharded
+            # current module suppresses that implicit cross-layer collective.
+            child.set_modules_to_backward_prefetch([child])
+
+
+def _replicated_fp32_parameters(module: nn.Module) -> set[nn.Parameter]:
+    return {
+        parameter
+        for child in module.modules()
+        if isinstance(child, (HyperConnection, AttentionSinks))
+        for parameter in child.parameters(recurse=False)
+    }
+
+
 def apply_fsdp2_layer(
     layer: DecoderLayer,
     meshes: ParallelMeshes,
@@ -49,6 +94,7 @@ def apply_fsdp2_layer(
     reshard_after_forward: bool = True,
 ) -> None:
     fully_shard = _fully_shard()
+    replicate_fp32 = meshes.ep is not None and meshes._dense is not None
     if meshes.ep is not None:
         assert meshes.expert_fsdp is not None
         layer.moe.routed.set_gradient_group(meshes.expert_fsdp.get_group())
@@ -57,13 +103,48 @@ def apply_fsdp2_layer(
             mesh=meshes.expert_fsdp,
             reshard_after_forward=reshard_after_forward,
         )
-    for fp32_module in (layer.attention_hc, layer.moe_hc, layer.attention.sinks):
+    if replicate_fp32:
         fully_shard(
-            fp32_module,
+            layer,
+            mesh=meshes.fsdp,
+            reshard_after_forward=reshard_after_forward,
+            ignored_params=_replicated_fp32_parameters(layer),
+        )
+    else:
+        for fp32_module in (layer.attention_hc, layer.moe_hc, layer.attention.sinks):
+            fully_shard(
+                fp32_module,
+                mesh=meshes.fsdp,
+                reshard_after_forward=reshard_after_forward,
+            )
+        fully_shard(
+            layer,
             mesh=meshes.fsdp,
             reshard_after_forward=reshard_after_forward,
         )
-    fully_shard(layer, mesh=meshes.fsdp, reshard_after_forward=reshard_after_forward)
+
+
+def synchronize_cp_gradients(model: nn.Module, cp: ContextParallel) -> None:
+    """Normalize gradients excluded from global dense FSDP reduction."""
+
+    if not cp.enabled:
+        return
+    experts = {
+        id(parameter)
+        for module in model.modules()
+        if isinstance(module, RoutedExperts) and module.num_experts < module.global_num_experts
+        for parameter in module.parameters()
+    }
+    replicated = {id(parameter) for parameter in _replicated_fp32_parameters(model)}
+    for parameter in model.parameters():
+        if parameter.grad is None:
+            continue
+        gradient = local_tensor(parameter.grad)
+        if id(parameter) in experts:
+            gradient.div_(cp.size)
+        elif id(parameter) in replicated:
+            dist.all_reduce(gradient)
+            gradient.div_(dist.get_world_size())
 
 
 def apply_fsdp2_root(
@@ -78,7 +159,11 @@ def apply_fsdp2_root(
     engram_fsdp = (
         meshes.engram_fsdp if meshes.engram_fsdp is not None else meshes.expert_fsdp
     )
-    ignored_params = set()
+    ignored_params = (
+        _replicated_fp32_parameters(decoder)
+        if meshes.ep is not None and meshes._dense is not None
+        else set()
+    )
     for table in decoder.engram_tables.values():
         if table.sparse_gradients:
             ignored_params.add(table.weight)
@@ -92,6 +177,8 @@ def apply_fsdp2_root(
     if ignored_params:
         root_options["ignored_params"] = ignored_params
     fully_shard(model, **root_options)
+    if meshes.ep is not None and meshes._dense is not None:
+        _disable_backward_prefetch(model)
 
 
 def apply_fsdp2(
@@ -119,4 +206,5 @@ __all__ = [
     "apply_fsdp2_layer",
     "apply_fsdp2_root",
     "build_parallelism",
+    "synchronize_cp_gradients",
 ]

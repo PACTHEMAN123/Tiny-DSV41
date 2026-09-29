@@ -59,3 +59,6 @@ python3 -m torch.distributed.run --standalone --nproc-per-node=8 \
 
 Testing and distributed diagnostics are documented in
 [`docs/testing.md`](docs/testing.md).
+
+Packed context-parallel training is documented in
+[`docs/context-parallel.md`](docs/context-parallel.md).
