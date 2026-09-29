@@ -6,6 +6,11 @@ Run all commands from the repository root.
 
 ## DeepSeek V4.1
 
+DSV4 supports direct shard loading, trainable CPU Engram tables, asynchronous
+row prefetch, selective FSDP CPU offload and sharded training-state resume.
+These policies default to disabled. See [configuration and examples](docs/memory_offload.md),
+[validation](docs/memory_validation.md), and [measurements](docs/memory_results.md).
+
 ### Two nodes, 16 GPUs, full 40 layers
 
 Run this command on both 8-GPU nodes. Set `NODE_RANK=0` on the first node and

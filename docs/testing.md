@@ -2,6 +2,9 @@
 
 Run all commands from the repository root.
 
+Loading/offload policy tests, the complete six-rank CP/EP matrix, fresh-process
+resume and performance commands are in [memory validation](memory_validation.md).
+
 ## Unit tests
 
 ```bash
