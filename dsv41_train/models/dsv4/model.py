@@ -1010,7 +1010,7 @@ def load_balancing_loss(
 @dataclass
 class CausalLMOutput:
     loss: torch.Tensor | None
-    logits: torch.Tensor
+    logits: torch.Tensor | None
     aux_loss: torch.Tensor | None
     router_logits: tuple[torch.Tensor, ...]
 
@@ -1075,6 +1075,15 @@ class DeepSeekV41ForCausalLM(nn.Module):
     def gradient_checkpointing_enable(self) -> None:
         self.model.gradient_checkpointing = True
 
+    def _lm_loss(self, hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        logits = self.lm_head(hidden)
+        return F.cross_entropy(
+            logits.float().reshape(-1, self.config.vocab_size),
+            targets.reshape(-1),
+            ignore_index=-100,
+            reduction="sum",
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1088,7 +1097,7 @@ class DeepSeekV41ForCausalLM(nn.Module):
             else attention_mask.bool()
         )
         hidden, router_logits = self.model(input_ids, token_mask, sequence_ids)
-        logits = self.lm_head(hidden)
+        logits = None
         loss = None
         if labels is not None:
             targets = torch.full_like(labels, -100)
@@ -1099,13 +1108,24 @@ class DeepSeekV41ForCausalLM(nn.Module):
                     sequence_ids[:, :-1] != sequence_ids[:, 1:], -100
                 )
             targets = self.context_parallel.shard(targets)
-            loss_sum = F.cross_entropy(
-                logits.float().reshape(-1, self.config.vocab_size),
-                targets.reshape(-1),
-                ignore_index=-100,
-                reduction="sum",
-            )
+            if self.training and torch.is_grad_enabled():
+                loss_sum = checkpoint(
+                    self._lm_loss,
+                    hidden,
+                    targets,
+                    use_reentrant=False,
+                )
+            else:
+                logits = self.lm_head(hidden)
+                loss_sum = F.cross_entropy(
+                    logits.float().reshape(-1, self.config.vocab_size),
+                    targets.reshape(-1),
+                    ignore_index=-100,
+                    reduction="sum",
+                )
             loss = self.context_parallel.mean_loss(loss_sum, (targets != -100).sum())
+        else:
+            logits = self.lm_head(hidden)
 
         local_token_mask = self.context_parallel.shard(token_mask)
         auxiliary_logits = tuple(logits.detach().requires_grad_() for logits in router_logits)
