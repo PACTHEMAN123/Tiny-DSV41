@@ -67,6 +67,15 @@ class ModelTest(unittest.TestCase):
             )
             for layer in model.model.layers
         ]
+        layer_output_sizes = []
+        hooks.extend(
+            layer.register_forward_hook(
+                lambda _module, _args, output, sizes=layer_output_sizes: sizes.append(
+                    len(output)
+                )
+            )
+            for layer in model.model.layers
+        )
         compressor_lengths = []
         compressor = model.model.layers[3].attention.compressor
         assert compressor is not None
@@ -82,6 +91,7 @@ class ModelTest(unittest.TestCase):
             hook.remove()
 
         self.assertEqual(layer_lengths, [8, 8, 8, 2, 2, 2])
+        self.assertEqual(layer_output_sizes, [8, 8, 8, 8, 8, 8])
         self.assertEqual(compressor_lengths, [8])
         self.assertTrue(torch.isfinite(output.loss))
         output.loss.backward()

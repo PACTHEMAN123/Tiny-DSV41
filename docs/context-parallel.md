@@ -66,8 +66,21 @@ python3 -m torch.distributed.run \
   --start-layer 0 --num-layers 40 --cp-size 16 --ep-size 16 \
   --steps 1 --batch-size 16 --seq-len 8192 --optimizer sgd \
   --sequence-packing --gradient-checkpointing --optimizer-in-backward \
+  --post-training \
   --metrics-file /path/to/ep16-cp16-bs16.json
 ```
 
-CP16/EP16 has been validated at batch sizes 16 and 32. The batch-32 run uses
-156.18 GiB peak allocated memory and completes with a finite parameter update.
+`--post-training` requires the complete 40-layer CED backbone. Layers 0-19 run
+on the full packed sequence. At layer 20, the model builds global compressed KV
+from the complete encoder output, then replays only the final 128 tokens of each
+packed sequence through layers 20-39 while preserving their original positions.
+
+On September 30, 2026, this command completed on 16 NVIDIA L20A GPUs with loss
+12.77656, a non-zero parameter update, 124.68 GiB peak allocated memory, and
+41.74 seconds in the sharded training section. The emitted metrics recorded
+`post_training=true`, `decoder_swa_bounded_replay=true`, and
+`decoder_replay_window=128`.
+
+The non-replay CP16/EP16 path has also been validated at batch sizes 16 and 32.
+The batch-32 run uses 156.18 GiB peak allocated memory and completes with a
+finite parameter update.

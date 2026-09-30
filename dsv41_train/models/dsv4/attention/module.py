@@ -234,7 +234,7 @@ def select_candidate_blocks(
     picked = block_scores.topk(min(topk_blocks, block_scores.shape[-1]), dim=-1)
     keep = torch.zeros_like(block_scores, dtype=torch.bool)
     keep.scatter_(-1, picked.indices, picked.values > float("-inf"))
-    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+    return keep.repeat_interleave(block_size, dim=-1)[..., :width].clone()
 
 
 class SparseIndexer(nn.Module):
