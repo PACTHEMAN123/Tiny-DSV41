@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
+from torch import nn
+
+from .config import DeepSeekV41Config
 
 try:
     import triton
@@ -10,54 +14,6 @@ try:
 except ImportError:
     triton = None
     tl = None
-
-
-def sinkhorn_reference(
-    logits: torch.Tensor, iterations: int, eps: float
-) -> torch.Tensor:
-    matrix = torch.softmax(logits.float(), dim=-1) + eps
-    matrix = matrix / (matrix.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(iterations - 1):
-        matrix = matrix / (matrix.sum(dim=-1, keepdim=True) + eps)
-        matrix = matrix / (matrix.sum(dim=-2, keepdim=True) + eps)
-    return matrix
-
-
-def mixing_weights_reference(
-    projected: torch.Tensor,
-    base: torch.Tensor,
-    scale: torch.Tensor,
-    hc: int,
-    iterations: int,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    pre, post, comb = projected.float().split([hc, hc, hc * hc], dim=-1)
-    pre_bias, post_bias, comb_bias = base.float().split([hc, hc, hc * hc])
-    pre_scale, post_scale, comb_scale = scale.float()
-    pre = torch.sigmoid(pre * pre_scale + pre_bias) + eps
-    post = 2 * torch.sigmoid(post * post_scale + post_bias)
-    comb = comb.view(*comb.shape[:-1], hc, hc) * comb_scale
-    comb = comb + comb_bias.view(hc, hc)
-    comb = sinkhorn_reference(comb, iterations, eps)
-    return pre, post, comb
-
-
-def collapse_reference(streams: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    return (weights.unsqueeze(-1) * streams.float()).sum(-2).to(streams.dtype)
-
-
-def expand_reference(
-    value: torch.Tensor,
-    residual: torch.Tensor,
-    output_weights: torch.Tensor,
-    residual_weights: torch.Tensor,
-) -> torch.Tensor:
-    mixed = torch.einsum(
-        "...jk,...jd->...kd", residual_weights.float(), residual.float()
-    )
-    return (
-        output_weights.unsqueeze(-1) * value.float().unsqueeze(-2) + mixed
-    ).to(residual.dtype)
 
 
 if triton is not None:
@@ -496,7 +452,7 @@ class _Expand(torch.autograd.Function):
         )
 
 
-def mixing_weights(
+def _mixing_weights(
     projected: torch.Tensor,
     base: torch.Tensor,
     scale: torch.Tensor,
@@ -514,11 +470,15 @@ def mixing_weights(
     if comb.is_cuda and triton is not None and hc == 4 and comb.numel() > 0:
         comb = _Sinkhorn.apply(comb, iterations, eps)
     else:
-        comb = sinkhorn_reference(comb, iterations, eps)
+        comb = torch.softmax(comb.float(), dim=-1) + eps
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+        for _ in range(iterations - 1):
+            comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+            comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
     return pre, post, comb
 
 
-def collapse(streams: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+def _collapse(streams: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     if (
         streams.is_cuda
         and triton is not None
@@ -526,10 +486,10 @@ def collapse(streams: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
         and streams.numel() > 0
     ):
         return _Collapse.apply(streams, weights)
-    return collapse_reference(streams, weights)
+    return (weights.unsqueeze(-1) * streams.float()).sum(-2).to(streams.dtype)
 
 
-def expand(
+def _expand(
     value: torch.Tensor,
     residual: torch.Tensor,
     output_weights: torch.Tensor,
@@ -542,7 +502,56 @@ def expand(
         and residual.numel() > 0
     ):
         return _Expand.apply(value, residual, output_weights, residual_weights)
-    return expand_reference(value, residual, output_weights, residual_weights)
+    mixed = torch.einsum(
+        "...jk,...jd->...kd", residual_weights.float(), residual.float()
+    )
+    return (
+        output_weights.unsqueeze(-1) * value.float().unsqueeze(-2) + mixed
+    ).to(residual.dtype)
+
+
+class HyperConnection(nn.Module):
+    """Prepare and finish one four-stream mHC branch."""
+
+    def __init__(self, config: DeepSeekV41Config) -> None:
+        super().__init__()
+        self.hc_mult = config.hc_mult
+        self.sinkhorn_iters = config.hc_sinkhorn_iters
+        self.eps = config.hc_eps
+        mix_size = (2 + config.hc_mult) * config.hc_mult
+        self.fn = nn.Parameter(torch.empty(mix_size, config.hc_mult * config.hidden_size))
+        self.base = nn.Parameter(torch.zeros(mix_size))
+        self.scale = nn.Parameter(torch.ones(3))
+        self.norm_eps = config.rms_norm_eps
+
+    def forward(
+        self, streams: torch.Tensor, input_weights: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        flat = streams.flatten(2).float()
+        flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        projected = F.linear(flat, self.fn.float())
+        pre, post, residual_weights = _mixing_weights(
+            projected,
+            self.base,
+            self.scale,
+            self.hc_mult,
+            self.sinkhorn_iters,
+            self.eps,
+        )
+        return _collapse(streams, input_weights), pre, post, residual_weights
+
+    @staticmethod
+    def finish(
+        value: torch.Tensor,
+        residual: torch.Tensor,
+        output_weights: torch.Tensor,
+        residual_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        return _expand(value, residual, output_weights, residual_weights)
+
+    @staticmethod
+    def collapse(streams: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        return _collapse(streams, weights)
 
 
 def is_available(tensor: torch.Tensor) -> bool:
@@ -550,12 +559,6 @@ def is_available(tensor: torch.Tensor) -> bool:
 
 
 __all__ = [
-    "collapse",
-    "collapse_reference",
-    "expand",
-    "expand_reference",
+    "HyperConnection",
     "is_available",
-    "mixing_weights",
-    "mixing_weights_reference",
-    "sinkhorn_reference",
 ]

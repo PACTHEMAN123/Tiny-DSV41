@@ -1,132 +1,81 @@
+import copy
 import unittest
 
 import torch
 
-from dsv41_train.models.dsv4.mhc import (
-    collapse,
-    collapse_reference,
-    expand,
-    expand_reference,
-    is_available,
-    mixing_weights,
-    mixing_weights_reference,
-)
+import dsv41_train.models.dsv4.mhc as mhc
+from dsv41_train.models.dsv4.config import DeepSeekV41Config
+from dsv41_train.models.dsv4.mhc import HyperConnection, is_available
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TritonMHCTest(unittest.TestCase):
-    def setUp(self):
+    def test_complete_site_matches_torch_fallback(self):
         if not is_available(torch.empty((), device="cuda")):
             self.skipTest("Triton is unavailable")
-
-    def test_mixing_weights_forward_and_backward_match_reference(self):
         generator = torch.Generator(device="cuda").manual_seed(11)
-        projected = torch.randn(2, 7, 24, generator=generator, device="cuda")
-        base = torch.randn(24, generator=generator, device="cuda") * 0.2
-        scale = torch.tensor([0.8, 1.1, 0.6], device="cuda")
-        upstream = (
-            torch.randn(2, 7, 4, generator=generator, device="cuda"),
-            torch.randn(2, 7, 4, generator=generator, device="cuda"),
-            torch.randn(2, 7, 4, 4, generator=generator, device="cuda"),
-        )
-        actual_inputs = [
-            value.detach().clone().requires_grad_()
-            for value in (projected, base, scale)
-        ]
-        expected_inputs = [
-            value.detach().clone().requires_grad_()
-            for value in (projected, base, scale)
-        ]
-        actual = mixing_weights(*actual_inputs, 4, 20, 1.0e-6)
-        expected = mixing_weights_reference(*expected_inputs, 4, 20, 1.0e-6)
-        torch.autograd.backward(actual, upstream)
-        torch.autograd.backward(expected, upstream)
-
-        for actual_output, expected_output in zip(actual, expected):
-            torch.testing.assert_close(
-                actual_output, expected_output, rtol=2e-5, atol=2e-5
-            )
-        for actual_input, expected_input in zip(actual_inputs, expected_inputs):
-            torch.testing.assert_close(
-                actual_input.grad, expected_input.grad, rtol=3e-4, atol=3e-4
-            )
-
-    def test_collapse_forward_and_backward_match_reference(self):
-        generator = torch.Generator(device="cuda").manual_seed(13)
+        config = DeepSeekV41Config.tiny()
+        actual = HyperConnection(config).cuda().to(torch.bfloat16)
+        torch.nn.init.normal_(actual.fn, std=config.initializer_range)
+        reference = copy.deepcopy(actual)
         streams = torch.randn(
             2,
             5,
             4,
-            320,
+            config.hidden_size,
             generator=generator,
             device="cuda",
             dtype=torch.bfloat16,
         )
-        weights = torch.randn(2, 5, 4, generator=generator, device="cuda")
-        upstream = torch.randn(
-            2,
-            5,
-            320,
-            generator=generator,
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        actual_inputs = [
-            value.detach().clone().requires_grad_() for value in (streams, weights)
-        ]
-        expected_inputs = [
-            value.detach().clone().requires_grad_() for value in (streams, weights)
-        ]
-        actual = collapse(*actual_inputs)
-        expected = collapse_reference(*expected_inputs)
-        actual.backward(upstream)
-        expected.backward(upstream)
+        input_weights = torch.randn(2, 5, 4, generator=generator, device="cuda")
+        output_gradient = torch.randn_like(streams)
+        pre_gradient = torch.randn(2, 5, 4, generator=generator, device="cuda")
 
-        torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.01)
-        torch.testing.assert_close(
-            actual_inputs[0].grad, expected_inputs[0].grad, rtol=0.01, atol=0.01
+        actual_streams = streams.detach().clone().requires_grad_()
+        actual_weights = input_weights.detach().clone().requires_grad_()
+        collapsed, pre, post, residual_weights = actual(
+            actual_streams, actual_weights
         )
-        torch.testing.assert_close(
-            actual_inputs[1].grad, expected_inputs[1].grad, rtol=5e-4, atol=5e-4
+        value = torch.sin(collapsed.float()).to(collapsed.dtype)
+        output = actual.finish(value, actual_streams, post, residual_weights)
+        torch.autograd.backward((output, pre), (output_gradient, pre_gradient))
+        actual_outputs = tuple(
+            tensor.detach().clone()
+            for tensor in (collapsed, pre, post, residual_weights, output)
         )
+        actual_grads = [actual_streams.grad, actual_weights.grad]
+        actual_grads.extend(parameter.grad for parameter in actual.parameters())
 
-    def test_expand_forward_and_backward_match_reference(self):
-        generator = torch.Generator(device="cuda").manual_seed(17)
-        value = torch.randn(
-            2,
-            5,
-            320,
-            generator=generator,
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        residual = torch.randn(
-            2,
-            5,
-            4,
-            320,
-            generator=generator,
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        output_weights = torch.randn(2, 5, 4, generator=generator, device="cuda")
-        residual_weights = torch.randn(2, 5, 4, 4, generator=generator, device="cuda")
-        upstream = torch.randn_like(residual)
-        values = (value, residual, output_weights, residual_weights)
-        actual_inputs = [item.detach().clone().requires_grad_() for item in values]
-        expected_inputs = [item.detach().clone().requires_grad_() for item in values]
-        actual = expand(*actual_inputs)
-        expected = expand_reference(*expected_inputs)
-        actual.backward(upstream)
-        expected.backward(upstream)
+        reference_streams = streams.detach().clone().requires_grad_()
+        reference_weights = input_weights.detach().clone().requires_grad_()
+        saved_triton = mhc.triton
+        mhc.triton = None
+        try:
+            collapsed, pre, post, residual_weights = reference(
+                reference_streams, reference_weights
+            )
+            value = torch.sin(collapsed.float()).to(collapsed.dtype)
+            output = reference.finish(
+                value, reference_streams, post, residual_weights
+            )
+            torch.autograd.backward(
+                (output, pre), (output_gradient, pre_gradient)
+            )
+        finally:
+            mhc.triton = saved_triton
 
-        torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.01)
-        for index, (actual_input, expected_input) in enumerate(
-            zip(actual_inputs, expected_inputs)
+        reference_outputs = (collapsed, pre, post, residual_weights, output)
+        reference_grads = [reference_streams.grad, reference_weights.grad]
+        reference_grads.extend(parameter.grad for parameter in reference.parameters())
+        for actual_output, reference_output in zip(
+            actual_outputs, reference_outputs
         ):
-            tolerance = 0.01 if index < 2 else 8e-4
             torch.testing.assert_close(
-                actual_input.grad, expected_input.grad, rtol=tolerance, atol=tolerance
+                actual_output, reference_output, rtol=0.01, atol=0.01
+            )
+        for actual_grad, reference_grad in zip(actual_grads, reference_grads):
+            torch.testing.assert_close(
+                actual_grad, reference_grad, rtol=0.01, atol=0.01
             )
 
 

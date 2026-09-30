@@ -30,9 +30,7 @@ from .attention import (
     ShadowIndexers,
 )
 from .config import DeepSeekV41Config
-from .mhc import collapse as mhc_collapse
-from .mhc import expand as mhc_expand
-from .mhc import mixing_weights
+from .mhc import HyperConnection
 from ...cp import ContextParallel, ModelContext
 from .moe import RoutedExperts, SparseMoE, TokenDispatcher, TopKRouter
 
@@ -42,35 +40,6 @@ if TYPE_CHECKING:
 
 def _direct(function, *args, **_kwargs):
     return function(*args)
-
-
-class HyperConnection(nn.Module):
-    """Compute the input, output, and residual mixing weights for one mHC site."""
-
-    def __init__(self, config: DeepSeekV41Config) -> None:
-        super().__init__()
-        self.hc_mult = config.hc_mult
-        self.sinkhorn_iters = config.hc_sinkhorn_iters
-        self.eps = config.hc_eps
-        mix_size = (2 + config.hc_mult) * config.hc_mult
-        self.fn = nn.Parameter(torch.empty(mix_size, config.hc_mult * config.hidden_size))
-        self.base = nn.Parameter(torch.zeros(mix_size))
-        self.scale = nn.Parameter(torch.ones(3))
-        self.norm_eps = config.rms_norm_eps
-
-    def forward(self, streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        flat = streams.flatten(2).float()
-        flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
-        hc = self.hc_mult
-        projected = F.linear(flat, self.fn.float())
-        return mixing_weights(
-            projected,
-            self.base,
-            self.scale,
-            hc,
-            self.sinkhorn_iters,
-            self.eps,
-        )
 
 
 class _ScaleGradient(torch.autograd.Function):
@@ -386,19 +355,6 @@ class DecoderLayer(nn.Module):
         self.attention_hc = HyperConnection(config)
         self.moe_hc = HyperConnection(config)
 
-    @staticmethod
-    def collapse(streams: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        return mhc_collapse(streams, weights)
-
-    @staticmethod
-    def expand(
-        value: torch.Tensor,
-        residual: torch.Tensor,
-        output_weights: torch.Tensor,
-        residual_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        return mhc_expand(value, residual, output_weights, residual_weights)
-
     def forward(
         self,
         streams: torch.Tensor,
@@ -411,20 +367,18 @@ class DecoderLayer(nn.Module):
             streams = self.engram(streams, engram_rows, context.token_mask)
 
         residual = streams
-        next_pre, post, combine = self.attention_hc(streams)
-        collapsed = self.collapse(streams, pre_mix)
+        collapsed, next_pre, post, combine = self.attention_hc(streams, pre_mix)
         value = self.attention(
             self.input_norm(collapsed),
             context,
             shadow,
         )
-        streams = self.expand(value, residual, post, combine)
+        streams = self.attention_hc.finish(value, residual, post, combine)
 
         residual = streams
-        final_pre, post, combine = self.moe_hc(streams)
-        collapsed = self.collapse(streams, next_pre)
+        collapsed, final_pre, post, combine = self.moe_hc(streams, next_pre)
         value, router_logits = self.moe(self.post_attention_norm(collapsed))
-        streams = self.expand(value, residual, post, combine)
+        streams = self.moe_hc.finish(value, residual, post, combine)
         return streams, final_pre, router_logits
 
 
@@ -539,7 +493,7 @@ class DeepSeekV41Model(nn.Module):
             )
             router_logits.append(logits)
 
-        hidden = DecoderLayer.collapse(streams, pre_mix)
+        hidden = HyperConnection.collapse(streams, pre_mix)
         return self.norm(hidden), tuple(router_logits)
 
     def _forward_layer(

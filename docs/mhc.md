@@ -9,14 +9,24 @@ pre/post weights: [..., 4]
 residual weights: [..., 4, 4]
 ```
 
-`dsv41_train/models/dsv4/mhc.py` contains CUDA Triton kernels plus PyTorch
-references. CPU execution, missing Triton installations, empty tensors, and
-non-four-stream configurations use the reference path.
+`dsv41_train/models/dsv4/mhc.py` owns the complete `HyperConnection` module,
+the CUDA Triton kernels, and an internal PyTorch fallback. CPU execution,
+missing Triton installations, empty tensors, and non-four-stream
+configurations use the same module interface without exposing separate
+reference APIs.
 
 ## Scope
 
-The implementation follows the operation boundaries used by Megatron Core's
-mHC support:
+The model adapts to one mHC object with two natural phases. Calling
+`HyperConnection(streams, input_weights)` performs RMS normalization, the
+learned projection, coefficient activation, Sinkhorn, and stream collapse.
+After attention or MoE computes the branch value, `HyperConnection.finish()`
+performs branch expansion and residual mixing. The branch itself prevents
+these phases from becoming one physical kernel, but no individual kernel or
+reference function leaks into `model.py`.
+
+Internally, the implementation follows the operation boundaries used by
+Megatron Core's mHC support:
 
 1. RMS normalization and the learned projection remain PyTorch operations.
    `F.linear` therefore continues to use the platform GEMM backend.
@@ -121,7 +131,7 @@ The same six-layer Triton model with activation checkpointing enabled matched
 the non-checkpointed loss exactly; its parameter-gradient relative L2 error was
 `3.03e-8`.
 
-The complete L20A unit suite runs 48 tests: 46 pass and two optional
+The complete L20A unit suite runs 46 tests: 44 pass and two optional
 `safetensors` tests are skipped when that package is unavailable. Run the
 focused test with:
 
