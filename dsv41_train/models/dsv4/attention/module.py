@@ -446,6 +446,12 @@ class CSA2Attention(nn.Module):
             if compressed_kv is not None and topk_indices is not None:
                 compressed_entries = compressed_kv[:, 0]
 
+        if topk_indices is not None and topk_indices.shape[:2] != (batch, length):
+            raise ValueError(
+                f"layer {self.layer_id} compressed indices have shape "
+                f"{tuple(topk_indices.shape[:2])}, expected {(batch, length)}"
+            )
+
         output = self._attend(
             query,
             kv,
