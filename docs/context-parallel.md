@@ -69,6 +69,5 @@ python3 -m torch.distributed.run \
   --metrics-file /path/to/ep16-cp16-bs16.json
 ```
 
-This CP16/EP16 batch-16 configuration is the largest validated training run.
-The batch-32 limit experiment reaches 168.96 GiB peak allocated memory but
-produces a non-finite parameter update.
+CP16/EP16 has been validated at batch sizes 16 and 32. The batch-32 run uses
+156.18 GiB peak allocated memory and completes with a finite parameter update.

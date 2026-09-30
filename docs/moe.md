@@ -104,9 +104,9 @@ python3 -m torch.distributed.run \
   --metrics-file /path/to/ep16-cp16-bs16.json
 ```
 
-To reproduce the batch-32 limit experiment, change `--batch-size 16` to
-`--batch-size 32` and use a different metrics file. Packing produces 8,192
-local tokens per rank at batch 16 and 16,384 at batch 32.
+To run batch 32, change `--batch-size 16` to `--batch-size 32` and use a
+different metrics file. Packing produces 8,192 local tokens per rank at batch
+16 and 16,384 at batch 32.
 
 ## Results
 
@@ -119,17 +119,19 @@ in backward.
 | Legacy experts, CP16/EP16, batch 16 (`15b81a7`) | 17.30916 | 153.86 GiB | 63.82 s | Passed |
 | Grouped experts, CP16/EP16, batch 16 (`65589fc`) | 17.30551 | 131.31 GiB | 55.76 s | Passed |
 | Grouped experts, CP16/EP16, batch 32 (`65589fc`) | 17.44295 | 168.96 GiB | 82.33 s | Invalid update |
+| CSA2 and stabilized backward, CP16/EP16, batch 16 | 17.31515 | 124.91 GiB | 31.66 s | Passed |
+| CSA2 and stabilized backward, CP16/EP16, batch 32 | 17.44834 | 156.18 GiB | 48.98 s | Passed |
 
 At batch 16, grouped experts reduce peak allocated memory by 22.55 GiB
 (14.66%) and step time by 8.06 seconds (12.63%) relative to the legacy expert
 loop. The loss difference is 0.00365 and the tracked parameter update remains
 finite.
 
-Batch 32 reaches the end of the step, but it is not a valid training result.
-Several ranks report allocator mapping failures with only about 7.6 MiB free,
-and the tracked parameter delta is `NaN`. Batch 16 is therefore the largest
-validated configuration from these experiments.
+The SwiGLU kernel maps `SiLU(-inf)` to its mathematical value of zero. The
+16-GPU BF16 optimizer-in-backward path applies one exact power-of-two loss
+scale and cancels it through the effective learning rate, so the MoE module
+does not carry precision-specific scale state. The tracked parameter deltas
+are `4.1127e-6` at batch 16 and `3.7998e-6` at batch 32.
 
-Validation also includes 40 unit tests, two-rank EP forward/backward parity,
-four-rank `EP2 x expert-FSDP2` backward, and an interleaved-stride Triton
-forward/backward comparison against the PyTorch reference.
+Validation includes 27 focused CPU/CUDA tests on L20A and full 40-layer runs
+at batch sizes 16 and 32 across 16 GPUs.

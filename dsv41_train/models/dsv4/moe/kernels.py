@@ -20,7 +20,10 @@ def clamped_swiglu_reference(
     if limit > 0:
         gate = gate.clamp(max=limit)
         up = up.clamp(-limit, limit)
-    return F.silu(gate) * up
+    silu = F.silu(gate)
+    # SiLU(-inf) is 0 mathematically; IEEE multiplication otherwise yields NaN.
+    silu = torch.where(torch.isneginf(gate), torch.zeros_like(silu), silu)
+    return silu * up
 
 
 if triton is not None:
@@ -60,7 +63,11 @@ if triton is not None:
         if limit > 0:
             gate_value = tl.minimum(gate_value, limit)
             up_value = tl.maximum(tl.minimum(up_value, limit), -limit)
-        silu = gate_value * tl.sigmoid(gate_value)
+        silu = tl.where(
+            gate_value == float("-inf"),
+            0.0,
+            gate_value * tl.sigmoid(gate_value),
+        )
         weight = tl.load(weights + row).to(tl.float32)
         tl.store(
             output
@@ -126,8 +133,13 @@ if triton is not None:
             gate_mask = raw_gate <= limit
             up_mask = (raw_up >= -limit) & (raw_up <= limit)
         sigmoid = tl.sigmoid(gate_value)
-        silu = gate_value * sigmoid
-        silu_grad = sigmoid * (1.0 + gate_value * (1.0 - sigmoid))
+        stable_gate = gate_value != float("-inf")
+        silu = tl.where(stable_gate, gate_value * sigmoid, 0.0)
+        silu_grad = tl.where(
+            stable_gate,
+            sigmoid * (1.0 + gate_value * (1.0 - sigmoid)),
+            0.0,
+        )
         weight = tl.load(weights + row).to(tl.float32)
         tl.store(
             grad_gate

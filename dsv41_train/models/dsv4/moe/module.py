@@ -41,25 +41,6 @@ class TopKRouter(nn.Module):
         return logits, weights * self.scale, indices
 
 
-def _grouped_mm(
-    x: torch.Tensor, weight: torch.Tensor, counts: torch.Tensor
-) -> torch.Tensor:
-    if x.is_cuda:
-        offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
-        return torch._grouped_mm(x, weight.transpose(-2, -1), offs=offsets)
-
-    outputs = []
-    start = 0
-    for expert, count in enumerate(counts.tolist()):
-        stop = start + count
-        if stop > start:
-            outputs.append(F.linear(x[start:stop], weight[expert]))
-        start = stop
-    if outputs:
-        return torch.cat(outputs)
-    return x.new_empty((0, weight.shape[1]))
-
-
 class RoutedExperts(nn.Module):
     def __init__(self, config: DeepSeekV41Config, dispatcher: TokenDispatcher) -> None:
         super().__init__()
@@ -89,16 +70,39 @@ class RoutedExperts(nn.Module):
             anchor = self.gate_up.flatten()[0] + self.down.flatten()[0]
             output = x.new_empty((0, self.hidden_size)) + anchor.to(x.dtype) * 0
         else:
-            gate_up = _grouped_mm(
-                x,
-                self.gate_up.reshape(
-                    self.num_experts, 2 * self.intermediate, self.hidden_size
-                ),
-                counts,
+            gate_up_weight = self.gate_up.reshape(
+                self.num_experts, 2 * self.intermediate, self.hidden_size
             )
+            if x.is_cuda:
+                offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
+                gate_up = torch._grouped_mm(
+                    x, gate_up_weight.transpose(-2, -1), offs=offsets
+                )
+            else:
+                sizes = counts.tolist()
+                gate_up = torch.cat(
+                    [
+                        F.linear(tokens, weight)
+                        for tokens, weight in zip(
+                            torch.split(x, sizes), gate_up_weight
+                        )
+                        if tokens.shape[0] > 0
+                    ]
+                )
             gate, up = gate_up.reshape(-1, self.intermediate, 2).unbind(-1)
             hidden = clamped_swiglu(gate, up, weights, self.limit)
-            output = _grouped_mm(hidden, self.down, counts)
+            if x.is_cuda:
+                output = torch._grouped_mm(
+                    hidden, self.down.transpose(-2, -1), offs=offsets
+                )
+            else:
+                output = torch.cat(
+                    [
+                        F.linear(tokens, weight)
+                        for tokens, weight in zip(torch.split(hidden, sizes), self.down)
+                        if tokens.shape[0] > 0
+                    ]
+                )
         return self.dispatcher.combine(output, metadata)
 
 

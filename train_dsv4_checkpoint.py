@@ -22,6 +22,9 @@ from dsv41_train.models.dsv4.parallel import (
 from dsv41_train.runtime import Runtime, distributed_mean, initialize_runtime, local_tensor
 
 
+_IN_BACKWARD_SCALE = 2.0**-16
+
+
 def distributed_trace(runtime: Runtime, event: str) -> None:
     if os.environ.get("DSV41_DISTRIBUTED_TRACE"):
         print(json.dumps({"trace": event, "rank": runtime.rank}), flush=True)
@@ -55,7 +58,8 @@ def install_sgd_in_backward(
             if value.grad is not None:
                 with torch.no_grad():
                     value.to_local().add_(
-                        value.grad.to_local(), alpha=-learning_rate / divisor
+                        value.grad.to_local(),
+                        alpha=-learning_rate / divisor,
                     )
                 value.grad = None
 
@@ -165,18 +169,26 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
     sharded_at = time.perf_counter()
     tracked = model.model.layers[0].attention_hc.fn
     before = local_tensor(tracked).detach().float().clone()
+    # FP32 masters do not fit on 16x L20A. Scale BF16 backward by an exact
+    # power of two, then cancel it once for both parameter update paths.
+    backward_scale = _IN_BACKWARD_SCALE if args.optimizer_in_backward else 1.0
+    effective_learning_rate = args.learning_rate / backward_scale
     stepped = (
-        install_sgd_in_backward(model, args.learning_rate, args.cp_size)
+        install_sgd_in_backward(model, effective_learning_rate, args.cp_size)
         if args.optimizer_in_backward
         else set()
     )
-    optimizer_parameters = [parameter for parameter in model.parameters() if id(parameter) not in stepped]
+    optimizer_parameters = [
+        parameter for parameter in model.parameters() if id(parameter) not in stepped
+    ]
     if args.optimizer == "adamw":
         optimizer: torch.optim.Optimizer = torch.optim.AdamW(
-            optimizer_parameters, lr=args.learning_rate, foreach=False
+            optimizer_parameters, lr=effective_learning_rate, foreach=False
         )
     else:
-        optimizer = torch.optim.SGD(optimizer_parameters, lr=args.learning_rate, foreach=False)
+        optimizer = torch.optim.SGD(
+            optimizer_parameters, lr=effective_learning_rate, foreach=False
+        )
 
     generator = torch.Generator(device=runtime.device)
     generator.manual_seed(args.seed + runtime.rank // args.cp_size)
@@ -197,7 +209,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         output = model(input_ids, labels=input_ids, sequence_ids=sequence_ids)
         if output.loss is None or not torch.isfinite(output.loss):
             raise RuntimeError("training produced a non-finite loss")
-        output.loss.backward()
+        (output.loss * backward_scale).backward()
         synchronize_cp_gradients(model, context_parallel)
         optimizer.step()
         distributed_trace(runtime, "optimizer_step_complete")
@@ -218,6 +230,8 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
     distributed_trace(runtime, "parameter_delta_local_complete")
     dist.all_reduce(parameter_delta, op=dist.ReduceOp.MAX)
     distributed_trace(runtime, "parameter_delta_reduced")
+    if not torch.isfinite(parameter_delta):
+        raise RuntimeError("optimizer step produced a non-finite parameter update")
     if parameter_delta.item() == 0:
         raise RuntimeError("optimizer step did not update the tracked parameter")
 
