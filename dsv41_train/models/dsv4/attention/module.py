@@ -275,7 +275,7 @@ class SparseIndexer(nn.Module):
             if latent is not None:
                 keys = self.k_norm(self.k_proj(latent))
                 cos, sin = self.rotary(keys, group_positions, compressed=True)
-                shadow.index_keys = apply_rope(keys, cos, sin).unsqueeze(1)
+                shadow.index_keys = apply_rope(keys, cos, sin).unsqueeze(1).clone()
 
         index_keys = shadow.index_keys
         if index_keys is None:
@@ -439,7 +439,7 @@ class CSA2Attention(nn.Module):
                 )
                 shadow.compressed_kv = apply_rope(
                     latent, latent_cos, latent_sin
-                ).unsqueeze(1)
+                ).unsqueeze(1).clone()
 
             compressed_kv = shadow.compressed_kv
             topk_indices = shadow.topk_indices
