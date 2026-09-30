@@ -121,8 +121,9 @@ The same six-layer Triton model with activation checkpointing enabled matched
 the non-checkpointed loss exactly; its parameter-gradient relative L2 error was
 `3.03e-8`.
 
-The complete L20A unit suite passes 48 tests; two optional `safetensors` tests
-are skipped when that package is unavailable. Run the focused test with:
+The complete L20A unit suite runs 48 tests: 46 pass and two optional
+`safetensors` tests are skipped when that package is unavailable. Run the
+focused test with:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python3 -m unittest -v tests.test_triton_mhc
