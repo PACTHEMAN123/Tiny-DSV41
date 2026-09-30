@@ -11,6 +11,31 @@ from dsv41_train import runtime as training_runtime
 
 
 class TrainTest(unittest.TestCase):
+    def test_post_training_requires_the_complete_ced_backbone(self):
+        args = argparse.Namespace(
+            model_path=".",
+            steps=1,
+            batch_size=1,
+            num_layers=20,
+            seq_len=8,
+            start_layer=0,
+            learning_rate=1.0e-4,
+            cp_size=1,
+            ep_size=1,
+            sequence_packing=False,
+            optimizer_in_backward=False,
+            optimizer="sgd",
+            post_training=True,
+        )
+        with patch("pathlib.Path.is_dir", return_value=True), patch(
+            "pathlib.Path.is_file", return_value=True
+        ), patch(
+            "train_dsv4_checkpoint.DeepSeekV41Config.from_json",
+            return_value=type("Config", (), {"num_hidden_layers": 40})(),
+        ):
+            with self.assertRaisesRegex(ValueError, "complete CED backbone"):
+                train_dsv4_checkpoint.validate_args(args, world_size=1)
+
     def test_parameter_delta_handles_an_empty_fsdp_shard(self):
         before = torch.empty(0, 4)
         after = torch.empty(0, 4)

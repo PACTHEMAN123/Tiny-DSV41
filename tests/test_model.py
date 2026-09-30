@@ -9,7 +9,11 @@ from dsv41_train.models.dsv4.attention import (
     CSA2Mode,
     RotaryEmbedding,
 )
-from dsv41_train.cp import ContextParallel
+from dsv41_train.cp import (
+    ContextParallel,
+    bounded_replay_selection,
+    sequence_positions,
+)
 from dsv41_train.models.dsv4.model import NgramHash
 from dsv41_train.models.dsv4.moe import DispatchMetadata, RoutedExperts, TokenDispatcher
 from dsv41_train.models.dsv4.parallel import apply_fsdp2
@@ -17,6 +21,81 @@ from dsv41_train.parallel import ParallelMeshes
 
 
 class ModelTest(unittest.TestCase):
+    def test_bounded_replay_keeps_each_packed_sequence_tail(self):
+        input_ids = torch.arange(8).unsqueeze(0)
+        token_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        sequence_ids = torch.tensor([[0, 0, 0, 0, 0, 1, 1, 1]])
+        positions = sequence_positions(token_mask, sequence_ids)
+
+        selected = bounded_replay_selection(
+            input_ids,
+            token_mask,
+            sequence_ids,
+            positions,
+            window=2,
+            shard_size=8,
+        )
+
+        self.assertEqual(selected.source_indices.shape, (1, 8))
+        torch.testing.assert_close(
+            selected.source_indices[0, :4], torch.tensor([3, 4, 6, 7])
+        )
+        torch.testing.assert_close(
+            selected.positions[0, :4], torch.tensor([3, 4, 1, 2])
+        )
+        torch.testing.assert_close(
+            selected.sequence_ids[0, :4], torch.tensor([0, 0, 1, 1])
+        )
+        self.assertTrue(selected.token_mask[0, :4].all())
+        self.assertFalse(selected.token_mask[0, 4:].any())
+
+    def test_decoder_bounded_replay_limits_decoder_tokens_but_not_global_kv(self):
+        config = DeepSeekV41Config.tiny()
+        config.sliding_window = 2
+        model = DeepSeekV41ForCausalLM(config)
+        model.decoder_swa_bounded_replay_enable()
+        model.gradient_checkpointing_enable()
+        for layer in model.model.layers:
+            layer.attention.indexer = None
+
+        layer_lengths = []
+        hooks = [
+            layer.register_forward_pre_hook(
+                lambda _module, args, lengths=layer_lengths: lengths.append(
+                    args[0].shape[1]
+                )
+            )
+            for layer in model.model.layers
+        ]
+        compressor_lengths = []
+        compressor = model.model.layers[3].attention.compressor
+        assert compressor is not None
+        hooks.append(
+            compressor.register_forward_pre_hook(
+                lambda _module, args: compressor_lengths.append(args[0].shape[1])
+            )
+        )
+
+        input_ids = torch.randint(0, config.vocab_size, (1, 8))
+        output = model(input_ids, labels=input_ids)
+        for hook in hooks:
+            hook.remove()
+
+        self.assertEqual(layer_lengths, [8, 8, 8, 2, 2, 2])
+        self.assertEqual(compressor_lengths, [8])
+        self.assertTrue(torch.isfinite(output.loss))
+        output.loss.backward()
+        self.assertTrue(torch.isfinite(model.model.embedding.weight.grad).all())
+
+    def test_decoder_bounded_replay_requires_the_complete_backbone(self):
+        with torch.device("meta"):
+            model = DeepSeekV41ForCausalLM(
+                DeepSeekV41Config.tiny(), layer_ids=[3, 4, 5]
+            )
+
+        with self.assertRaisesRegex(ValueError, "complete backbone"):
+            model.decoder_swa_bounded_replay_enable()
+
     def test_attention_fallback_uses_window_indices(self):
         config = DeepSeekV41Config.tiny()
         attention = CSA2Attention(config, 0, RotaryEmbedding(config)).eval()

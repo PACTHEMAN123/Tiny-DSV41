@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from dsv41_train.models.dsv4 import load_dsv41_backbone_window
+from dsv41_train.models.dsv4 import DeepSeekV41Config, load_dsv41_backbone_window
 from dsv41_train.cp import pack_sequences
 from dsv41_train.models.dsv4.parallel import (
     apply_fsdp2_layer,
@@ -84,6 +84,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--optimizer-in-backward", action="store_true")
     parser.add_argument("--sequence-packing", action="store_true")
+    parser.add_argument(
+        "--post-training",
+        action="store_true",
+        help="train the full CED model with decoder SWA bounded replay enabled",
+    )
     return parser.parse_args()
 
 
@@ -115,6 +120,10 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
         raise ValueError("the checkpoint's 384 experts must divide evenly across ep-size")
     if args.optimizer_in_backward and args.optimizer != "sgd":
         raise ValueError("optimizer-in-backward requires SGD")
+    if args.post_training:
+        config = DeepSeekV41Config.from_json(model_path / "config.json")
+        if args.start_layer != 0 or args.num_layers != config.num_hidden_layers:
+            raise ValueError("post-training requires the complete CED backbone")
 
 
 def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int | str]:
@@ -141,6 +150,10 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
     )
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
+    if args.post_training:
+        model.decoder_swa_bounded_replay_enable()
+        if not model.model.decoder_swa_bounded_replay:
+            raise RuntimeError("post-training did not enable decoder SWA bounded replay")
     model.train()
     loaded_at = time.perf_counter()
 
@@ -262,6 +275,11 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         "batch_size_per_rank": args.batch_size,
         "sequence_length": args.seq_len,
         "start_layer": args.start_layer,
+        "post_training": args.post_training,
+        "decoder_swa_bounded_replay": model.model.decoder_swa_bounded_replay,
+        "decoder_replay_window": (
+            model.config.sliding_window if model.model.decoder_swa_bounded_replay else 0
+        ),
         "optimizer": args.optimizer,
         "loss": last_loss,
         "aux_loss": last_aux_loss,

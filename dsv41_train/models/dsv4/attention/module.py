@@ -387,6 +387,8 @@ class CSA2Attention(nn.Module):
         x: torch.Tensor,
         context: ModelContext,
         shadow: ShadowIndexers,
+        source_x: torch.Tensor | None = None,
+        source_context: ModelContext | None = None,
     ) -> torch.Tensor:
         batch, length, _ = x.shape
         compressed = self.ratio > 0
@@ -404,12 +406,14 @@ class CSA2Attention(nn.Module):
             latent = None
             group_positions = context.positions[:, :0]
             if self.compressor is not None:
-                full_x = context.gather(x)
+                compressor_x = x if source_x is None else source_x
+                compressor_context = context if source_context is None else source_context
+                full_x = compressor_context.gather(compressor_x)
                 latent, group_positions, group_sequence_ids, _ = self.compressor(
                     full_x,
-                    context.gather(context.positions),
-                    context.gather(context.token_mask),
-                    context.gather(context.sequence_ids),
+                    compressor_context.gather(compressor_context.positions),
+                    compressor_context.gather(compressor_context.token_mask),
+                    compressor_context.gather(compressor_context.sequence_ids),
                 )
                 shadow.compressed_sequence_ids = group_sequence_ids
                 shadow.compressed_kv = None

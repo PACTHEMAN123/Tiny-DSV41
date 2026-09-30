@@ -148,6 +148,42 @@ class ContextParallel:
         dist.all_gather(parts, tensor, group=self.group)
         return torch.cat(parts, dim=dim)
 
+    def redistribute_selected(
+        self,
+        tensor: torch.Tensor,
+        source_indices: torch.Tensor,
+        token_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select global source tokens and shard the compacted result over CP."""
+
+        if tensor.ndim < 2 or source_indices.ndim != 2:
+            raise ValueError(
+                "selected CP tensors must include batch and sequence dimensions"
+            )
+        if (
+            tensor.shape[0] != source_indices.shape[0]
+            or token_mask.shape != source_indices.shape
+        ):
+            raise ValueError("selected token metadata must match the tensor batch dimension")
+
+        local_length = tensor.shape[1]
+        start = self.rank * local_length
+        local_indices = (source_indices - start).clamp(0, max(local_length - 1, 0))
+        gather_indices = local_indices.view(
+            *local_indices.shape, *([1] * (tensor.ndim - 2))
+        ).expand(*local_indices.shape, *tensor.shape[2:])
+        selected = tensor.gather(1, gather_indices)
+        owned = (
+            token_mask
+            & source_indices.ge(start)
+            & source_indices.lt(start + local_length)
+        )
+        selected = selected.masked_fill(
+            ~owned.view(*owned.shape, *([1] * (tensor.ndim - 2))), 0
+        )
+        selected = self.sum(selected, autograd=tensor.requires_grad)
+        return self.shard(selected)
+
     def left_halo(
         self, tensor: torch.Tensor, length: int, dim: int = 1
     ) -> torch.Tensor:
@@ -202,15 +238,15 @@ class ModelContext:
         token_mask: torch.Tensor,
         sequence_ids: torch.Tensor,
         window: int,
+        positions: torch.Tensor | None = None,
     ) -> "ModelContext":
         length = input_ids.shape[1]
         indices = torch.arange(length, device=input_ids.device).expand_as(input_ids)
-        starts = token_mask & (
-            sequence_ids != F.pad(sequence_ids[:, :-1], (1, 0), value=-1)
-        )
-        positions = (
-            indices - torch.where(starts, indices, 0).cummax(-1).values
-        ).masked_fill(~token_mask, 0)
+        if positions is None:
+            positions = sequence_positions(token_mask, sequence_ids)
+        elif positions.shape != input_ids.shape:
+            raise ValueError("positions must have the same shape as input_ids")
+        positions = positions.masked_fill(~token_mask, 0)
         local_indices = parallel.shard(indices)
         global_key_indices = local_indices.unsqueeze(-1) - torch.arange(
             window - 1, -1, -1, device=input_ids.device
@@ -262,6 +298,93 @@ class ModelContext:
         return self.parallel.gather(tensor, dim)
 
 
+@dataclass(frozen=True)
+class ReplaySelection:
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    token_mask: torch.Tensor
+    sequence_ids: torch.Tensor
+    source_indices: torch.Tensor
+
+
+def sequence_positions(
+    token_mask: torch.Tensor, sequence_ids: torch.Tensor
+) -> torch.Tensor:
+    """Return zero-based positions for each contiguous packed sequence."""
+
+    if token_mask.shape != sequence_ids.shape:
+        raise ValueError("token mask and sequence IDs must have matching shapes")
+    length = token_mask.shape[1]
+    indices = torch.arange(length, device=token_mask.device).expand_as(sequence_ids)
+    starts = token_mask & (
+        sequence_ids != F.pad(sequence_ids[:, :-1], (1, 0), value=-1)
+    )
+    return (
+        indices - torch.where(starts, indices, 0).cummax(-1).values
+    ).masked_fill(~token_mask, 0)
+
+
+def bounded_replay_selection(
+    input_ids: torch.Tensor,
+    token_mask: torch.Tensor,
+    sequence_ids: torch.Tensor,
+    positions: torch.Tensor,
+    window: int,
+    shard_size: int = 1,
+) -> ReplaySelection:
+    """Pack the last replay window of every sequence while preserving positions."""
+
+    if window < 1 or shard_size < 1:
+        raise ValueError("replay window and shard size must be positive")
+    if not (
+        input_ids.shape
+        == token_mask.shape
+        == sequence_ids.shape
+        == positions.shape
+    ):
+        raise ValueError("replay inputs must have matching batch and sequence shapes")
+
+    length = input_ids.shape[1]
+    reverse_ids = sequence_ids.flip(1)
+    reverse_mask = token_mask.flip(1)
+    reverse_indices = torch.arange(length, device=input_ids.device).expand_as(input_ids)
+    reverse_starts = reverse_mask & (
+        reverse_ids != F.pad(reverse_ids[:, :-1], (1, 0), value=-1)
+    )
+    reverse_positions = (
+        reverse_indices
+        - torch.where(reverse_starts, reverse_indices, 0).cummax(-1).values
+    ).masked_fill(~reverse_mask, 0)
+    replay_mask = token_mask & reverse_positions.flip(1).lt(window)
+
+    counts = replay_mask.sum(-1)
+    max_count = max(int(counts.max().item()), 1)
+    padded_count = ((max_count + shard_size - 1) // shard_size) * shard_size
+    source_indices = torch.zeros(
+        input_ids.shape[0], padded_count, device=input_ids.device, dtype=torch.long
+    )
+    rows, columns = replay_mask.nonzero(as_tuple=True)
+    destinations = replay_mask.long().cumsum(-1)[rows, columns] - 1
+    source_indices[rows, destinations] = columns
+    compact_mask = (
+        torch.arange(padded_count, device=input_ids.device).unsqueeze(0)
+        < counts.unsqueeze(1)
+    )
+
+    selected_ids = input_ids.gather(1, source_indices).masked_fill(~compact_mask, 0)
+    selected_positions = positions.gather(1, source_indices).masked_fill(~compact_mask, 0)
+    selected_sequences = sequence_ids.gather(1, source_indices).masked_fill(
+        ~compact_mask, -1
+    )
+    return ReplaySelection(
+        selected_ids,
+        selected_positions,
+        compact_mask,
+        selected_sequences,
+        source_indices,
+    )
+
+
 def pack_sequences(input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Flatten a batch and preserve its original sequence boundaries."""
 
@@ -270,4 +393,11 @@ def pack_sequences(input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     return input_ids.reshape(1, -1), sequence_ids.reshape(1, -1)
 
 
-__all__ = ["ContextParallel", "ModelContext", "pack_sequences"]
+__all__ = [
+    "ContextParallel",
+    "ModelContext",
+    "ReplaySelection",
+    "bounded_replay_selection",
+    "pack_sequences",
+    "sequence_positions",
+]
