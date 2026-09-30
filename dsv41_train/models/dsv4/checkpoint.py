@@ -13,12 +13,12 @@ import torch
 
 from .moe import TokenDispatcher
 from ...cp import ContextParallel
+from .attention import RotaryEmbedding
 from .config import DeepSeekV41Config
 from .model import (
     DecoderLayer,
     DeepSeekV41ForCausalLM,
     NgramHash,
-    RotaryEmbedding,
     build_compressed_token_map,
 )
 

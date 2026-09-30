@@ -10,8 +10,8 @@ from torch import nn
 from ...cp import ContextParallel
 from ...parallel import ParallelMeshes
 from ...runtime import local_tensor
+from .attention import AttentionSinks
 from .model import (
-    AttentionSinks,
     DecoderLayer,
     DeepSeekV41ForCausalLM,
     DeepSeekV41Model,

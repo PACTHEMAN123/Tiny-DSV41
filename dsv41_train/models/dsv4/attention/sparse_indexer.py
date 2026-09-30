@@ -21,6 +21,7 @@ if triton is not None:
         weights,
         key_starts,
         key_ends,
+        candidates,
         output,
         sequence_length: tl.constexpr,
         key_length: tl.constexpr,
@@ -29,6 +30,7 @@ if triton is not None:
         output_width: tl.constexpr,
         scale: tl.constexpr,
         block_keys: tl.constexpr,
+        has_candidates: tl.constexpr,
     ):
         row = tl.program_id(0)
         key_block = tl.program_id(1)
@@ -42,6 +44,12 @@ if triton is not None:
         end = tl.load(key_ends + row)
         key_indices = start + key_offsets
         valid = (key_offsets < output_width) & (key_indices < end)
+        if has_candidates:
+            valid &= tl.load(
+                candidates + row * output_width + key_offsets,
+                mask=key_offsets < output_width,
+                other=0,
+            ).to(tl.int1)
 
         query_base = ((batch * sequence_length + sequence) * heads) * head_dim
         query_tile = tl.load(
@@ -77,6 +85,7 @@ def fused_index_scores(
     key_starts: torch.Tensor,
     key_ends: torch.Tensor,
     output_width: int,
+    candidates: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fuse QK, ReLU, head weighting, and head reduction without a head score tensor."""
 
@@ -98,12 +107,23 @@ def fused_index_scores(
         raise ValueError("fused indexer heads and head dimension must be multiples of 16")
     if output_width <= 0:
         return query.new_empty((batch, sequence_length, 0), dtype=torch.float32)
+    if candidates is not None and candidates.shape != (
+        batch,
+        sequence_length,
+        output_width,
+    ):
+        raise ValueError("candidate mask must match the fused score output")
 
     query = query.contiguous()
     keys = keys.contiguous()
     weights = weights.float().contiguous()
     starts = key_starts.to(torch.int32).contiguous()
     ends = key_ends.to(torch.int32).contiguous()
+    candidate_mask = (
+        torch.empty(0, device=query.device, dtype=torch.bool)
+        if candidates is None
+        else candidates.bool().contiguous()
+    )
     output = torch.empty(
         (batch, sequence_length, output_width),
         device=query.device,
@@ -117,6 +137,7 @@ def fused_index_scores(
         weights,
         starts,
         ends,
+        candidate_mask,
         output,
         sequence_length=sequence_length,
         key_length=keys.shape[1],
@@ -125,6 +146,7 @@ def fused_index_scores(
         output_width=output_width,
         scale=head_dim**-0.5,
         block_keys=block_keys,
+        has_candidates=candidates is not None,
         num_warps=4,
         num_stages=3,
     )

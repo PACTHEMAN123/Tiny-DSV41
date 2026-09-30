@@ -15,7 +15,7 @@ from dsv41_train.models.dsv4.checkpoint import (
     dequantize_fp8_blocks,
     dequantize_fp8_rows,
 )
-from dsv41_train.models.dsv4.model import RotaryEmbedding
+from dsv41_train.models.dsv4.attention import RotaryEmbedding
 
 
 def write_safetensors(path: Path, tensors: dict[str, torch.Tensor]) -> None:

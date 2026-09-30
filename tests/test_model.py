@@ -4,6 +4,11 @@ from unittest.mock import Mock, call, patch
 import torch
 
 from dsv41_train.models.dsv4 import DeepSeekV41Config, DeepSeekV41ForCausalLM
+from dsv41_train.models.dsv4.attention import (
+    CSA2Attention,
+    CSA2Mode,
+    RotaryEmbedding,
+)
 from dsv41_train.cp import ContextParallel
 from dsv41_train.models.dsv4.model import NgramHash
 from dsv41_train.models.dsv4.moe import DispatchMetadata, RoutedExperts, TokenDispatcher
@@ -12,6 +17,45 @@ from dsv41_train.parallel import ParallelMeshes
 
 
 class ModelTest(unittest.TestCase):
+    def test_attention_fallback_uses_window_indices(self):
+        config = DeepSeekV41Config.tiny()
+        attention = CSA2Attention(config, 0, RotaryEmbedding(config)).eval()
+        query = torch.randn(1, config.num_attention_heads, 2, config.head_dim)
+        kv = torch.randn(1, 4, config.head_dim)
+        indices = torch.tensor([[[3, 1], [2, 0]]])
+        mask = torch.ones(1, 1, 2, 2, dtype=torch.bool)
+
+        actual = attention._attend(query, kv, indices, mask, None, None)
+
+        selected = kv[torch.arange(1).view(-1, 1, 1), indices]
+        logits = torch.einsum("bhld,blwd->bhlw", query, selected)
+        logits = logits * config.head_dim**-0.5
+        sink = torch.zeros(1, config.num_attention_heads, 2, 1)
+        probabilities = torch.softmax(
+            torch.cat((logits, sink), dim=-1), dim=-1
+        )[..., :-1]
+        expected = torch.einsum(
+            "bhlw,blwd->bhld", probabilities, selected
+        ).transpose(1, 2)
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_csa2_modes_follow_layer_reuse_boundaries(self):
+        with torch.device("meta"):
+            model = DeepSeekV41ForCausalLM(DeepSeekV41Config.tiny())
+
+        self.assertEqual(
+            [layer.attention.mode for layer in model.model.layers],
+            [
+                None,
+                CSA2Mode.FULL,
+                CSA2Mode.REUSE,
+                CSA2Mode.FULL,
+                CSA2Mode.REINDEX,
+                CSA2Mode.REUSE,
+            ],
+        )
+
     def test_empty_expert_route_does_not_allocate_gradients(self):
         class EmptyReceiveDispatcher(TokenDispatcher):
             def dispatch(self, hidden, expert_ids, weights):
