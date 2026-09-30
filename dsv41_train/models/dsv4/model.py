@@ -428,7 +428,7 @@ class DecoderLayer(nn.Module):
         source_streams: torch.Tensor | None = None,
         source_pre_mix: torch.Tensor | None = None,
         source_context: ModelContext | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
         if self.engram is not None:
             streams = self.engram(streams, engram_rows, context.token_mask)
 
@@ -454,7 +454,12 @@ class DecoderLayer(nn.Module):
         collapsed = self.collapse(streams, next_pre)
         value, router_logits = self.moe(self.post_attention_norm(collapsed))
         streams = self.expand(value, residual, post, combine)
-        return streams, final_pre, router_logits
+        return (
+            streams,
+            final_pre,
+            router_logits,
+            *shadow.dump(streams.new_empty(0)),
+        )
 
 
 @dataclass
@@ -662,7 +667,7 @@ class DeepSeekV41Model(nn.Module):
         *shadow_tensors: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         shadow = ShadowIndexers.load(shadow_tensors)
-        streams, pre_mix, logits = layer(
+        return layer(
             streams,
             pre_mix,
             context,
@@ -672,7 +677,6 @@ class DeepSeekV41Model(nn.Module):
             None if source_pre_mix.numel() == 0 else source_pre_mix,
             source_context,
         )
-        return streams, pre_mix, logits, *shadow.dump(streams.new_empty(0))
 
 
 def load_balancing_loss(
