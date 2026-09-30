@@ -30,6 +30,9 @@ from .attention import (
     ShadowIndexers,
 )
 from .config import DeepSeekV41Config
+from .mhc import collapse as mhc_collapse
+from .mhc import expand as mhc_expand
+from .mhc import mixing_weights
 from ...cp import ContextParallel, ModelContext
 from .moe import RoutedExperts, SparseMoE, TokenDispatcher, TopKRouter
 
@@ -59,19 +62,15 @@ class HyperConnection(nn.Module):
         flat = streams.flatten(2).float()
         flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
         hc = self.hc_mult
-        pre, post, comb = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
-        pre_bias, post_bias, comb_bias = self.base.float().split([hc, hc, hc * hc])
-        pre_scale, post_scale, comb_scale = self.scale.float()
-
-        pre = torch.sigmoid(pre * pre_scale + pre_bias) + self.eps
-        post = 2 * torch.sigmoid(post * post_scale + post_bias)
-        comb = comb.view(*comb.shape[:-1], hc, hc) * comb_scale + comb_bias.view(hc, hc)
-        comb = torch.softmax(comb, dim=-1) + self.eps
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.eps)
-        for _ in range(self.sinkhorn_iters - 1):
-            comb = comb / (comb.sum(dim=-1, keepdim=True) + self.eps)
-            comb = comb / (comb.sum(dim=-2, keepdim=True) + self.eps)
-        return pre, post, comb
+        projected = F.linear(flat, self.fn.float())
+        return mixing_weights(
+            projected,
+            self.base,
+            self.scale,
+            hc,
+            self.sinkhorn_iters,
+            self.eps,
+        )
 
 
 class _ScaleGradient(torch.autograd.Function):
@@ -389,7 +388,7 @@ class DecoderLayer(nn.Module):
 
     @staticmethod
     def collapse(streams: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        return (weights.unsqueeze(-1) * streams.float()).sum(2).to(streams.dtype)
+        return mhc_collapse(streams, weights)
 
     @staticmethod
     def expand(
@@ -398,8 +397,7 @@ class DecoderLayer(nn.Module):
         output_weights: torch.Tensor,
         residual_weights: torch.Tensor,
     ) -> torch.Tensor:
-        mixed = torch.einsum("bsjk,bsjd->bskd", residual_weights.float(), residual.float())
-        return (output_weights.unsqueeze(-1) * value.float().unsqueeze(-2) + mixed).to(residual.dtype)
+        return mhc_expand(value, residual, output_weights, residual_weights)
 
     def forward(
         self,
