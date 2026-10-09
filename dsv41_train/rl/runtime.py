@@ -17,23 +17,26 @@ from .checkpoint import (load_policy, load_training_checkpoint, publish_policy,
 from .config import RLConfig
 from .data import build_reward, load_jsonl
 from .policy import DSV41Config, build_dsv41_policy
+from .parallel import layer_device_map, validate_available_devices
 from .rollout import generate_group
 
 
-def make_model(model_dir, model_config, config, devices, random_init):
+def make_model(model_dir, model_config, config, devices, random_init, *, engram_weights=None):
     torch.manual_seed(config.seed)
     return build_dsv41_policy(model_dir, model_config, random_init=random_init,
-                              devices=devices, dtype=getattr(torch, config.dtype))
+                              devices=devices, dtype=getattr(torch, config.dtype),
+                              engram_weights=engram_weights, engram_offload=config.engram_offload)
 
 
 def _rollout_worker(model_dir, model_config, config, data_path, random_init,
                     snapshot_path, published_version, output, errors, stop,
-                    next_group_id, rng_state):
+                    next_group_id, rng_state, engram_weights):
     # Only plain Python data crosses this queue; CUDA tensors never enter IPC.
     output.cancel_join_thread()
     try:
         torch.set_num_threads(config.num_threads)
-        model = make_model(model_dir, model_config, config, config.rollout_devices, random_init)
+        model = make_model(model_dir, model_config, config, config.rollout_devices, random_init,
+                           engram_weights=engram_weights)
         model.eval()
         records = load_jsonl(data_path)
         reward_fn = build_reward(config.reward)
@@ -61,6 +64,7 @@ def _rollout_worker(model_dir, model_config, config, data_path, random_init,
                 "started_at": started_at,
                 "finished_at": time.monotonic(),
                 "worker_pid": os.getpid(),
+                "engram_shared": model.engram_shared,
             }
             while not stop.is_set():
                 try:
@@ -148,6 +152,9 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
     torch.set_num_threads(config.num_threads)
     model_dir, data_path = str(Path(model_dir).resolve()), str(Path(data_path).resolve())
     model_config = DSV41Config.from_model_dir(model_dir)
+    for devices in (config.learner_devices, config.rollout_devices):
+        layer_device_map(model_config.num_hidden_layers, devices)
+        validate_available_devices(devices)
     # A missing full checkpoint must never silently become a giant random policy.
     if random_init:
         model_config.validate_random_init()
@@ -169,9 +176,11 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
     channels = []
     try:
         model = make_model(model_dir, model_config, config, config.learner_devices, random_init)
+        engram_weights = model.share_engram_memory()
         reference = None
         if config.kl_beta:
-            reference = make_model(model_dir, model_config, config, config.learner_devices, random_init)
+            reference = make_model(model_dir, model_config, config, config.learner_devices, random_init,
+                                   engram_weights=engram_weights)
             reference.eval().requires_grad_(False)
         optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
                                       lr=config.learning_rate, weight_decay=config.weight_decay,
@@ -200,12 +209,16 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
             target=_rollout_worker,
             args=(model_dir, model_config, config, data_path, random_init,
                   str(snapshot_path), published_version, output, errors, stop,
-                  next_group_id, rng_state),
+                  next_group_id, rng_state, engram_weights),
             name="dsv41-rollout",
         )
         worker.start()
         print(json.dumps({"event": "started", "learner_pid": os.getpid(), "rollout_pid": worker.pid,
                           "engram_device": model.engram_device,
+                          "engram_offload": config.engram_offload,
+                          "engram_shared": model.engram_shared,
+                          "engram_bytes": sum(value.numel() * value.element_size() for value in engram_weights.values()),
+                          "trainer_devices": config.learner_devices, "rollout_devices": config.rollout_devices,
                           "policy_version": step}), flush=True)
         previous_train_interval = None
         while step < config.max_steps:
@@ -248,6 +261,8 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
                            dropped_groups=dropped, next_group_id=next_group_id,
                            rollout_versions=[group.policy_version for group in groups],
                            engram_device=model.engram_device,
+                           engram_shared=model.engram_shared,
+                           rollout_engram_shared=all(packet["engram_shared"] for packet in packets),
                            train_seconds=train_end - train_start,
                            overlap_previous_train_seconds=overlap)
             line = json.dumps(metrics, sort_keys=True, allow_nan=False)

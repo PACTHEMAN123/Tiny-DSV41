@@ -79,9 +79,50 @@ python3 -m dsv41_train.rl.sample \
   --prompt-ids '[1,4,7]' --max-new-tokens 6
 ```
 
-`examples/rl/cuda.json` places the learner on `cuda:0` and rollout on `cuda:1`
-with BF16. Each process currently needs its full backbone on one device. A
-nonzero `kl_beta` also keeps a fixed base reference model on the learner device.
+`examples/rl/cuda.json` defaults to one trainer GPU and one rollout GPU with
+BF16. Set their counts independently in JSON (`trainer_num_gpus`,
+`rollout_num_gpus`) or override both counts on the command line:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+python3 -m dsv41_train.rl.train \
+  --model-dir examples/rl/tiny-dsv41 \
+  --data examples/rl/prompts.jsonl --config examples/rl/cuda.json \
+  --trainer-num-gpus 4 --rollout-num-gpus 2 --allow-random-init
+```
+
+Counts allocate visible CUDA indices consecutively: trainer gets `cuda:0..3`
+and rollout gets `cuda:4..5` in this example. Zero selects CPU. Alternatively,
+specify explicit `learner_devices` (the trainer) and `rollout_devices` lists in
+JSON instead of counts, for example `["cuda:3", "cuda:1"]` and `["cuda:0"]`.
+Indices are relative to `CUDA_VISIBLE_DEVICES`. Each policy uses one process
+and splits contiguous decoder layers over its GPUs; embeddings are on the first
+device and the final norm/LM head on the last. Residual streams, shared KV,
+sparse indices and position metadata cross device boundaries with autograd
+preserved. A policy cannot use more GPUs than decoder layers. This is sequential
+layer model parallelism, with no microbatch pipeline scheduling or tensor/data
+parallelism. Each layer and its optimizer state must fit on its assigned GPU.
+A nonzero `kl_beta` places a separate fixed reference backbone on the trainer's
+GPUs. Sampling also accepts `--devices cuda:0,cuda:1`.
+
+Engram tables are frozen and CPU-offloaded by default (`engram_offload: true`).
+The trainer exports its tables into PyTorch shared memory before starting
+rollout. Trainer, rollout and reference use the same physical CPU table storage;
+pretrained consumers inject the shared tensors and skip reading table weights
+again. Their trainable backbone weights remain independent. Only lookup results
+cross to each layer's GPU, and table tensors never enter optimizer states or
+weight-update snapshots. Startup logs report `engram_bytes` and
+`engram_shared`; training metrics also report `rollout_engram_shared`.
+
+Sharing requires processes on the same host. On Linux, provision `/dev/shm`
+for at least the complete table size plus runtime overhead (containers often
+need an explicit shared-memory limit). Other model weights still need host
+memory during loading. `--no-engram-offload` (or `engram_offload: false`) keeps
+frozen copies on the GPUs owning the respective Engram layers, with a shared
+CPU base retained for initialization. Offload mode never enables table training;
+the Engram projection layers continue to train. For reproducible tiny smoke
+initialization, each process still performs the bounded random initialization
+before replacing its temporary tables with the shared ones.
 
 For pretrained training, replace `--model-dir` with a checkpoint directory,
 provide tokenized task data and a task reward in the RL config, and omit
@@ -118,7 +159,7 @@ The runtime and synchronization rules are:
   publishes the version. Rollout checks for newer weights between groups and
   may skip intermediate versions. Groups older than `max_policy_lag` are
   discarded whole. `max_policy_lag: 0` accepts only the current version.
-- Engram embedding tables and hash metadata stay on CPU. Tables are frozen
+- By default, Engram embedding tables and hash metadata stay on CPU. Tables are frozen
   buffers excluded from AdamW and policy/training snapshots; only selected rows
   move to the model device. Engram projections remain trainable. Sparse indexers
   are frozen because their discrete selection has no GRPO gradient. A portable
@@ -132,9 +173,10 @@ The runtime and synchronization rules are:
 This is a correctness-first MVP: no KV cache, batched generation, distributed
 FSDP/EP/CP integration, multi-worker rollout or incremental weight transport.
 BF16 prefix and teacher-forced GEMMs can differ slightly by sequence shape.
-CPU tests cover optimization, loading, frozen tables, synchronization and
-train/resume/sample; GPU and full released-checkpoint runs require separate
-validation on suitable hardware.
+CPU tests cover optimization, loading, storage shared across spawned processes,
+frozen tables, synchronization and train/resume/sample. Two-GPU tests compare
+logits/gradients and table placement when hardware is available; GPU and full
+released-checkpoint runs require validation on suitable hardware.
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_rl_*.py' -v

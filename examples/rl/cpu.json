@@ -10,6 +10,7 @@
   "queue_capacity": 2,
   "learner_devices": ["cpu"],
   "rollout_devices": ["cpu"],
+  "engram_offload": true,
   "dtype": "float32",
   "reward": "toy_token_score",
   "output_dir": "runs/tiny_dsv41_cpu"

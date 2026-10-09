@@ -8,8 +8,9 @@
   "kl_beta": 0.02,
   "max_policy_lag": 2,
   "queue_capacity": 2,
-  "learner_devices": ["cuda:0"],
-  "rollout_devices": ["cuda:1"],
+  "trainer_num_gpus": 1,
+  "rollout_num_gpus": 1,
+  "engram_offload": true,
   "dtype": "bfloat16",
   "reward": "toy_token_score",
   "output_dir": "runs/tiny_dsv41_cuda"

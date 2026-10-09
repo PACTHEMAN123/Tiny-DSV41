@@ -23,6 +23,7 @@ class RLConfig:
     reward: str = "token_accuracy"
     learner_devices: tuple[str, ...] = ("cpu",)
     rollout_devices: tuple[str, ...] = ("cpu",)
+    engram_offload: bool = True
     dtype: str = "float32"
     seed: int = 42
     num_threads: int = 1
@@ -33,6 +34,17 @@ class RLConfig:
     @classmethod
     def from_dict(cls, values: dict) -> "RLConfig":
         values = dict(values)
+        counts = ("trainer_num_gpus", "rollout_num_gpus")
+        if any(name in values for name in counts):
+            if not all(name in values for name in counts):
+                raise ValueError("specify both trainer_num_gpus and rollout_num_gpus")
+            if any(name in values for name in ("learner_devices", "rollout_devices")):
+                raise ValueError("specify GPU counts or explicit device lists, not both")
+            trainer, rollout = (values.pop(name) for name in counts)
+            if any(type(count) is not int or count < 0 for count in (trainer, rollout)):
+                raise ValueError("GPU counts must be nonnegative integers; zero selects CPU")
+            values["learner_devices"] = tuple(f"cuda:{i}" for i in range(trainer)) or ("cpu",)
+            values["rollout_devices"] = tuple(f"cuda:{i}" for i in range(trainer, trainer + rollout)) or ("cpu",)
         for name in ("learner_devices", "rollout_devices"):
             if name in values:
                 values[name] = tuple(values[name])
@@ -73,11 +85,13 @@ class RLConfig:
             raise ValueError("dtype must be float32 or bfloat16")
         if not self.reward or not self.output_dir:
             raise ValueError("reward and output_dir must not be empty")
+        if type(self.engram_offload) is not bool:
+            raise ValueError("engram_offload must be a boolean")
         for devices in (self.learner_devices, self.rollout_devices):
-            if len(devices) != 1:
-                raise ValueError("RL requires exactly one device per policy process")
+            if not devices or len(set(devices)) != len(devices):
+                raise ValueError("device lists must be nonempty with no duplicates")
             if devices == ("cpu",):
                 continue
             if any(not isinstance(d, str) or not d.startswith("cuda:") or not d[5:].isdigit()
                    for d in devices):
-                raise ValueError("use ['cpu'] or one explicit CUDA device such as ['cuda:0']")
+                raise ValueError("use ['cpu'] or explicit CUDA devices such as ['cuda:0', 'cuda:1']")

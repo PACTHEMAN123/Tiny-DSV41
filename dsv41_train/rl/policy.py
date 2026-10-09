@@ -18,6 +18,7 @@ from dsv41_train.models.dsv4.mhc import HyperConnection
 from dsv41_train.models.dsv4.model import DeepSeekV41ForCausalLM, NgramHash, build_compressed_token_map
 
 from .indexer import PortableSparseIndexer
+from .parallel import DeviceRotaryEmbedding, forward_logits, layer_device_map, validate_available_devices
 
 
 @dataclass
@@ -82,13 +83,16 @@ class _CPUHash(nn.Module):
                            None if sequence_ids is None else sequence_ids.cpu())
 
 
-class _CPUEmbedding(nn.Module):
-    def __init__(self, weight):
+class _FrozenEmbedding(nn.Module):
+    def __init__(self, weight, offload):
         super().__init__()
+        self.offload = offload
         self.register_buffer("weight", weight.detach().cpu())
         self.register_buffer("placement", torch.empty(0, dtype=weight.dtype), persistent=False)
 
     def _apply(self, fn, recurse=True):
+        if not self.offload:
+            return super()._apply(fn, recurse=recurse)
         weight = self._buffers.pop("weight")
         try:
             super()._apply(fn, recurse=recurse)
@@ -98,20 +102,26 @@ class _CPUEmbedding(nn.Module):
 
     @torch.no_grad()
     def forward(self, indices):
-        values = F.embedding(indices.to(device="cpu", dtype=torch.long), self.weight)
+        values = F.embedding(indices.to(device=self.weight.device, dtype=torch.long), self.weight)
         return values.to(device=self.placement.device, dtype=self.placement.dtype)
 
 
 class DSV41Policy(nn.Module):
-    def __init__(self, backend):
+    def __init__(self, backend, *, engram_offload=True):
         super().__init__()
         self.backend = backend
         self.config = backend.config
+        self.engram_offload = engram_offload
+        self.cpu_engram = {}
         for name, table in list(backend.model.engram_tables.items()):
-            backend.model.engram_tables[name] = _CPUEmbedding(table.weight)
+            frozen = _FrozenEmbedding(table.weight, engram_offload)
+            backend.model.engram_tables[name] = frozen
+            self.cpu_engram[name] = frozen.weight
         if backend.model.hash is not None:
             backend.model.hash = _CPUHash(backend.model.hash)
+        backend.model.rotary = DeviceRotaryEmbedding(backend.model.rotary)
         for layer in backend.model.layers:
+            layer.attention.rotary = backend.model.rotary
             if layer.attention.indexer is not None:
                 with torch.device("meta"):
                     indexer = PortableSparseIndexer(self.config, layer.layer_id, backend.model.rotary)
@@ -121,12 +131,26 @@ class DSV41Policy(nn.Module):
 
     @property
     def engram_device(self):
-        return "cpu" if self.backend.model.engram_tables else "none"
+        return ",".join(sorted({str(table.weight.device)
+                                for table in self.backend.model.engram_tables.values()})) or "none"
+
+    def share_engram_memory(self):
+        for weight in self.cpu_engram.values():
+            weight.share_memory_()
+        return self.cpu_engram
+
+    @property
+    def engram_shared(self):
+        tables = self.backend.model.engram_tables
+        return bool(tables) and all(table.weight.device.type == "cpu" and table.weight.is_shared()
+                                    for table in tables.values())
 
     def assert_engram_invariants(self):
         for table in self.backend.model.engram_tables.values():
-            if table.weight.device.type != "cpu" or table.weight.requires_grad or list(table.parameters()):
-                raise RuntimeError("Engram tables must remain frozen CPU buffers")
+            if table.weight.requires_grad or list(table.parameters()):
+                raise RuntimeError("Engram tables must remain frozen buffers")
+            if self.engram_offload and table.weight.device.type != "cpu":
+                raise RuntimeError("offloaded Engram tables must remain on CPU")
         if self.backend.model.hash is not None and any(
             value.device.type != "cpu" for value in self.backend.model.hash.buffers()
         ):
@@ -154,9 +178,19 @@ class DSV41Policy(nn.Module):
         return self
 
     def to_training_devices(self, devices, dtype):
-        if len(devices) != 1:
-            raise ValueError("Tiny-DSV41 RL currently requires exactly one device per policy process")
-        return self.to(device=devices[0], dtype=dtype)
+        placement = layer_device_map(len(self.backend.model.layers), devices)
+        validate_available_devices(devices)
+        self.to(dtype=dtype)
+        model = self.backend.model
+        model.embedding.to(placement[0])
+        for layer, device in zip(model.layers, placement):
+            layer.to(device)
+            if layer.engram is not None:
+                model.engram_tables[str(layer.layer_id)].to(device)
+        model.norm.to(placement[-1])
+        self.backend.lm_head.to(placement[-1])
+        self.assert_engram_invariants()
+        return self
 
     def _partition(self, trainable, include_engram=False):
         state = {name: value for name, value in self.named_parameters() if value.requires_grad == trainable}
@@ -191,8 +225,7 @@ class DSV41Policy(nn.Module):
 
     def forward(self, input_ids, attention_mask=None):
         # The RL objective consumes logits; the SFT wrapper's auxiliary loss is unused.
-        hidden, _ = self.backend.model(input_ids, attention_mask)
-        return self.backend.lm_head(hidden)
+        return forward_logits(self.backend, input_ids, attention_mask)
 
 
 def _load_token_map(root, config):
@@ -240,7 +273,20 @@ def _layout(root):
     raise FileNotFoundError(f"no model.safetensors or pytorch_model.bin checkpoint found in {root}")
 
 
-def _load_native(root, config):
+def _validate_engram_weights(config, weights):
+    if weights is None:
+        return
+    expected = {str(layer): (rows, config.engram_head_dim)
+                for layer, rows in zip(config.engram_layer_ids, config.engram_num_embeddings)}
+    if weights.keys() != expected.keys():
+        raise ValueError("shared Engram keys do not match configured layers")
+    for name, value in weights.items():
+        if (value.shape != expected[name] or value.device.type != "cpu" or value.requires_grad
+                or value.dtype not in {torch.float32, torch.bfloat16}):
+            raise ValueError(f"invalid frozen CPU Engram tensor: {name}")
+
+
+def _load_native(root, config, engram_weights=None):
     weight_map, safetensors = _layout(root)
     # Materialize checkpoint tensors directly, avoiding a second random full model.
     with torch.device("meta"):
@@ -250,9 +296,12 @@ def _load_native(root, config):
         raise ValueError(f"DeepSeek checkpoint keys: missing={sorted(expected.keys() - weight_map.keys())[:8]}, "
                          f"unexpected={sorted(weight_map.keys() - expected.keys())[:8]}")
     by_file = defaultdict(list)
+    injected = {f"model.engram_tables.{name}.weight": weight for name, weight in (engram_weights or {}).items()}
+    model.load_state_dict(injected, strict=False, assign=True)
     for name, filename in weight_map.items():
         _checkpoint_file(root, filename)
-        by_file[filename].append(name)
+        if name not in injected:
+            by_file[filename].append(name)
     for filename, names in by_file.items():
         path = _checkpoint_file(root, filename)
         if safetensors:
@@ -280,19 +329,24 @@ def _load_native(root, config):
     return model
 
 
-def build_dsv41_policy(model_dir, config, *, random_init, devices, dtype):
-    if len(devices) != 1:
-        raise ValueError("Tiny-DSV41 RL currently requires exactly one device per policy process")
+def build_dsv41_policy(model_dir, config, *, random_init, devices, dtype,
+                       engram_weights=None, engram_offload=True):
+    layer_device_map(config.num_hidden_layers, devices)
+    validate_available_devices(devices)
+    _validate_engram_weights(config, engram_weights)
     if random_init:
         config.validate_random_init()
         backend = DeepSeekV41ForCausalLM(config)
         for table in backend.model.engram_tables.values():
             table.to(dtype=getattr(torch, config.checkpoint_dtype))
+        if engram_weights is not None:
+            for name, weight in engram_weights.items():
+                backend.model.engram_tables[name].load_state_dict({"weight": weight}, assign=True)
     elif config.checkpoint_format == "released":
         backend = load_dsv41_backbone_prefix(
             model_dir, num_layers=config.num_hidden_layers, device="cpu",
-            dtype=getattr(torch, config.checkpoint_dtype))
+            dtype=getattr(torch, config.checkpoint_dtype), engram_weights=engram_weights)
         backend.config = config
     else:
-        backend = _load_native(Path(model_dir), config)
-    return DSV41Policy(backend).to_training_devices(devices, dtype)
+        backend = _load_native(Path(model_dir), config, engram_weights)
+    return DSV41Policy(backend, engram_offload=engram_offload).to_training_devices(devices, dtype)

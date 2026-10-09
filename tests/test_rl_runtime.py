@@ -27,7 +27,7 @@ class RuntimeTests(unittest.TestCase):
     def test_config_rejects_invalid_values(self):
         for values in ({"group_size": 1}, {"max_policy_lag": -1}, {"queue_capacity": 0},
                        {"temperature": float("nan")}, {"kl_beta": -0.1},
-                       {"learner_devices": ["cuda:0", "cuda:1"]}, {"max_steps": 1.2}):
+                       {"learner_devices": ["cuda:0", "cuda:0"]}, {"max_steps": 1.2}):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 RLConfig.from_dict(values)
 
@@ -59,6 +59,7 @@ class RuntimeTests(unittest.TestCase):
             metrics = [json.loads(line) for line in result.stdout.splitlines()
                        if line.startswith("{") and json.loads(line)["event"] == "train"]
             self.assertTrue(all(event["policy_lag_max"] <= 2 for event in metrics))
+            self.assertTrue(all(event["engram_shared"] and event["rollout_engram_shared"] for event in metrics))
             self.assertTrue(any(event["nonzero_advantages"] > 0 for event in metrics))
             checkpoint = root / "output/step-00000002.pt"
             before = torch.load(checkpoint, weights_only=True)

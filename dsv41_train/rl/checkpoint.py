@@ -88,7 +88,7 @@ def load_training_checkpoint(path, model, optimizer, config, identity) -> dict:
     if state["format_version"] != 1 or state["identity"] != identity:
         raise ValueError("checkpoint format, model files, random-init mode or training data changed")
     mutable = {"max_steps", "output_dir", "checkpoint_interval", "worker_timeout_seconds",
-               "learner_devices", "rollout_devices", "num_threads"}
+               "learner_devices", "rollout_devices", "num_threads", "engram_offload"}
     current = json.loads(json.dumps(config.to_dict()))
     previous = json.loads(json.dumps(state["config"]))
     for key in current.keys() - mutable:

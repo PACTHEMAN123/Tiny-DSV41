@@ -96,7 +96,7 @@ def main() -> None:
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--checkpoint", required=True, help="RL step-XXXXXXXX.pt checkpoint")
     parser.add_argument("--prompt-ids", required=True, help="JSON list of token IDs, for example '[1,4,5]'")
-    parser.add_argument("--device", default="cpu", help="cpu or one CUDA device such as cuda:0")
+    parser.add_argument("--devices", "--device", default="cpu", help="cpu or comma-separated CUDA devices")
     parser.add_argument("--max-new-tokens", type=int, help="defaults to the checkpoint generation length")
     parser.add_argument("--temperature", type=float, help="defaults to the checkpoint temperature")
     parser.add_argument("--seed", type=int, help="sampling seed; defaults to the checkpoint seed")
@@ -105,7 +105,7 @@ def main() -> None:
         result = sample_checkpoint(
             model_dir=args.model_dir, checkpoint=args.checkpoint,
             prompt_ids=json.loads(args.prompt_ids),
-            devices=(args.device,),
+            devices=tuple(device.strip() for device in args.devices.split(",")),
             max_new_tokens=args.max_new_tokens, temperature=args.temperature, seed=args.seed,
         )
     except (ValueError, TypeError) as exc:
