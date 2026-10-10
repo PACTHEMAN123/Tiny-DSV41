@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -23,27 +23,28 @@ from .parallel import DeviceRotaryEmbedding, forward_logits, layer_device_map, v
 
 @dataclass
 class DSV41Config(DeepSeekV41Config):
-    checkpoint_format: str = "tiny_dsv41"
+    checkpoint_format: str = "native"
     checkpoint_dtype: str = "float32"
 
     @classmethod
     def from_model_dir(cls, model_dir):
-        with (Path(model_dir) / "config.json").open(encoding="utf-8") as handle:
-            root = json.load(handle)
-        text = dict(root.get("text_config", root))
-        for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
-            if root.get(name) is not None:
-                text[name] = root[name]
-        if "engram_pad_token_id" in text:
-            text["engram_pad_id"] = text["engram_pad_token_id"]
+        return cls.from_json(Path(model_dir) / "config.json")
+
+    @classmethod
+    def from_dict(cls, root):
+        config = super().from_dict(root)
+        text = root.get("text_config", root)
         quantized = bool(root.get("quantization_config") or text.get("quantization_config"))
-        text["checkpoint_format"] = root.get(
-            "checkpoint_format", text.get("checkpoint_format", "released" if quantized else "tiny_dsv41"))
-        text["checkpoint_dtype"] = root.get("dtype", root.get("torch_dtype")) or text.get(
-            "dtype", text.get("torch_dtype", "bfloat16" if quantized else "float32"))
-        config = cls(**{key: value for key, value in text.items() if key in {f.name for f in fields(cls)}})
-        if config.checkpoint_format not in {"tiny_dsv41", "released"}:
-            raise ValueError("DeepSeek checkpoint_format must be tiny_dsv41 or released")
+        config.checkpoint_format = root.get(
+            "checkpoint_format", text.get("checkpoint_format", "released" if quantized else "native"))
+        if config.checkpoint_format == "tiny_dsv41":
+            config.checkpoint_format = "native"
+        config.checkpoint_dtype = (root.get("dtype") or root.get("torch_dtype")
+                                   or text.get("dtype") or text.get("torch_dtype")
+                                   or text.get("checkpoint_dtype")
+                                   or ("bfloat16" if quantized else "float32"))
+        if config.checkpoint_format not in {"native", "released"}:
+            raise ValueError("DeepSeek checkpoint_format must be native or released")
         if quantized and config.checkpoint_format != "released":
             raise ValueError("quantized DeepSeek checkpoints require the released loader")
         if config.checkpoint_dtype not in {"float32", "bfloat16"}:
@@ -58,16 +59,6 @@ class DSV41Config(DeepSeekV41Config):
         ):
             raise ValueError("Engram layer IDs must be distinct zero-based decoder indices")
         return config
-
-    def validate_random_init(self):
-        table_elements = sum(self.engram_num_embeddings) * self.engram_head_dim
-        if (self.hidden_size > 256 or self.num_hidden_layers > 8 or self.n_routed_experts > 16
-                or self.vocab_size > 4096 or table_elements > 20_000_000):
-            raise ValueError("random initialization is restricted to tiny test configurations")
-        with torch.device("meta"):
-            model = DeepSeekV41ForCausalLM(self)
-        if sum(parameter.numel() for parameter in model.parameters()) > 50_000_000:
-            raise ValueError("random initialization is restricted to tiny test configurations")
 
 
 class _CPUHash(nn.Module):
@@ -335,7 +326,6 @@ def build_dsv41_policy(model_dir, config, *, random_init, devices, dtype,
     validate_available_devices(devices)
     _validate_engram_weights(config, engram_weights)
     if random_init:
-        config.validate_random_init()
         backend = DeepSeekV41ForCausalLM(config)
         for table in backend.model.engram_tables.values():
             table.to(dtype=getattr(torch, config.checkpoint_dtype))

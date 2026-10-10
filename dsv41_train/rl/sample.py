@@ -29,8 +29,8 @@ def sample_checkpoint(
 ) -> dict:
     """Load policy weights without an optimizer and generate one response.
 
-    The checkpoint's initialization seed is always retained for the frozen tiny
-    Engram table. An explicit seed overrides only the CPU sampling generator.
+    The checkpoint's initialization seed is retained for randomly initialized
+    frozen Engram tables. An explicit seed overrides only the CPU sampling generator.
     Training data is not required, but base-model identity must still match.
     """
     model_dir = Path(model_dir).resolve()
@@ -64,8 +64,6 @@ def sample_checkpoint(
         raise ValueError("sampling seed must be an integer in [0, 2**63 - 1)")
     record = PromptRecord(prompt_ids)
     model_config = DSV41Config.from_model_dir(model_dir)
-    if random_init:
-        model_config.validate_random_init()
     if len(record.prompt_ids) + config.max_new_tokens > model_config.max_position_embeddings:
         raise ValueError("prompt length + max_new_tokens exceeds model context length")
     if any(token >= model_config.vocab_size for token in record.prompt_ids):

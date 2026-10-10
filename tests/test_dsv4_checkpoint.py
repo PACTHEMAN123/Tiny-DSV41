@@ -2,6 +2,7 @@ import json
 import struct
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -59,7 +60,10 @@ class DSV4CheckpointTest(unittest.TestCase):
         torch.testing.assert_close(actual.compressed, expected.compressed, rtol=0, atol=0)
 
     def test_prefix_config_includes_the_second_engram_layer(self):
-        config = DeepSeekV41Config(
+        config = replace(
+            DeepSeekV41Config.from_json(
+                Path(__file__).resolve().parents[1] / "dsv41_train/models/dsv4/config.json"
+            ),
             engram_layer_ids=[1, 14],
             engram_num_embeddings=[100, 200],
         )

@@ -1,4 +1,3 @@
-import copy
 import json
 import os
 import subprocess
@@ -203,7 +202,7 @@ class DSV41Tests(unittest.TestCase):
             with self.assertRaisesRegex((ValueError, RuntimeError), "missing|Missing"):
                 make_model(root, self.config, self.rl, ("cpu",), False)
 
-    def test_config_preserves_outer_special_ids_and_guards_random_allocation(self):
+    def test_config_preserves_outer_special_ids(self):
         from dsv41_train.rl.policy import DSV41Config
 
         values = json.loads((MODEL_DIR / "config.json").read_text())
@@ -215,12 +214,39 @@ class DSV41Tests(unittest.TestCase):
             }))
             config = DSV41Config.from_model_dir(root)
             self.assertEqual((config.eos_token_id, config.bos_token_id), (1, 0))
-        large = copy.deepcopy(self.config)
-        large.hidden_size = 5120
-        with self.assertRaisesRegex(ValueError, "restricted to tiny"):
-            large.validate_random_init()
         with self.assertRaisesRegex(ValueError, "one device"):
             make_model(MODEL_DIR, self.config, self.rl, ("cpu", "cpu"), True)
+
+    def test_external_config_controls_random_and_pretrained_models(self):
+        from dsv41_train.rl.policy import DSV41Config
+
+        values = json.loads((MODEL_DIR / "config.json").read_text())
+        values.update(vocab_size=48, hidden_size=272, num_hidden_layers=4,
+                      num_attention_heads=4, q_lora_rank=24, moe_intermediate_size=48,
+                      n_routed_experts=3, n_shared_experts=2, compress_ratios=[0, 2, 1, 1],
+                      kv_source_layer_ids=[1, 2], index_source_layer_ids=[1, 2, 3],
+                      candidate_source_layer_id=2, engram_layer_ids=[1, 3])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "config.json").write_text(json.dumps(values))
+            config = DSV41Config.from_model_dir(root)
+            with self.assertRaisesRegex(FileNotFoundError, "checkpoint"):
+                make_model(root, config, self.rl, ("cpu",), False)
+            random = make_model(root, config, self.rl, ("cpu",), True)
+            self.assertEqual(len(random.backend.model.layers), 4)
+            self.assertEqual(random.backend.model.embedding.weight.shape, (48, 272))
+            self.assertEqual(random.backend.model.layers[0].moe.routed.gate_up.shape[0], 3)
+            self.assertEqual(random.backend.model.layers[0].moe.shared.gate.weight.shape, (96, 272))
+            self.assertEqual(set(random.backend.model.engram_tables), {"1", "3"})
+            tokens = torch.tensor([[1, 4, 7, 3]])
+            expected = random(tokens)
+            expected.square().mean().backward()
+            self.assertTrue(torch.isfinite(random.backend.lm_head.weight.grad).all())
+            torch.save(random.backend.state_dict(), root / "pytorch_model.bin")
+            torch.save(random.backend.model.hash.source.token_map, root / "engram_token_map.pt")
+            loaded = make_model(root, DSV41Config.from_model_dir(root), self.rl, ("cpu",), False)
+            torch.testing.assert_close(loaded(tokens), expected)
+            loaded.assert_engram_invariants()
 
     def test_native_sharded_safetensors_loads_all_tables_and_parameters(self):
         with tempfile.TemporaryDirectory() as temporary:

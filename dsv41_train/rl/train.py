@@ -8,10 +8,11 @@ from .runtime import run_training
 
 def main():
     parser = argparse.ArgumentParser(description="Minimal asynchronous DeepSeek-V4.1 GRPO")
-    parser.add_argument("--model-dir", required=True)
+    parser.add_argument("--model-dir", required=True, help="local checkpoint directory containing config.json")
     parser.add_argument("--data", required=True, help="pretokenized prompt/target JSONL")
     parser.add_argument("--config", required=True, help="RL runtime JSON")
-    parser.add_argument("--allow-random-init", action="store_true", help="tiny smoke tests only")
+    parser.add_argument("--random-init", "--allow-random-init", action="store_true",
+                        help="initialize from config.json without loading base weights")
     parser.add_argument("--resume", help="step-XXXXXXXX.pt checkpoint; retains base-model requirement")
     parser.add_argument("--max-steps", type=int, help="override total optimizer steps, including restored steps")
     parser.add_argument("--output-dir", help="override checkpoint and log directory")
@@ -35,7 +36,7 @@ def main():
         values["engram_offload"] = args.engram_offload
     checkpoint = run_training(model_dir=args.model_dir, data_path=args.data,
                               config=RLConfig.from_dict(values),
-                              random_init=args.allow_random_init, resume=args.resume)
+                              random_init=args.random_init, resume=args.resume)
     print(f"checkpoint: {checkpoint}", flush=True)
 
 

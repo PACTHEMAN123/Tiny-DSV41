@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from unittest.mock import Mock, call, patch
 
 import torch
@@ -110,7 +111,8 @@ class ModelTest(unittest.TestCase):
         self.assertEqual(list(model.model.engram_tables), [])
 
     def test_selected_engram_hash_preserves_global_prime_sequence(self):
-        config = DeepSeekV41Config(
+        config = replace(
+            DeepSeekV41Config.tiny(),
             num_hidden_layers=4,
             compress_ratios=[0, 0, 0, 0],
             kv_source_layer_ids=[],

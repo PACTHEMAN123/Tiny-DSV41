@@ -155,9 +155,6 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
     for devices in (config.learner_devices, config.rollout_devices):
         layer_device_map(model_config.num_hidden_layers, devices)
         validate_available_devices(devices)
-    # A missing full checkpoint must never silently become a giant random policy.
-    if random_init:
-        model_config.validate_random_init()
     records = load_jsonl(data_path)
     _check_inputs(records, model_config, config)
     build_reward(config.reward)

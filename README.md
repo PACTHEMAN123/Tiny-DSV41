@@ -47,7 +47,28 @@ python3 -m torch.distributed.run --standalone --nproc-per-node=8 \
 rollout process. It uses the existing dependencies only. No Ray, Transformers,
 vLLM or separate RL repository is required.
 
-Install and run the CPU smoke example:
+Model architecture comes from `<model-dir>/config.json` at startup: vocabulary,
+dimensions, layer count, attention/compression layout, routed/shared experts,
+mHC and Engram shapes. Python contains no DSV4 size preset or inferred layer
+layout. Both flat configs and released checkpoints' nested `text_config` are
+supported, including outer special token IDs and declared MTP layout entries.
+Only the decoder backbone is built; MTP and vision modules are not trained.
+Missing architecture fields fail before model allocation. Older partial configs
+must supply their previously implicit fields explicitly.
+
+For pretrained RL, point `--model-dir` at a downloaded checkpoint repository
+directory. Its config and weights must agree; missing weights are an error.
+`--config` continues to specify RL settings, not model dimensions:
+
+```bash
+python3 -m dsv41_train.rl.train \
+  --model-dir /path/to/DeepSeek-V4.1-Flash \
+  --data /path/to/tokenized-prompts.jsonl \
+  --config examples/rl/cuda.json \
+  --trainer-num-gpus 4 --rollout-num-gpus 2
+```
+
+Install and run the CPU smoke example from its standalone tiny config:
 
 ```bash
 python3 -m pip install -e .
@@ -55,14 +76,21 @@ python3 -m dsv41_train.rl.train \
   --model-dir examples/rl/tiny-dsv41 \
   --data examples/rl/prompts.jsonl \
   --config examples/rl/cpu.json \
-  --allow-random-init
+  --random-init
 ```
 
 `tiny-dsv41` is a reduced six-layer architecture for testing, not pretrained
 weights. It exercises compressed sparse attention, candidate selection, shared
-KV/index keys, MoE, mHC and two Engram tables. Random initialization is explicitly
-restricted to small configurations. The example's `toy_token_score` reward is
-synthetic; it does not measure task quality.
+KV/index keys, MoE, mHC and two Engram tables. `--random-init` explicitly skips
+base weight loading and initializes the architecture in that directory's config;
+it never changes model dimensions or chooses a preset. There is no hardcoded size
+limit, so the selected model and temporary initialization tensors must fit in
+memory. The example's `toy_token_score` reward is synthetic; it does not measure
+task quality. `--allow-random-init` remains a command-line alias.
+
+The original native SFT/kernel tests retain their dimensions in
+`dsv41_train/models/dsv4/tiny_config.json`; `train.py --model-config PATH` reads
+that file by default. Neither tiny config is a fallback for a checkpoint config.
 
 Resume to five total optimizer steps and sample from the resulting checkpoint:
 
@@ -70,7 +98,7 @@ Resume to five total optimizer steps and sample from the resulting checkpoint:
 python3 -m dsv41_train.rl.train \
   --model-dir examples/rl/tiny-dsv41 \
   --data examples/rl/prompts.jsonl \
-  --config examples/rl/cpu.json --allow-random-init \
+  --config examples/rl/cpu.json --random-init \
   --resume runs/tiny_dsv41_cpu/step-00000003.pt --max-steps 5
 
 python3 -m dsv41_train.rl.sample \
@@ -88,7 +116,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
 python3 -m dsv41_train.rl.train \
   --model-dir examples/rl/tiny-dsv41 \
   --data examples/rl/prompts.jsonl --config examples/rl/cuda.json \
-  --trainer-num-gpus 4 --rollout-num-gpus 2 --allow-random-init
+  --trainer-num-gpus 4 --rollout-num-gpus 2 --random-init
 ```
 
 Counts allocate visible CUDA indices consecutively: trainer gets `cuda:0..3`
@@ -121,16 +149,17 @@ memory during loading. `--no-engram-offload` (or `engram_offload: false`) keeps
 frozen copies on the GPUs owning the respective Engram layers, with a shared
 CPU base retained for initialization. Offload mode never enables table training;
 the Engram projection layers continue to train. For reproducible tiny smoke
-initialization, each process still performs the bounded random initialization
+initialization, each process still performs the configured random initialization
 before replacing its temporary tables with the shared ones.
 
 For pretrained training, replace `--model-dir` with a checkpoint directory,
 provide tokenized task data and a task reward in the RL config, and omit
-`--allow-random-init`. Supported base formats are:
+`--random-init`. Supported base formats are:
 
 - Native `DeepSeekV41ForCausalLM.state_dict()` tensors in `pytorch_model.bin` or
   `model.safetensors`, optionally sharded with a corresponding `.index.json`.
-  Config uses `checkpoint_format: "tiny_dsv41"`; all native parameter/buffer keys
+  Config uses `checkpoint_format: "native"` (legacy `"tiny_dsv41"` is accepted);
+  this format supports any valid configured size. All native parameter/buffer keys
   must match. Engram also requires `engram_token_map.pt` (an int64 tensor) or the
   matching `tokenizer.json`.
 - Released DeepSeek-V4.1 checkpoints through the existing
