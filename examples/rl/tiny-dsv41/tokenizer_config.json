@@ -1,0 +1,8 @@
+{
+  "bos_token": "<bos>",
+  "eos_token": "<eos>",
+  "pad_token": "<pad>",
+  "unk_token": "<unk>",
+  "additional_special_tokens": ["<user>", "<assistant>", "<system>", "<end>", "<eot>"],
+  "chat_template": "{{ bos_token }}{% for message in messages %}{{ '<' + message['role'] + '>' }}{{ message['content'] }}<end>{% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}"
+}

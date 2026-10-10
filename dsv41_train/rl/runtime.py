@@ -7,6 +7,7 @@ import os
 import queue
 import time
 import traceback
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -16,9 +17,11 @@ from .checkpoint import (load_policy, load_training_checkpoint, publish_policy,
                          run_identity, save_training_checkpoint)
 from .config import RLConfig
 from .data import build_reward, load_jsonl
+from .evaluation import append_jsonl, evaluate_policy, sample_record
 from .policy import DSV41Config, build_dsv41_policy
 from .parallel import layer_device_map, validate_available_devices
-from .rollout import generate_group
+from .rollout import generate_group, generation_options
+from .tokenizer import ModelTokenizer
 
 
 def make_model(model_dir, model_config, config, devices, random_init, *, engram_weights=None):
@@ -28,7 +31,7 @@ def make_model(model_dir, model_config, config, devices, random_init, *, engram_
                               engram_weights=engram_weights, engram_offload=config.engram_offload)
 
 
-def _rollout_worker(model_dir, model_config, config, data_path, random_init,
+def _rollout_worker(model_dir, model_config, config, records, random_init,
                     snapshot_path, published_version, output, errors, stop,
                     next_group_id, rng_state, engram_weights):
     # Only plain Python data crosses this queue; CUDA tensors never enter IPC.
@@ -38,8 +41,9 @@ def _rollout_worker(model_dir, model_config, config, data_path, random_init,
         model = make_model(model_dir, model_config, config, config.rollout_devices, random_init,
                            engram_weights=engram_weights)
         model.eval()
-        records = load_jsonl(data_path)
-        reward_fn = build_reward(config.reward)
+        tokenizer = ModelTokenizer(model_dir) if (Path(model_dir) / "tokenizer.json").is_file() else None
+        reward_fn = build_reward(config.reward, tokenizer=tokenizer)
+        generation_kwargs = generation_options(model_dir, model_config, config)
         generator = torch.Generator(device="cpu").manual_seed(config.seed + 1)
         if rng_state is not None:
             generator.set_state(torch.tensor(list(rng_state), dtype=torch.uint8))
@@ -54,7 +58,7 @@ def _rollout_worker(model_dir, model_config, config, data_path, random_init,
             group = generate_group(
                 model, records[next_group_id % len(records)],
                 group_size=config.group_size, max_new_tokens=config.max_new_tokens,
-                temperature=config.temperature, eos_token_id=model_config.eos_token_id,
+                temperature=config.temperature, **generation_kwargs,
                 policy_version=version, group_id=next_group_id,
                 generator=generator, reward_fn=reward_fn,
             )
@@ -106,9 +110,12 @@ def train_groups(model, reference, optimizer, groups, config):
     metrics = {}
     rewards = []
     nonzero_advantages = 0
+    zero_variance_groups = 0
+    truncated = 0
     for group in groups:
         advantages = group_advantages([sample.reward for sample in group.samples])
         nonzero_advantages += int(advantages.count_nonzero())
+        zero_variance_groups += int(not bool(advantages.count_nonzero()))
         for sample, advantage in zip(group.samples, advantages):
             log_probs = response_log_probs(model, sample.prompt_ids, sample.response_ids, config.temperature)
             reference_probs = None
@@ -128,13 +135,16 @@ def train_groups(model, reference, optimizer, groups, config):
                 if name != "loss":
                     metrics[name] = metrics.get(name, 0.0) + value / total_samples
             rewards.append(sample.reward)
+            truncated += int(sample.finish_reason == "length")
     parameters = [p for p in model.parameters() if p.requires_grad]
     norm = torch.nn.utils.clip_grad_norm_(parameters, config.max_grad_norm, error_if_nonfinite=True,
                                          foreach=False)
     optimizer.step()
     model.assert_engram_invariants()
     metrics.update(reward_mean=sum(rewards) / len(rewards), grad_norm=float(norm),
-                   nonzero_advantages=nonzero_advantages, samples=total_samples)
+                   nonzero_advantages=nonzero_advantages, samples=total_samples,
+                   zero_variance_group_fraction=zero_variance_groups / len(groups),
+                   truncation_fraction=truncated / total_samples)
     return metrics
 
 
@@ -147,7 +157,33 @@ def _check_inputs(records, model_config, config):
             raise ValueError("dataset token IDs must be inside the model vocabulary")
 
 
-def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, resume=None):
+def prepare_records(data_path, model_config, config, tokenizer):
+    limit = model_config.max_position_embeddings - config.max_new_tokens
+    if config.max_prompt_tokens is not None:
+        limit = min(limit, config.max_prompt_tokens)
+    if limit < 1:
+        raise ValueError("max_new_tokens must leave room for a prompt within the model context")
+    records = load_jsonl(data_path, tokenizer=tokenizer, max_prompt_tokens=limit,
+                         length_policy=config.length_policy)
+    _check_inputs(records, model_config, config)
+    return records
+
+
+def validate_reward_records(records, reward, spec):
+    from .rewards import TEXT_REWARDS
+
+    for index, record in enumerate(records):
+        if spec in {"token_accuracy", "exact_match"} and record.target_ids is None:
+            raise ValueError(f"record {index}: reward {spec} requires target_ids")
+        if spec in TEXT_REWARDS:
+            try:
+                reward(record, [])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"record {index}: {exc}") from exc
+
+
+def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, resume=None,
+                 eval_data_path=None):
     config.validate()
     torch.set_num_threads(config.num_threads)
     model_dir, data_path = str(Path(model_dir).resolve()), str(Path(data_path).resolve())
@@ -155,10 +191,16 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
     for devices in (config.learner_devices, config.rollout_devices):
         layer_device_map(model_config.num_hidden_layers, devices)
         validate_available_devices(devices)
-    records = load_jsonl(data_path)
-    _check_inputs(records, model_config, config)
-    build_reward(config.reward)
-    identity = run_identity(model_dir, data_path, random_init)
+    tokenizer = ModelTokenizer(model_dir) if (Path(model_dir) / "tokenizer.json").is_file() else None
+    records = prepare_records(data_path, model_config, config, tokenizer)
+    eval_records = prepare_records(eval_data_path, model_config, config, tokenizer) if eval_data_path else []
+    if {tuple(record.prompt_ids) for record in records}.intersection(
+        tuple(record.prompt_ids) for record in eval_records
+    ):
+        raise ValueError("validation prompts overlap training prompts; use an independent validation set")
+    reward_fn = build_reward(config.reward, tokenizer=tokenizer)
+    validate_reward_records(records + eval_records, reward_fn, config.reward)
+    identity = run_identity(model_dir, data_path, random_init, eval_data_path=eval_data_path)
     output_dir = Path(config.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     lock = output_dir / ".run.lock"
@@ -187,13 +229,21 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
             state = load_training_checkpoint(resume, model, optimizer, config, identity)
             step, next_group_id = state["step"], state["next_group_id"]
             rng_state, dropped = state["rollout_rng_state"], state["dropped_groups"]
+            config = replace(config, eos_token_ids=state["config"]["eos_token_ids"])
             del state
         elif any(output_dir.glob("step-*.pt")):
             raise FileExistsError("output_dir already has checkpoints; use --resume or a new output directory")
+        generation_kwargs = generation_options(model_dir, model_config, config)
+        config = replace(config, eos_token_ids=generation_kwargs["eos_token_id"])
         if step >= config.max_steps:
             raise ValueError("max_steps must exceed the restored checkpoint step")
         if any(int(path.stem.removeprefix("step-")) > step for path in output_dir.glob("step-*.pt")):
             raise FileExistsError("output_dir contains later checkpoints; resume into a new --output-dir")
+        if eval_records:
+            metrics = evaluate_policy(model, eval_records, config, reward_fn=reward_fn,
+                                      generation_kwargs=generation_kwargs, step=step, tokenizer=tokenizer,
+                                      output_dir=output_dir, phase="resume" if resume else "baseline")
+            print(json.dumps(metrics, sort_keys=True, allow_nan=False), flush=True)
         snapshot_path = output_dir / "policy-latest.pt"
         publish_policy(model, step, snapshot_path)
         context = mp.get_context("spawn")
@@ -204,7 +254,7 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
         published_version = context.Value("q", step)
         worker = context.Process(
             target=_rollout_worker,
-            args=(model_dir, model_config, config, data_path, random_init,
+            args=(model_dir, model_config, config, records, random_init,
                   str(snapshot_path), published_version, output, errors, stop,
                   next_group_id, rng_state, engram_weights),
             name="dsv41-rollout",
@@ -249,6 +299,15 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
             published_version.value = step
             next_group_id = groups[-1].group_id + 1
             rng_state = packets[-1]["rng_state"]
+            if config.log_samples_per_step:
+                rows = []
+                for group in groups:
+                    record = records[group.group_id % len(records)]
+                    for sample in group.samples:
+                        if len(rows) < config.log_samples_per_step:
+                            rows.append(sample_record(record, sample, step=step, group_id=group.group_id,
+                                                      tokenizer=tokenizer))
+                append_jsonl(output_dir / "train-samples.jsonl", rows)
             overlap = 0.0
             if previous_train_interval is not None:
                 start, end = previous_train_interval
@@ -273,6 +332,12 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
                     step=step, config=config, identity=identity, next_group_id=next_group_id,
                     rollout_rng_state=rng_state, dropped_groups=dropped,
                 )
+            if eval_records and (step % (config.eval_interval or config.checkpoint_interval) == 0
+                                 or step == config.max_steps):
+                metrics = evaluate_policy(model, eval_records, config, reward_fn=reward_fn,
+                                          generation_kwargs=generation_kwargs, step=step, tokenizer=tokenizer,
+                                          output_dir=output_dir)
+                print(json.dumps(metrics, sort_keys=True, allow_nan=False), flush=True)
         return output_dir / f"step-{step:08d}.pt"
     finally:
         if worker is not None and worker.pid is not None:

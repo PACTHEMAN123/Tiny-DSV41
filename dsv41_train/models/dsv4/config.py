@@ -66,7 +66,7 @@ class DeepSeekV41Config:
     router_aux_loss_coef: float = 0.001
     pad_token_id: int
     bos_token_id: int
-    eos_token_id: int
+    eos_token_id: int | list[int]
 
     def __post_init__(self) -> None:
         for name in ("compress_ratios", "kv_source_layer_ids", "index_source_layer_ids",

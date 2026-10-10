@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import math
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
@@ -35,32 +36,51 @@ class PromptRecord:
         self.metadata = dict(self.metadata)
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "PromptRecord":
+    def from_mapping(cls, value: Mapping[str, Any], *, tokenizer=None) -> "PromptRecord":
         if not isinstance(value, Mapping):
             raise ValueError("each JSONL record must be an object")
+        if sum(name in value for name in ("prompt_ids", "prompt", "messages")) != 1:
+            raise ValueError("each JSONL record requires exactly one of prompt_ids, prompt or messages")
+        prompt_ids = value.get("prompt_ids")
         if "prompt_ids" not in value:
-            raise ValueError("each JSONL record requires prompt_ids")
+            if tokenizer is None:
+                raise ValueError("text records require tokenizer.json in the model directory")
+            prompt_ids = tokenizer.encode_prompt(prompt=value.get("prompt"), messages=value.get("messages"))
         metadata = value.get("metadata", {})
         if not isinstance(metadata, dict):
             raise ValueError("metadata must be a JSON object")
         metadata = dict(metadata)
         metadata.update({k: v for k, v in value.items() if k not in {"prompt_ids", "target_ids", "metadata"}})
-        return cls(value["prompt_ids"], value.get("target_ids"), metadata)
+        return cls(prompt_ids, value.get("target_ids"), metadata)
 
 
 RewardFn = Callable[[PromptRecord, list[int]], float]
 
 
-def load_jsonl(path: str | Path) -> list[PromptRecord]:
+def load_jsonl(path: str | Path, *, tokenizer=None, max_prompt_tokens=None,
+               length_policy="error") -> list[PromptRecord]:
+    if length_policy not in {"error", "skip"}:
+        raise ValueError("length_policy must be error or skip")
+    if max_prompt_tokens is not None and (type(max_prompt_tokens) is not int or max_prompt_tokens < 1):
+        raise ValueError("max_prompt_tokens must be a positive integer")
     records = []
+    skipped = 0
     with Path(path).open(encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
             if not line.strip():
                 continue
             try:
-                records.append(PromptRecord.from_mapping(json.loads(line)))
+                record = PromptRecord.from_mapping(json.loads(line), tokenizer=tokenizer)
+                if max_prompt_tokens is not None and len(record.prompt_ids) > max_prompt_tokens:
+                    if length_policy == "skip":
+                        skipped += 1
+                        continue
+                    raise ValueError(f"prompt length {len(record.prompt_ids)} exceeds limit {max_prompt_tokens}")
+                records.append(record)
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"{path}:{line_number}: {exc}") from exc
+    if skipped:
+        warnings.warn(f"{path}: skipped {skipped} records exceeding the prompt length limit", stacklevel=2)
     if not records:
         raise ValueError(f"{path}: no records found")
     return records
@@ -93,14 +113,20 @@ def toy_token_score(record: PromptRecord, response_ids: list[int]) -> float:
     return sum(response_ids) / len(response_ids)
 
 
-def build_reward(spec: str) -> RewardFn:
+def build_reward(spec: str, *, tokenizer=None) -> RewardFn:
     """Resolve a builtin or import a module:function(record, response_ids) plugin."""
     builtins = {
         "token_accuracy": token_accuracy,
         "exact_match": exact_match,
         "toy_token_score": toy_token_score,
     }
-    if spec in builtins:
+    from .rewards import TEXT_REWARDS, build_text_reward
+
+    if spec in TEXT_REWARDS:
+        if tokenizer is None:
+            raise ValueError(f"reward {spec!r} requires tokenizer.json in the model directory")
+        reward_fn = build_text_reward(spec, tokenizer)
+    elif spec in builtins:
         reward_fn = builtins[spec]
     else:
         module_name, separator, function_name = spec.partition(":")
@@ -116,4 +142,5 @@ def build_reward(spec: str) -> RewardFn:
             raise ValueError(f"reward {spec!r} returned a non-finite value")
         return reward
 
+    checked_reward.strip_stop_tokens = spec in TEXT_REWARDS
     return checked_reward

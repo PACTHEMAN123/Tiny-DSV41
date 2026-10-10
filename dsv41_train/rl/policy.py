@@ -51,8 +51,9 @@ class DSV41Config(DeepSeekV41Config):
             raise ValueError("DeepSeek checkpoint dtype must be float32 or bfloat16")
         if config.attention_dropout:
             raise ValueError("RL policies require attention_dropout=0 for behavior probability consistency")
-        if any(not 0 <= token < config.vocab_size for token in (
-            config.bos_token_id, config.eos_token_id, config.pad_token_id, config.engram_pad_id)):
+        eos_ids = config.eos_token_id if isinstance(config.eos_token_id, list) else [config.eos_token_id]
+        if not eos_ids or any(type(token) is not int or not 0 <= token < config.vocab_size for token in (
+            config.bos_token_id, config.pad_token_id, config.engram_pad_id, *eos_ids)):
             raise ValueError("special token IDs must be inside the model vocabulary")
         if len(set(config.engram_layer_ids)) != len(config.engram_layer_ids) or any(
             layer < 0 or layer >= config.num_hidden_layers for layer in config.engram_layer_ids

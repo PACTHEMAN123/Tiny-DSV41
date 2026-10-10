@@ -62,6 +62,37 @@ class RolloutTests(unittest.TestCase):
             self.assertEqual(len(sample.behavior_log_probs), 1)
             self.assertEqual(sample.reward, 1.0)
 
+    def test_multiple_eos_and_custom_stop_preserve_training_tokens(self):
+        group = self.generate(CausalModel(always_eos=True), eos_token_id=[0, 2])
+        self.assertEqual(group.samples[0].finish_reason, "eos")
+        self.assertEqual(group.samples[0].content_ids, [])
+        model = CausalModel()
+        with torch.no_grad():
+            model.transitions.copy_(torch.tensor([[-100., 100., -100.],
+                                                 [-100., -100., 100.], [100., -100., -100.]]))
+        sample = self.generate(model, record=PromptRecord([0], [1, 2]),
+                               stop_token_sequences=((1, 2),)).samples[0]
+        self.assertEqual(sample.response_ids, [1, 2])
+        self.assertEqual(sample.finish_reason, "stop")
+        self.assertEqual(sample.stop_token_count, 2)
+        self.assertEqual(sample.reward, 1.0)
+        torch.testing.assert_close(torch.tensor(sample.behavior_log_probs),
+                                   response_log_probs(model, [0], [1, 2], 0.7))
+
+    def test_truncation_reward_and_content_scoring_are_explicit(self):
+        reward = lambda record, ids: float(ids == [])
+        reward.strip_stop_tokens = True
+        stopped = self.generate(CausalModel(always_eos=True), eos_token_id=2,
+                                reward_fn=reward).samples[0]
+        self.assertEqual(stopped.reward, 1.0)
+        truncated = self.generate(CausalModel(always_eos=True), max_new_tokens=2,
+                                  truncated_reward=-1.0,
+                                  reward_fn=lambda record, ids: 0.5).samples[0]
+        self.assertEqual(truncated.finish_reason, "length")
+        self.assertEqual(truncated.response_ids, [2, 2])
+        self.assertEqual(truncated.raw_reward, 0.5)
+        self.assertEqual(truncated.reward, -1.0)
+
     def test_rng_state_replays_the_same_group(self):
         generator = torch.Generator().manual_seed(58)
         state = generator.get_state().clone()
@@ -105,6 +136,36 @@ class RolloutTests(unittest.TestCase):
 
 
 class DataRewardTests(unittest.TestCase):
+    def test_text_records_keep_answers_out_of_prompts_and_check_lengths(self):
+        class Encoder:
+            def encode_prompt(self, prompt=None, messages=None):
+                self.input = (prompt, messages)
+                return [1, 4, 5]
+
+        encoder = Encoder()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "data.jsonl"
+            value = {"messages": [{"role": "user", "content": "What is 2+2?"}],
+                     "answer": "4", "task": "math"}
+            path.write_text(json.dumps(value) + "\n")
+            record = load_jsonl(path, tokenizer=encoder)[0]
+            self.assertEqual(encoder.input, (None, value["messages"]))
+            self.assertEqual(record.prompt_ids, [1, 4, 5])
+            self.assertEqual(record.metadata["answer"], "4")
+            self.assertEqual(record.metadata["messages"], value["messages"])
+            with self.assertRaisesRegex(ValueError, "tokenizer"):
+                load_jsonl(path)
+            with self.assertRaisesRegex(ValueError, r"data.jsonl:1:.*length"):
+                load_jsonl(path, tokenizer=encoder, max_prompt_tokens=2)
+            with path.open("a") as handle:
+                handle.write(json.dumps({"prompt_ids": [1]}) + "\n")
+            with self.assertWarnsRegex(UserWarning, "skipped"):
+                records = load_jsonl(path, tokenizer=encoder, max_prompt_tokens=2,
+                                     length_policy="skip")
+            self.assertEqual([r.prompt_ids for r in records], [[1]])
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                PromptRecord.from_mapping({"prompt_ids": [1], "prompt": "ambiguous"}, tokenizer=encoder)
+
     def test_token_rewards_count_extra_tokens_and_eos(self):
         record = PromptRecord([0], [1, 2])
         reward = build_reward("token_accuracy")

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import torch
 
+from .config import RLConfig
+
 
 def atomic_save(payload: dict, destination: str | Path) -> None:
     """Readers see a complete old or new file, never a partially written snapshot."""
@@ -42,7 +44,8 @@ def publish_policy(model, version: int, path: str | Path) -> None:
     atomic_save({"version": version, **policy_state(model)}, path)
 
 
-def run_identity(model_dir: str | Path, data_path: str | Path, random_init: bool) -> dict:
+def run_identity(model_dir: str | Path, data_path: str | Path, random_init: bool,
+                 *, eval_data_path=None) -> dict:
     root = Path(model_dir)
     files = []
     if not random_init:
@@ -52,6 +55,7 @@ def run_identity(model_dir: str | Path, data_path: str | Path, random_init: bool
                 files.append([str(path.relative_to(root)), stat.st_size, stat.st_mtime_ns])
     config_bytes = (root / "config.json").read_bytes()
     identity = {
+        "identity_version": 2,
         "model_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
         "data_sha256": hashlib.sha256(Path(data_path).read_bytes()).hexdigest(),
         "base_files": files,
@@ -61,7 +65,33 @@ def run_identity(model_dir: str | Path, data_path: str | Path, random_init: bool
         name: hashlib.sha256((root / name).read_bytes()).hexdigest()
         for name in ("tokenizer.json", "engram_token_map.pt") if (root / name).is_file()
     }
+    assets = {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+              for name in ("tokenizer_config.json", "special_tokens_map.json", "chat_template.jinja",
+                           "generation_config.json") if (root / name).is_file()}
+    if assets:
+        identity["text_assets_sha256"] = assets
+    if eval_data_path is not None:
+        identity["eval_data_sha256"] = hashlib.sha256(Path(eval_data_path).read_bytes()).hexdigest()
     return identity
+
+
+def validate_identity(stored, current, *, inference=False):
+    ignored = {"data_sha256", "eval_data_sha256"} if inference else set()
+    if "identity_version" not in stored:
+        # Legacy checkpoints did not fingerprint template/generation metadata.
+        ignored |= {"identity_version", "text_assets_sha256"}
+    for key in (stored.keys() | current.keys()) - ignored:
+        if stored.get(key) != current.get(key):
+            raise ValueError(f"checkpoint identity mismatch: {key}")
+
+
+def checkpoint_config(values, model_config):
+    values = dict(values)
+    if "eos_token_ids" not in values:
+        # Old rollout used only model.config.eos_token_id, ignoring generation_config.
+        eos = model_config.eos_token_id
+        values["eos_token_ids"] = [eos] if isinstance(eos, int) else eos
+    return RLConfig.from_dict(values)
 
 
 def save_training_checkpoint(path, model, optimizer, *, step, config, identity,
@@ -85,15 +115,20 @@ def save_training_checkpoint(path, model, optimizer, *, step, config, identity,
 
 def load_training_checkpoint(path, model, optimizer, config, identity) -> dict:
     state = torch.load(path, map_location="cpu", weights_only=True)
-    if state["format_version"] != 1 or state["identity"] != identity:
-        raise ValueError("checkpoint format, model files, random-init mode or training data changed")
+    if state["format_version"] != 1:
+        raise ValueError("unsupported checkpoint format")
+    validate_identity(state["identity"], identity)
     mutable = {"max_steps", "output_dir", "checkpoint_interval", "worker_timeout_seconds",
-               "learner_devices", "rollout_devices", "num_threads", "engram_offload"}
+               "learner_devices", "rollout_devices", "num_threads", "engram_offload",
+               "eval_interval", "log_samples_per_step"}
     current = json.loads(json.dumps(config.to_dict()))
-    previous = json.loads(json.dumps(state["config"]))
+    previous = json.loads(json.dumps(checkpoint_config(state["config"], model.config).to_dict()))
+    if current["eos_token_ids"] is None:
+        current["eos_token_ids"] = previous["eos_token_ids"]
     for key in current.keys() - mutable:
         if current[key] != previous[key]:
             raise ValueError(f"resume cannot change algorithm setting {key}")
+    state["config"] = previous
     load_policy(model, state["policy"])
     optimizer.load_state_dict(state["optimizer"])
     torch.set_rng_state(state["learner_rng_state"])

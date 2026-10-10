@@ -168,11 +168,105 @@ provide tokenized task data and a task reward in the RL config, and omit
   `checkpoint_format: "released"`. This path materializes the full requested
   backbone on CPU before device placement and requires enough host/device RAM.
 
-Data is JSONL with `prompt_ids`, optional `target_ids`, and optional `metadata`.
-The built-in `token_accuracy` and `exact_match` rewards require `target_ids`
-(including terminal EOS if desired). A reward can instead be an importable
-`module:function` receiving `(record, response_ids)` and returning a finite
-scalar. Text tokenization and chat formatting are the data producer's job.
+### Text Data, Task Rewards and Evaluation
+
+Each JSONL record supplies exactly one of `prompt_ids`, `prompt`, or `messages`.
+`messages` contains text-only `system`/`user`/`assistant` history ending with a
+user turn. Reference answers stay outside the prompt:
+
+```json
+{"messages":[{"role":"user","content":"What is 2 + 2?"}],"answer":4,"task":"arithmetic"}
+```
+
+Text input requires the checkpoint's `tokenizer.json`. Messages also require
+`chat_template.jinja` or `tokenizer_config.json`'s `chat_template`; a template
+file takes precedence. Named templates require a `default` entry. Plain
+`prompt` text becomes a user message when a template exists, otherwise it uses
+the tokenizer's normal special-token processing. Templates are rendered with
+`add_generation_prompt=true` in sandboxed Jinja2, the only added dependency.
+No remote tokenizer code is executed. Tools, multimodal content and interactive
+multi-turn environment rollout are outside this MVP; conversation history is
+supported. The included tiny tokenizer is illustrative, not a production tokenizer.
+
+`reward` in the RL JSON selects the task score:
+
+| Reward | Reference | Comparison |
+| --- | --- | --- |
+| `text_exact_match` | `answer` string | Unicode/whitespace-normalized, case-sensitive exact text; terminal `<answer>...</answer>` supported |
+| `numeric_answer` | `answer` number or string | Exact scalar equivalence, including decimals, scientific notation, fractions and percentages; terminal `<answer>`, `\boxed{...}` or `####` answer extraction |
+| `json_match` | `answer` JSON value | Complete JSON or a single fenced JSON block; object order ignored, array order and types retained |
+| `token_accuracy`, `exact_match` | `target_ids` | Existing token comparison, including any desired terminal EOS |
+
+Top-level `answer`, `task` and other extra fields are placed in `record.metadata`;
+an explicit `metadata` object is also accepted. Missing/invalid references fail
+before model allocation; malformed generated answers score zero. Numeric scoring
+does not simplify algebraic expressions or search arbitrary prose for a number.
+Custom `module:function(record, response_ids)` rewards remain supported and see
+all sampled tokens, including stops. Built-in text rewards exclude terminal stop
+sequences before decoding. `toy_token_score` remains only a mechanics test.
+
+Generation reads scalar or multiple EOS IDs from `generation_config.json`,
+falling back to the model config. Additional `stop_token_sequences` in the RL
+JSON are lists of token-ID lists. Every sampled token, including stops, retains
+its behavior probability and contributes to the RL objective. Samples record
+`finish_reason` (`eos`, `stop`, `length`), `stop_token_count`, `raw_reward` and
+the reward used for training. `truncated_reward: null` retains the scorer's
+result; a finite value such as `0.0` explicitly overrides length-truncated
+rewards. These examples use zero. `max_prompt_tokens` and the model context
+limit are checked before allocation; `length_policy` is `error` (default) or
+`skip` with a warning, never silent truncation of conversation history.
+
+Run the complete text workflow locally:
+
+```bash
+python3 -m pip install -e .
+python3 -m dsv41_train.rl.train \
+  --model-dir examples/rl/tiny-dsv41 --random-init \
+  --data examples/rl/text-train.jsonl --eval-data examples/rl/text-eval.jsonl \
+  --config examples/rl/text-cpu.json
+
+python3 -m dsv41_train.rl.sample \
+  --model-dir examples/rl/tiny-dsv41 \
+  --checkpoint runs/tiny_dsv41_text/step-00000003.pt \
+  --prompt 'What is 2 + 2 ?'
+
+python3 -m dsv41_train.rl.evaluate \
+  --model-dir examples/rl/tiny-dsv41 \
+  --checkpoint runs/tiny_dsv41_text/step-00000003.pt \
+  --data examples/rl/text-eval.jsonl --output-dir runs/tiny_dsv41_text_eval
+```
+
+For actual fine-tuning, supply pretrained weights without `--random-init`,
+replace both datasets, and start from `examples/rl/text-cuda.json` with suitable
+GPU counts. Tune length and optimization settings to the task. A random tiny
+model usually earns zero task reward; its smoke run demonstrates plumbing,
+not arithmetic learning. SFT is a separate objective, not implemented here.
+
+`--eval-data` enables a baseline before training, periodic evaluations at
+`eval_interval` (zero means `checkpoint_interval`), and a final evaluation.
+Evaluation uses the trainer policy without gradients and a separate fixed
+`eval_seed`; it does not advance rollout sampling RNG or add a model copy.
+Training and validation tokenized prompts must be disjoint. Metrics append to
+`eval-metrics.jsonl`; decoded validation responses append to `eval-samples.jsonl`.
+`train-samples.jsonl` records up to `log_samples_per_step` training responses
+(zero disables it), with the actual rollout policy version. Without a tokenizer,
+these files retain token IDs. Training metrics include zero-advantage group and
+truncation fractions; evaluation reports reward mean/std and truncation fraction.
+Generated IDs outside the tokenizer vocabulary score zero for text rewards;
+logs retain their IDs with `response_text: null` and `response_decode_error`.
+
+Resume with the original `--eval-data` and initialization mode. Checkpoints
+fingerprint the validation file, tokenizer, chat template and generation settings
+as well as training data and base weights. Adding/changing those assets invalidates
+the identity of new runs. Legacy checkpoints check the fingerprints they originally
+stored, preserve their original model-config EOS behavior, and record the new
+fingerprints when training resumes. Resolved EOS IDs are saved in checkpoints;
+`eos_token_ids` in the RL config can override them for a new run (`[]` disables EOS).
+Standalone sampling/evaluation needs the original model
+assets, but does not require the original train/validation files. Evaluation and
+sample logs append on resume; `phase` and `step` identify each evaluation.
+
+### Runtime and Synchronization
 
 The runtime and synchronization rules are:
 

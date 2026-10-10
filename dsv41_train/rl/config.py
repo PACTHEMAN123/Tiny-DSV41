@@ -30,6 +30,15 @@ class RLConfig:
     checkpoint_interval: int = 1
     output_dir: str = "runs/default"
     worker_timeout_seconds: float = 600.0
+    max_prompt_tokens: int | None = None
+    length_policy: str = "error"
+    eos_token_ids: tuple[int, ...] | None = None
+    stop_token_sequences: tuple[tuple[int, ...], ...] = ()
+    truncated_reward: float | None = None
+    eval_interval: int = 0
+    eval_samples_per_prompt: int = 1
+    eval_seed: int = 1234
+    log_samples_per_step: int = 1
 
     @classmethod
     def from_dict(cls, values: dict) -> "RLConfig":
@@ -48,6 +57,10 @@ class RLConfig:
         for name in ("learner_devices", "rollout_devices"):
             if name in values:
                 values[name] = tuple(values[name])
+        if "stop_token_sequences" in values:
+            values["stop_token_sequences"] = tuple(tuple(ids) for ids in values["stop_token_sequences"])
+        if values.get("eos_token_ids") is not None:
+            values["eos_token_ids"] = tuple(values["eos_token_ids"])
         result = cls(**values)
         result.validate()
         return result
@@ -61,7 +74,7 @@ class RLConfig:
 
     def validate(self) -> None:
         for name in ("max_steps", "groups_per_step", "max_new_tokens", "queue_capacity",
-                     "num_threads", "checkpoint_interval"):
+                     "num_threads", "checkpoint_interval", "eval_samples_per_prompt"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -69,6 +82,21 @@ class RLConfig:
             raise ValueError("group_size must be at least two")
         if type(self.max_policy_lag) is not int or self.max_policy_lag < 0:
             raise ValueError("max_policy_lag must be a nonnegative integer")
+        for name in ("eval_interval", "log_samples_per_step", "eval_seed"):
+            if type(getattr(self, name)) is not int or not 0 <= getattr(self, name) < 2**63 - 1:
+                raise ValueError(f"{name} must be a nonnegative integer below 2**63 - 1")
+        if self.max_prompt_tokens is not None and (type(self.max_prompt_tokens) is not int or self.max_prompt_tokens < 1):
+            raise ValueError("max_prompt_tokens must be a positive integer or null")
+        if self.length_policy not in {"error", "skip"}:
+            raise ValueError("length_policy must be error or skip")
+        if self.eos_token_ids is not None and any(type(token) is not int or token < 0
+                                                for token in self.eos_token_ids):
+            raise ValueError("eos_token_ids must contain nonnegative integer IDs or be null")
+        for ids in self.stop_token_sequences:
+            if not ids or any(type(token) is not int or token < 0 for token in ids):
+                raise ValueError("stop_token_sequences must contain nonempty lists of nonnegative integer IDs")
+        if self.truncated_reward is not None and not math.isfinite(self.truncated_reward):
+            raise ValueError("truncated_reward must be finite or null")
         if type(self.seed) is not int or not 0 <= self.seed < 2**63 - 1:
             raise ValueError("seed must be an integer in [0, 2**63 - 1)")
         for name in ("temperature", "learning_rate", "max_grad_norm", "worker_timeout_seconds"):

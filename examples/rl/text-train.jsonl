@@ -1,0 +1,2 @@
+{"messages":[{"role":"system","content":"Answer with a number only ."},{"role":"user","content":"What is 1 + 1 ?"}],"answer":2,"task":"arithmetic"}
+{"prompt":"What is 2 + 1 ?","answer":3,"task":"arithmetic"}
