@@ -153,4 +153,23 @@ def fused_index_scores(
     return output
 
 
-__all__ = ["fused_index_scores"]
+def index_scores(query, keys, weights, starts, ends, width, candidates=None):
+    """Use fused CUDA scoring when supported, otherwise the PyTorch reference."""
+    # tl.arange tiles must be powers of two; tl.dot also requires at least 16.
+    fused_shape = all(size >= 16 and size & (size - 1) == 0 for size in query.shape[2:])
+    if query.is_cuda and triton is not None and fused_shape:
+        return fused_index_scores(query, keys, weights, starts, ends, width, candidates)
+    if width == 0:
+        return query.new_empty((*query.shape[:2], 0), dtype=torch.float32)
+    indices = starts.unsqueeze(-1) + torch.arange(width, device=query.device)
+    valid = indices < ends.unsqueeze(-1)
+    if candidates is not None:
+        valid = valid & candidates
+    rows = torch.arange(query.shape[0], device=query.device)[:, None, None]
+    gathered = keys[rows, indices.clamp_max(keys.shape[1] - 1)]
+    dots = torch.einsum("blhd,blkd->blkh", query.float(), gathered.float())
+    scores = (dots.relu() * query.shape[-1] ** -0.5 * weights.float().unsqueeze(2)).sum(-1)
+    return scores.masked_fill(~valid, float("-inf"))
+
+
+__all__ = ["fused_index_scores", "index_scores"]

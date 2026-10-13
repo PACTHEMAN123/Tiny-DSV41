@@ -10,7 +10,9 @@ deliberately outside this module.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, fields, replace
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -442,19 +444,23 @@ class DeepSeekV41Model(nn.Module):
         attention_mask: torch.Tensor | None = None,
         sequence_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-        if input_ids.ndim != 2:
-            raise ValueError("input_ids must have shape [batch, sequence]")
+        if input_ids.ndim != 2 or input_ids.shape[1] == 0:
+            raise ValueError("input_ids must have shape [batch, nonempty sequence]")
+        input_ids = input_ids.to(self.embedding.weight.device)
         _, global_length = input_ids.shape
         if global_length > self.config.max_position_embeddings:
             raise ValueError("sequence is longer than max_position_embeddings")
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
         else:
-            attention_mask = attention_mask.bool()
+            if attention_mask.shape != input_ids.shape:
+                raise ValueError("attention_mask must match input_ids")
+            attention_mask = attention_mask.to(device=input_ids.device, dtype=torch.bool)
         if sequence_ids is None:
             sequence_ids = torch.zeros_like(input_ids)
         elif sequence_ids.shape != input_ids.shape:
             raise ValueError("sequence_ids must have the same shape as input_ids")
+        sequence_ids = sequence_ids.to(input_ids.device)
         sequence_ids = sequence_ids.masked_fill(~attention_mask, -1)
 
         context = ModelContext.build(
@@ -464,6 +470,7 @@ class DeepSeekV41Model(nn.Module):
             sequence_ids,
             self.config.sliding_window,
         )
+        contexts = {input_ids.device: context}
         hashes = self.hash(input_ids, attention_mask, sequence_ids) if self.hash else None
 
         hidden = self.embedding(context.input_ids)
@@ -480,21 +487,32 @@ class DeepSeekV41Model(nn.Module):
         pre_mix[..., 0] = 1
         empty = hidden.new_empty(0)
         shadow = ShadowIndexers().dump(empty)
-        loader = checkpoint if self.gradient_checkpointing and self.training else _direct
+        loader = checkpoint if self.gradient_checkpointing and self.training and torch.is_grad_enabled() else _direct
         router_logits = []
         for layer in self.layers:
+            device = next(layer.parameters()).device
+            if device not in contexts:
+                contexts[device] = replace(context, **{
+                    field.name: value.to(device) for field in fields(context)
+                    if isinstance(value := getattr(context, field.name), torch.Tensor)
+                })
+            streams, pre_mix = streams.to(device), pre_mix.to(device)
+            shadow = tuple(value.to(device) for value in shadow)
             streams, pre_mix, logits, *shadow = loader(
-                lambda *args, current=layer: self._forward_layer(current, context, *args),
+                lambda *args, current=layer, local_context=contexts[device]:
+                    self._forward_layer(current, local_context, *args),
                 streams,
                 pre_mix,
-                engram_rows.get(layer.layer_id, empty),
+                engram_rows.get(layer.layer_id, empty).to(device),
                 *shadow,
                 use_reentrant=False,
             )
             router_logits.append(logits)
 
-        hidden = HyperConnection.collapse(streams, pre_mix)
-        return self.norm(hidden), tuple(router_logits)
+        device = self.norm.weight.device
+        with torch.cuda.device(device) if device.type == "cuda" else nullcontext():
+            hidden = HyperConnection.collapse(streams.to(device), pre_mix.to(device))
+            return self.norm(hidden), tuple(router_logits)
 
     def _forward_layer(
         self,
@@ -506,13 +524,15 @@ class DeepSeekV41Model(nn.Module):
         *shadow_tensors: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         shadow = ShadowIndexers.load(shadow_tensors)
-        streams, pre_mix, logits = layer(
-            streams,
-            pre_mix,
-            context,
-            shadow,
-            None if engram_row.numel() == 0 else engram_row,
-        )
+        # The context is needed on both the first execution and checkpoint replay.
+        with torch.cuda.device(streams.device) if streams.is_cuda else nullcontext():
+            streams, pre_mix, logits = layer(
+                streams,
+                pre_mix,
+                context,
+                shadow,
+                None if engram_row.numel() == 0 else engram_row,
+            )
         return streams, pre_mix, logits, *shadow.dump(streams.new_empty(0))
 
 
@@ -529,7 +549,7 @@ def load_balancing_loss(
     total = torch.zeros((), device=device)
     mask = None if attention_mask is None else attention_mask.flatten().float().to(device)
     for logits in router_logits:
-        probs = torch.softmax(logits.float(), dim=-1)
+        probs = torch.softmax(logits.float().to(device), dim=-1)
         selected = probs.topk(topk, dim=-1).indices
         if mask is None:
             assignments += torch.bincount(selected.flatten(), minlength=num_experts)
@@ -552,6 +572,7 @@ class CausalLMOutput:
     logits: torch.Tensor | None
     aux_loss: torch.Tensor | None
     router_logits: tuple[torch.Tensor, ...]
+    token_log_probs: torch.Tensor | None = None
 
 
 class DeepSeekV41ForCausalLM(nn.Module):
@@ -619,22 +640,68 @@ class DeepSeekV41ForCausalLM(nn.Module):
             reduction="sum",
         )
 
+    def _token_log_probs(
+        self, hidden: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor, temperature: float
+    ) -> torch.Tensor:
+        logits = self.lm_head(hidden[mask]).float() / temperature
+        selected = F.log_softmax(logits, dim=-1).gather(-1, targets[mask].unsqueeze(-1)).squeeze(-1)
+        return selected.new_zeros(mask.shape).masked_scatter(mask, selected)
+
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         sequence_ids: torch.Tensor | None = None,
+        *,
+        target_ids: torch.Tensor | None = None,
+        target_mask: torch.Tensor | None = None,
+        temperature: float = 1.0,
+        compute_aux_loss: bool = True,
     ) -> CausalLMOutput:
+        """Score aligned targets without shifting; masked positions return zero.
+
+        Token scores have shape [batch, local_sequence] under context parallelism.
+        Callers own target alignment, packed-boundary masks and loss reduction.
+        """
         token_mask = (
             torch.ones_like(input_ids, dtype=torch.bool)
             if attention_mask is None
-            else attention_mask.bool()
+            else attention_mask.to(device=input_ids.device, dtype=torch.bool)
         )
+        if token_mask.shape != input_ids.shape:
+            raise ValueError("attention_mask must match input_ids")
+        if target_ids is None and target_mask is not None:
+            raise ValueError("target_mask requires target_ids")
+        if target_ids is not None:
+            if labels is not None:
+                raise ValueError("labels and target_ids are mutually exclusive")
+            if target_ids.shape != input_ids.shape or target_ids.dtype != torch.long:
+                raise ValueError("target_ids must be int64 with the same shape as input_ids")
+            if not math.isfinite(temperature) or temperature <= 0:
+                raise ValueError("temperature must be finite and positive")
+            if target_mask is not None and target_mask.shape != input_ids.shape:
+                raise ValueError("target_mask must match input_ids")
+            target_mask = token_mask if target_mask is None else (
+                target_mask.to(device=input_ids.device, dtype=torch.bool) & token_mask
+            )
+            target_ids = target_ids.to(input_ids.device)
+            selected_targets = target_ids[target_mask]
+            if ((selected_targets < 0) | (selected_targets >= self.config.vocab_size)).any():
+                raise ValueError("target token ID is outside the model vocabulary")
         hidden, router_logits = self.model(input_ids, token_mask, sequence_ids)
         logits = None
         loss = None
-        if labels is not None:
+        token_log_probs = None
+        if target_ids is not None:
+            targets = self.context_parallel.shard(target_ids).to(hidden.device)
+            mask = self.context_parallel.shard(target_mask).to(hidden.device)
+            loader = checkpoint if self.training and torch.is_grad_enabled() else _direct
+            token_log_probs = loader(
+                self._token_log_probs, hidden, targets, mask, temperature, use_reentrant=False
+            )
+        elif labels is not None:
+            labels = labels.to(input_ids.device)
             targets = torch.full_like(labels, -100)
             targets[:, :-1] = labels[:, 1:]
             targets[:, :-1].masked_fill_(~token_mask[:, 1:], -100)
@@ -642,7 +709,7 @@ class DeepSeekV41ForCausalLM(nn.Module):
                 targets[:, :-1].masked_fill_(
                     sequence_ids[:, :-1] != sequence_ids[:, 1:], -100
                 )
-            targets = self.context_parallel.shard(targets)
+            targets = self.context_parallel.shard(targets).to(hidden.device)
             if self.training and torch.is_grad_enabled():
                 loss_sum = checkpoint(
                     self._lm_loss,
@@ -662,6 +729,8 @@ class DeepSeekV41ForCausalLM(nn.Module):
         else:
             logits = self.lm_head(hidden)
 
+        if not compute_aux_loss:
+            return CausalLMOutput(loss, logits, None, router_logits, token_log_probs)
         local_token_mask = self.context_parallel.shard(token_mask)
         auxiliary_logits = tuple(logits.detach().requires_grad_() for logits in router_logits)
         aux_loss = load_balancing_loss(
@@ -677,8 +746,8 @@ class DeepSeekV41ForCausalLM(nn.Module):
                 gradients = torch.autograd.grad(aux_loss, auxiliary_logits)
                 for layer, gradient in zip(self.model.layers, gradients):
                     layer.moe.stage_router_aux_gradient(gradient * coefficient)
-            loss = loss + coefficient * aux_loss.detach()
-        return CausalLMOutput(loss, logits, aux_loss, router_logits)
+            loss = loss + coefficient * aux_loss.detach().to(loss.device)
+        return CausalLMOutput(loss, logits, aux_loss, router_logits, token_log_probs)
 
 
 # Keep the former spelling available for callers migrating from Transformers.

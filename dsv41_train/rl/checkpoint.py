@@ -120,7 +120,7 @@ def load_training_checkpoint(path, model, optimizer, config, identity) -> dict:
     validate_identity(state["identity"], identity)
     mutable = {"max_steps", "output_dir", "checkpoint_interval", "worker_timeout_seconds",
                "learner_devices", "rollout_devices", "num_threads", "engram_offload",
-               "eval_interval", "log_samples_per_step"}
+               "eval_interval", "log_samples_per_step", "gradient_checkpointing"}
     current = json.loads(json.dumps(config.to_dict()))
     previous = json.loads(json.dumps(checkpoint_config(state["config"], model.config).to_dict()))
     if current["eos_token_ids"] is None:

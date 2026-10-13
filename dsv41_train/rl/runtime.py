@@ -26,9 +26,12 @@ from .tokenizer import ModelTokenizer
 
 def make_model(model_dir, model_config, config, devices, random_init, *, engram_weights=None):
     torch.manual_seed(config.seed)
-    return build_dsv41_policy(model_dir, model_config, random_init=random_init,
-                              devices=devices, dtype=getattr(torch, config.dtype),
-                              engram_weights=engram_weights, engram_offload=config.engram_offload)
+    model = build_dsv41_policy(model_dir, model_config, random_init=random_init,
+                               devices=devices, dtype=getattr(torch, config.dtype),
+                               engram_weights=engram_weights, engram_offload=config.engram_offload)
+    if config.gradient_checkpointing:
+        model.backend.gradient_checkpointing_enable()
+    return model
 
 
 def _rollout_worker(model_dir, model_config, config, records, random_init,

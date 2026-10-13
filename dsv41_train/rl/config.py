@@ -24,6 +24,7 @@ class RLConfig:
     learner_devices: tuple[str, ...] = ("cpu",)
     rollout_devices: tuple[str, ...] = ("cpu",)
     engram_offload: bool = True
+    gradient_checkpointing: bool = False
     dtype: str = "float32"
     seed: int = 42
     num_threads: int = 1
@@ -113,8 +114,9 @@ class RLConfig:
             raise ValueError("dtype must be float32 or bfloat16")
         if not self.reward or not self.output_dir:
             raise ValueError("reward and output_dir must not be empty")
-        if type(self.engram_offload) is not bool:
-            raise ValueError("engram_offload must be a boolean")
+        for name in ("engram_offload", "gradient_checkpointing"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a boolean")
         for devices in (self.learner_devices, self.rollout_devices):
             if not devices or len(set(devices)) != len(devices):
                 raise ValueError("device lists must be nonempty with no duplicates")

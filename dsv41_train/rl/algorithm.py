@@ -51,6 +51,16 @@ def response_log_probs(
     prompt = validate_token_ids(prompt_ids, "prompt_ids")
     response = validate_token_ids(response_ids, "response_ids")
     tokens = torch.tensor([prompt + response[:-1]], dtype=torch.long, device=input_device(model))
+    if getattr(model, "supports_token_log_probs", False):
+        targets = torch.full_like(tokens, -100)
+        targets[0, len(prompt) - 1:] = torch.tensor(response, device=tokens.device)
+        scores = model(tokens, attention_mask=torch.ones_like(tokens), target_ids=targets,
+                       target_mask=targets != -100, temperature=temperature)
+        if scores.shape != tokens.shape:
+            raise ValueError("model must return one log probability per input token")
+        log_probs = scores[0, len(prompt) - 1:]
+        _finite(log_probs, "response log probabilities")
+        return log_probs
     logits = extract_logits(model(tokens, attention_mask=torch.ones_like(tokens)))
     if logits.shape[1] != tokens.shape[1]:
         raise ValueError("model must return one logits vector per input token")

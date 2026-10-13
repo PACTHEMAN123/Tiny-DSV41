@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 
+from dsv41_train.rl.algorithm import response_log_probs
 from dsv41_train.rl.checkpoint import load_policy, policy_state
 from dsv41_train.rl.config import RLConfig
 from dsv41_train.rl.policy import DSV41Config
@@ -172,6 +173,18 @@ class ParallelRLTests(unittest.TestCase):
                 torch.testing.assert_close(parameter.grad.cpu(), original[name].grad.cpu(), rtol=5e-4, atol=2e-5)
         load_policy(parallel, policy_state(single))
         parallel.assert_engram_invariants()
+        single.zero_grad(set_to_none=True)
+        parallel.zero_grad(set_to_none=True)
+        parallel.backend.gradient_checkpointing_enable()
+        with torch.cuda.device(0), patch.object(HyperConnection, "collapse", checked_collapse):
+            expected = response_log_probs(single, [1, 4, 7, 3, 8, 9], [5, 6, 2], 0.8)
+            actual = response_log_probs(parallel, [1, 4, 7, 3, 8, 9], [5, 6, 2], 0.8)
+            torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=2e-4, atol=2e-5)
+            expected.sum().backward()
+            actual.sum().backward()
+        for name, parameter in parallel.named_parameters():
+            if parameter.grad is not None:
+                torch.testing.assert_close(parameter.grad.cpu(), original[name].grad.cpu(), rtol=5e-4, atol=2e-5)
 
     @unittest.skipUnless(torch.cuda.device_count() >= 2, "two CUDA devices required")
     def test_disabling_offload_places_frozen_tables_with_their_layers(self):

@@ -285,8 +285,17 @@ The runtime and synchronization rules are:
 - By default, Engram embedding tables and hash metadata stay on CPU. Tables are frozen
   buffers excluded from AdamW and policy/training snapshots; only selected rows
   move to the model device. Engram projections remain trainable. Sparse indexers
-  are frozen because their discrete selection has no GRPO gradient. A portable
-  PyTorch indexer uses stable tie ordering to keep prefix probabilities consistent.
+  are frozen because their discrete selection has no GRPO gradient. The shared
+  sparse indexer enables stable tie ordering for RL to keep prefix probabilities
+  consistent. Scoring uses Triton on supported CUDA shapes and a PyTorch reference
+  on CPU or unsupported shapes.
+- Policy generation and response scoring both enter the public SFT model forward.
+  Response scoring projects only selected hidden states, returns FP32 token
+  log probabilities, and checkpoints the LM head during training. It does not
+  add the SFT router auxiliary loss. `gradient_checkpointing: true` in the RL
+  JSON, or `--gradient-checkpointing`, also enables decoder recomputation during
+  learner backward. This execution setting can change on resume; old checkpoints
+  default to disabled. Evaluation and rollout do not recompute activations.
 - Training checkpoints include policy, optimizer, RNG state and data cursor;
   the original base tables are required to restore. Resume checks config/data,
   mapping hashes and base-file size/mtime. Queued/in-flight groups are regenerated,
@@ -300,6 +309,7 @@ CPU tests cover optimization, loading, storage shared across spawned processes,
 frozen tables, synchronization and train/resume/sample. Two-GPU tests compare
 logits/gradients and table placement when hardware is available; GPU and full
 released-checkpoint runs require validation on suitable hardware.
+See [the shared-forward interface and validation notes](docs/rl-shared-forward.md).
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_rl_*.py' -v

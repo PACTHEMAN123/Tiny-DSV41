@@ -21,6 +21,8 @@ def main():
     parser.add_argument("--rollout-num-gpus", type=int, help="rollout GPU count; allocated after trainer GPUs")
     parser.add_argument("--engram-offload", action=argparse.BooleanOptionalAction, default=None,
                         help="keep frozen Engram in shared CPU memory (default: enabled)")
+    parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=None,
+                        help="recompute decoder activations during learner backward (default: disabled)")
     args = parser.parse_args()
     values = RLConfig.from_json(args.config).to_dict()
     if args.max_steps is not None:
@@ -35,6 +37,8 @@ def main():
         values.update(trainer_num_gpus=args.trainer_num_gpus, rollout_num_gpus=args.rollout_num_gpus)
     if args.engram_offload is not None:
         values["engram_offload"] = args.engram_offload
+    if args.gradient_checkpointing is not None:
+        values["gradient_checkpointing"] = args.gradient_checkpointing
     checkpoint = run_training(model_dir=args.model_dir, data_path=args.data,
                               config=RLConfig.from_dict(values),
                               random_init=args.random_init, resume=args.resume, eval_data_path=args.eval_data)

@@ -14,7 +14,7 @@ from ....cp import ModelContext
 from ..config import DeepSeekV41Config
 from .sparse_attention import is_available as triton_attention_available
 from .sparse_attention import sparse_attention
-from .sparse_indexer import fused_index_scores
+from .sparse_indexer import index_scores
 
 
 class RMSNorm(nn.Module):
@@ -222,18 +222,29 @@ class ShadowIndexers:
         )
 
 
+def _select_topk(scores: torch.Tensor, count: int, *, stable: bool, sorted: bool = False):
+    if stable:
+        indices = torch.argsort(scores, dim=-1, descending=True, stable=True)[..., :count]
+        return scores.gather(-1, indices), indices
+    return scores.topk(count, dim=-1, sorted=sorted)
+
+
 def select_candidate_blocks(
-    scores: torch.Tensor, visible: torch.Tensor, topk_blocks: int, block_size: int
+    scores: torch.Tensor, visible: torch.Tensor, topk_blocks: int, block_size: int,
+    *, stable: bool = False,
 ) -> torch.Tensor:
     width = scores.shape[-1]
+    if width == 0:
+        return torch.zeros_like(scores, dtype=torch.bool)
     block_scores = F.pad(scores, (0, -width % block_size), value=float("-inf"))
     block_scores = block_scores.unflatten(-1, (-1, block_size)).amax(-1)
     last = (visible - 1) // block_size
     block_ids = torch.arange(block_scores.shape[-1], device=scores.device)
     block_scores = block_scores.masked_fill(block_ids == last.unsqueeze(-1), torch.inf)
-    picked = block_scores.topk(min(topk_blocks, block_scores.shape[-1]), dim=-1)
+    values, indices = _select_topk(block_scores, min(topk_blocks, block_scores.shape[-1]),
+                                 stable=stable, sorted=True)
     keep = torch.zeros_like(block_scores, dtype=torch.bool)
-    keep.scatter_(-1, picked.indices, picked.values > float("-inf"))
+    keep.scatter_(-1, indices, values > float("-inf"))
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 
 
@@ -242,6 +253,7 @@ class SparseIndexer(nn.Module):
         self, config: DeepSeekV41Config, layer_id: int, rotary: RotaryEmbedding
     ) -> None:
         super().__init__()
+        self.stable_topk = False
         self.owns_keys = layer_id in config.kv_source_layer_ids
         self.is_candidate_source = layer_id == config.candidate_source_layer_id
         self.uses_candidates = 0 <= config.candidate_source_layer_id < layer_id
@@ -307,7 +319,7 @@ class SparseIndexer(nn.Module):
         head_weights = self.weight_proj(x).float() * self.num_heads**-0.5
         max_sequence_width = int((sequence_ends - key_starts).max().item())
         previous_candidates = shadow.candidates if self.uses_candidates else None
-        scores = fused_index_scores(
+        scores = index_scores(
             query,
             keys,
             head_weights,
@@ -322,11 +334,12 @@ class SparseIndexer(nn.Module):
                 key_ends - key_starts,
                 self.topk_blocks,
                 self.block_size,
+                stable=self.stable_topk,
             )
-        picked = scores.topk(min(self.topk, scores.shape[-1]), dim=-1, sorted=False)
-        picked_indices = key_starts.unsqueeze(-1) + picked.indices
+        values, indices = _select_topk(scores, min(self.topk, scores.shape[-1]), stable=self.stable_topk)
+        picked_indices = key_starts.unsqueeze(-1) + indices
         shadow.topk_indices = torch.where(
-            picked.values > float("-inf"),
+            values > float("-inf"),
             picked_indices,
             torch.full_like(picked_indices, -1),
         )

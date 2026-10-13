@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 import torch
 
@@ -70,8 +70,7 @@ class DSV41Tests(unittest.TestCase):
         upstream = DeepSeekV41ForCausalLM(self.config)
         policy = self.policy()
         tokens = torch.tensor([[1, 4, 7, 3, 8, 9, 5, 6]])
-        with patch("dsv41_train.models.dsv4.attention.module.fused_index_scores", reference_scores):
-            expected = upstream(tokens).logits
+        expected = upstream(tokens).logits
         actual = policy(tokens)
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
         actual.square().mean().backward()
@@ -82,7 +81,7 @@ class DSV41Tests(unittest.TestCase):
                 torch.testing.assert_close(parameter.grad, original[name].grad, rtol=1e-4, atol=1e-6)
 
     def test_index_scores_match_independent_oracle_with_offsets_and_masks(self):
-        from dsv41_train.rl.indexer import index_scores
+        from dsv41_train.models.dsv4.attention.sparse_indexer import index_scores
 
         torch.manual_seed(2)
         query = torch.randn(2, 3, 2, 4)
@@ -96,6 +95,22 @@ class DSV41Tests(unittest.TestCase):
             actual = index_scores(query, keys, weights, starts, ends, 5, mask)
             torch.testing.assert_close(actual, expected)
         self.assertEqual(index_scores(query, keys, weights, starts, ends, 0).shape, (2, 3, 0))
+
+    def test_index_scores_fall_back_for_non_power_of_two_cuda_tiles(self):
+        from dsv41_train.models.dsv4.attention import sparse_indexer
+
+        starts, ends = torch.tensor([[0, 0]]), torch.tensor([[1, 3]])
+        for heads, dimension in ((48, 16), (16, 48)):
+            query = torch.randn(1, 2, heads, dimension)
+            keys = torch.randn(1, 3, dimension)
+            weights = torch.randn(1, 2, heads)
+            expected = reference_scores(query, keys, weights, starts, ends, 3)
+            # Simulate CUDA availability; still execute the real reference math.
+            with patch.object(torch.Tensor, "is_cuda", new_callable=PropertyMock, return_value=True), \
+                 patch.object(sparse_indexer, "triton", object()), \
+                 patch.object(sparse_indexer, "fused_index_scores", side_effect=RuntimeError("invalid Triton tile")):
+                actual = sparse_indexer.index_scores(query, keys, weights, starts, ends, 3)
+            torch.testing.assert_close(actual, expected)
 
     def test_engram_and_hash_stay_frozen_across_dtype_moves_and_updates(self):
         policy = self.policy()
@@ -183,14 +198,35 @@ class DSV41Tests(unittest.TestCase):
         # BF16 GEMMs may round differently for single-prefix and full-sequence shapes.
         torch.testing.assert_close(actual, torch.tensor(sample.behavior_log_probs), rtol=0, atol=0.002)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_cuda_fused_indexing_keeps_rollout_and_teacher_forcing_consistent(self):
+        # The fused scorer requires a multiple of 16 heads; the tiny default has two.
+        self.config.index_n_heads = 16
+        policy = make_model(MODEL_DIR, self.config, self.rl, ("cuda:0",), True)
+        for tied in (False, True):
+            if tied:
+                with torch.no_grad():
+                    for layer in policy.backend.model.layers:
+                        if layer.attention.indexer is not None:
+                            for parameter in layer.attention.indexer.parameters():
+                                parameter.zero_()
+            group = generate_group(
+                policy, PromptRecord([1, 4, 7, 3, 8, 9]), group_size=2, max_new_tokens=6,
+                temperature=0.8, eos_token_id=None, policy_version=0, group_id=0,
+                generator=torch.Generator().manual_seed(13), reward_fn=lambda r, ids: 0.0,
+            )
+            for sample in group.samples:
+                actual = response_log_probs(policy, sample.prompt_ids, sample.response_ids, 0.8)
+                torch.testing.assert_close(actual.cpu(), torch.tensor(sample.behavior_log_probs),
+                                           rtol=1e-5, atol=1e-5)
+
     def test_native_checkpoint_requires_mapping_and_all_weights(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "base"
             upstream = self.native_base(root)
             policy = make_model(root, self.config, self.rl, ("cpu",), False)
             tokens = torch.tensor([[1, 4, 7, 3]])
-            with patch("dsv41_train.models.dsv4.attention.module.fused_index_scores", reference_scores):
-                expected = upstream(tokens).logits
+            expected = upstream(tokens).logits
             torch.testing.assert_close(policy(tokens), expected)
             (root / "engram_token_map.pt").unlink()
             with self.assertRaisesRegex((ValueError, FileNotFoundError), "token.*map|tokenizer"):

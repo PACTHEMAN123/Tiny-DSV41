@@ -17,8 +17,7 @@ from dsv41_train.models.dsv4.checkpoint import _SafeTensorShard, load_dsv41_back
 from dsv41_train.models.dsv4.mhc import HyperConnection
 from dsv41_train.models.dsv4.model import DeepSeekV41ForCausalLM, NgramHash, build_compressed_token_map
 
-from .indexer import PortableSparseIndexer
-from .parallel import DeviceRotaryEmbedding, forward_logits, layer_device_map, validate_available_devices
+from .parallel import DeviceRotaryEmbedding, layer_device_map, validate_available_devices
 
 
 @dataclass
@@ -99,6 +98,8 @@ class _FrozenEmbedding(nn.Module):
 
 
 class DSV41Policy(nn.Module):
+    supports_token_log_probs = True
+
     def __init__(self, backend, *, engram_offload=True):
         super().__init__()
         self.backend = backend
@@ -115,10 +116,9 @@ class DSV41Policy(nn.Module):
         for layer in backend.model.layers:
             layer.attention.rotary = backend.model.rotary
             if layer.attention.indexer is not None:
-                with torch.device("meta"):
-                    indexer = PortableSparseIndexer(self.config, layer.layer_id, backend.model.rotary)
-                indexer.load_state_dict(layer.attention.indexer.state_dict(), assign=True)
-                layer.attention.indexer = indexer.requires_grad_(False)
+                layer.attention.indexer.rotary = backend.model.rotary
+                layer.attention.indexer.stable_topk = True
+                layer.attention.indexer.requires_grad_(False)
         self.assert_engram_invariants()
 
     @property
@@ -215,9 +215,12 @@ class DSV41Policy(nn.Module):
     def load_frozen_state_dict(self, state, *, include_engram=False):
         self._load_partition(state, self._partition(False, include_engram))
 
-    def forward(self, input_ids, attention_mask=None):
-        # The RL objective consumes logits; the SFT wrapper's auxiliary loss is unused.
-        return forward_logits(self.backend, input_ids, attention_mask)
+    def forward(self, input_ids, attention_mask=None, *, target_ids=None, target_mask=None,
+                temperature=1.0, sequence_ids=None):
+        output = self.backend(input_ids, attention_mask=attention_mask, sequence_ids=sequence_ids,
+                              target_ids=target_ids, target_mask=target_mask, temperature=temperature,
+                              compute_aux_loss=False)
+        return output.logits if target_ids is None else output.token_log_probs
 
 
 def _load_token_map(root, config):

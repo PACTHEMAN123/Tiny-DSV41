@@ -13,6 +13,16 @@ is not installed.
 
 ## CPU distributed parity
 
+Shared RL token log probabilities and checkpointed gradients, including a CP
+rank with no response tokens (model-level parity, not a distributed RL runtime):
+
+```bash
+PYTHONPATH=. python3 -m torch.distributed.run \
+  --nnodes=1 --nproc-per-node=2 \
+  --master-addr=127.0.0.1 --master-port=29503 \
+  tests/dsv4_rl_cp_parity.py
+```
+
 ```bash
 PYTHONPATH=. python3 -m torch.distributed.run \
   --nnodes=1 --nproc-per-node=2 \
