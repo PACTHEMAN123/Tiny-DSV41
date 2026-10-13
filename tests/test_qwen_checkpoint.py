@@ -6,6 +6,7 @@ import torch
 
 from dsv41_train.dispatch import TokenDispatcher
 from dsv41_train.models.qwen import Qwen3MoeForCausalLM, load_qwen3_moe
+from dsv41_train.layout import parameter_layouts
 from qwen_helpers import tiny_config, write_hf_checkpoint
 
 try:
@@ -50,6 +51,10 @@ class QwenCheckpointTest(unittest.TestCase):
             )
 
         start = config.num_experts // 2
+        layout = parameter_layouts(loaded)["model.layers.0.mlp.experts.gate_up_proj"]
+        self.assertEqual(layout.global_shape[0], config.num_experts)
+        self.assertEqual(layout.offsets[0], start)
+        self.assertEqual(layout.role, "experts")
         for layer_id in range(config.num_hidden_layers):
             expected = source.model.layers[layer_id].mlp.experts
             actual = loaded.model.layers[layer_id].mlp.experts

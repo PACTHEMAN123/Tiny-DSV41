@@ -60,13 +60,14 @@ class RowRouter:
 
     def prepare(self, indices, deduplicate=False):
         flat = indices.reshape(-1)
-        if flat.numel() and (flat.min() < 0 or flat.max() >= self.num_embeddings):
-            raise IndexError("embedding index is outside the configured row range")
         inverse = None
         if deduplicate:
             flat, inverse = torch.unique(flat, sorted=True, return_inverse=True)
         if self.size == 1:
+            if flat.numel() and (flat.min() < 0 or flat.max() >= self.num_embeddings):
+                raise IndexError("embedding index is outside the configured row range")
             return RowRequest(indices.shape, flat, inverse, None, [], [])
+        bounds = torch.stack(torch.aminmax(flat)) if flat.numel() else flat.new_tensor([0, -1])
         base, remainder = divmod(self.num_embeddings, self.size)
         owners = torch.where(
             flat < (base + 1) * remainder,
@@ -74,10 +75,16 @@ class RowRouter:
             remainder + torch.div(flat - (base + 1) * remainder, base, rounding_mode="floor"),
         )
         order = torch.argsort(owners, stable=True)
-        send = torch.bincount(owners, minlength=self.size).to(torch.int64)
+        # Fixed-size counts avoid bincount's device-to-host size read. Check
+        # bounds with the mandatory split-size transfer, without scalar syncs.
+        send = torch.zeros(self.size, dtype=torch.int64, device=flat.device)
+        send.scatter_add_(0, owners.clamp(0, self.size - 1).long(), torch.ones_like(owners, dtype=torch.int64))
         recv = torch.empty_like(send)
         dist.all_to_all_single(recv, send, group=self.group)
-        send, recv = send.tolist(), recv.tolist()
+        metadata = torch.cat((bounds, send, recv)).tolist()
+        if metadata[0] < 0 or metadata[1] >= self.num_embeddings:
+            raise IndexError("embedding index is outside the configured row range")
+        send, recv = metadata[2:2+self.size], metadata[2+self.size:]
         routed = self.exchange(flat[order], recv, send, autograd=False)
         return RowRequest(indices.shape, routed - self.row_start, inverse, order, send, recv)
 

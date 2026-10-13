@@ -123,6 +123,33 @@ class DSV4CheckpointTest(unittest.TestCase):
         expected = torch.tensor([[2.0] * 32 + [3.0] * 32, [4.0] * 32 + [5.0] * 32])
         torch.testing.assert_close(actual, expected)
 
+    def test_cpu_fp8_decode_matches_native_for_every_encoding_and_strided_input(self):
+        codes = torch.arange(256).to(torch.uint8).repeat(8)
+        weights = (codes.view(32, 64).view(torch.float8_e4m3fn),
+                   codes.view(64, 32).t().view(torch.float8_e4m3fn))
+        for weight in weights:
+            for rowwise in (False, True):
+                scale = torch.tensor([[.5, 2.0]]).expand(32 if rowwise else 1, 2)
+                expanded = scale.repeat_interleave(32, 1)
+                if not rowwise:
+                    expanded = expanded.repeat_interleave(32, 0)
+                for dtype in (torch.float32, torch.bfloat16):
+                    decode = dequantize_fp8_rows if rowwise else dequantize_fp8_blocks
+                    actual = decode(weight, scale, dtype=dtype)
+                    expected = (weight.float() * expanded).to(dtype)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+                    zeros = expected == 0
+                    torch.testing.assert_close(torch.signbit(actual[zeros]), torch.signbit(expected[zeros]))
+
+    def test_cpu_fp8_decode_preserves_non_fp8_fallback_and_empty_rows(self):
+        weight = torch.randn(3, 64, dtype=torch.bfloat16)
+        scale = torch.rand(3, 2)
+        expected = (weight.float() * scale.repeat_interleave(32, 1)).bfloat16()
+        torch.testing.assert_close(dequantize_fp8_rows(weight, scale), expected, rtol=0, atol=0)
+        empty = dequantize_fp8_rows(torch.empty(0, 64, dtype=torch.float8_e4m3fn), torch.empty(0, 2))
+        self.assertEqual(empty.shape, (0, 64))
+        self.assertEqual(empty.dtype, torch.bfloat16)
+
 
 if __name__ == "__main__":
     unittest.main()

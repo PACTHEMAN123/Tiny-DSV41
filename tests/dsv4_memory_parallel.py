@@ -28,6 +28,7 @@ from dsv41_train.optimization import OptimizerPolicy, build_optimizer
 from dsv41_train.sharded_state import StateAdapter
 from test_dsv4_loading import synthetic_checkpoint
 from test_memory_modules import memory_config, LocalMaterializer
+from memory_validation_cases import fixture_dimensions, validation_cases
 
 
 def collective_check(function):
@@ -99,6 +100,11 @@ def main():
     parser.add_argument("--case", type=int)
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--detect-anomaly", action="store_true")
+    parser.add_argument("--cache-bytes", type=int, default=0)
+    parser.add_argument("--disable-dedup", action="store_true")
+    parser.add_argument("--activation-checkpoint", choices=("none", "full"))
+    parser.add_argument("--match-reference-dedup", action="store_true",
+                        help="isolate placement from low-precision duplicate-reduction rounding")
     args = parser.parse_args()
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -107,41 +113,35 @@ def main():
         torch.cuda.set_device(device)
     torch.set_num_threads(1)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    dist.init_process_group("gloo" if args.cpu else "nccl", timeout=datetime.timedelta(seconds=60))
+    dist.init_process_group("gloo" if args.cpu else "nccl", timeout=datetime.timedelta(seconds=60),
+                            device_id=None if args.cpu else device)
     temporary = tempfile.TemporaryDirectory(prefix="dsv41-memory-") if rank == 0 else None
     paths = [temporary.name if temporary else None]
     dist.broadcast_object_list(paths)
     folder = Path(paths[0])
-    config = memory_config(n_routed_experts=6, engram_layer_ids=[1, 3], engram_num_embeddings=[127, 131])
+    experts, length = fixture_dimensions(world)
+    config = memory_config(n_routed_experts=experts, engram_layer_ids=[1, 3], engram_num_embeddings=[127, 131])
     if rank == 0:
         torch.manual_seed(42)
         synthetic_checkpoint(folder, config)
     dist.barrier()
     dtype = torch.bfloat16 if args.bf16 else torch.float32
     tolerance = 2e-3 if args.bf16 else 3e-5
-    if args.all_topologies:
-        cases = [(cp, ep, "direct_shard", "cpu", "async", True, False)
-                 for cp in range(1, world+1) for ep in range(1, world+1)
-                 if world % cp == world % ep == 0 and 12 % cp == 6 % ep == 0]
-    elif world == 6:
-        cases = [(2,3,"direct_shard","cpu","async",True,True),
-                 (3,2,"layerwise","cuda","sync",False,False)]
-    else:
-        cases = [(1,1,"layerwise","cuda","sync",False,False),
-                 (1,2,"direct_shard","cuda","sync",True,False),
-                 (2,1,"direct_shard","cpu","sync",False,True),
-                 (2,2,"direct_shard","cpu","async",True,False),
-                 (1,2,"layerwise","cpu","async",True,True)]
+    cases = validation_cases(world, args.all_topologies)
+    if args.case is not None and not 0 <= args.case < len(cases):
+        raise ValueError("case is outside the legal topology list")
     results = []
     try:
         for case, (cp_size, ep_size, mode, storage, prefetch, dedup, offload) in enumerate(cases):
             if args.case is not None and args.case != case:
                 continue
+            if args.disable_dedup:
+                dedup = False
             if rank == 0:
                 print(json.dumps({"case_start":case,"cp":cp_size,"ep":ep_size,"mode":mode,
                                   "storage":storage,"prefetch":prefetch,"offload":offload}), flush=True)
             meshes, cp, dispatcher = build_parallelism(cp_size, ep_size, device.type)
-            engram = EngramPolicy(storage, prefetch, dedup, 8192)
+            engram = EngramPolicy(storage, prefetch, dedup, 8192, args.cache_bytes)
             fsdp = FSDPPolicy((1,3) if offload and not args.cpu else ())
             def load(placement, *, baseline=False):
                 load_mode = "layerwise" if baseline else mode
@@ -152,7 +152,8 @@ def main():
                     dtype=dtype, context_parallel=cp, token_dispatcher=dispatcher, engram_mesh=meshes.engram,
                     sparse_engram_gradients=True, engram_policy=placement,
                     load_policy=LoadPolicy(load_mode, 19, 131072, True), materializer=materializer)
-                model.set_activation_checkpointing(ActivationCheckpointConfig("full" if dedup and not baseline else "none"))
+                checkpoint_mode = args.activation_checkpoint or ("full" if dedup and not baseline else "none")
+                model.set_activation_checkpointing(ActivationCheckpointConfig(checkpoint_mode))
                 return model
             if not args.cpu:
                 torch.cuda.reset_peak_memory_stats(device)
@@ -163,7 +164,7 @@ def main():
             load_seconds = time.perf_counter()-started
             # BF16 updates are compared at identical reduction topology. FP32
             # independently validates the distributed math against a full model.
-            reference = (load(EngramPolicy(), baseline=True) if args.bf16 else
+            reference = (load(EngramPolicy(deduplicate=dedup and args.match_reference_dedup), baseline=True) if args.bf16 else
                 load_dsv41_backbone_window(folder, num_layers=config.num_hidden_layers, device=device, dtype=dtype))
             optimizer = build_optimizer(model, OptimizerPolicy("sgd", .01, True))
             ref_optimizer = (build_optimizer(reference, OptimizerPolicy("sgd", .01)) if args.bf16
@@ -181,7 +182,7 @@ def main():
                     state_adapter=StateAdapter(target, cp=cp_size, ep=ep_size)))
             batches = []
             for dp in range(world//cp_size):
-                tokens = torch.randint(3,32,(1,12),generator=torch.Generator().manual_seed(123+dp)).to(device)
+                tokens = torch.randint(3,32,(1,length),generator=torch.Generator().manual_seed(123+dp)).to(device)
                 mask = torch.ones_like(tokens)
                 mask[:,-(dp%3+1):] = 0
                 batches.append((tokens,mask))
@@ -222,14 +223,17 @@ def main():
                     model.synchronize_engram()
                     manager(model, optimizer).save(1)
                     model.close()
-                    restored = load(EngramPolicy("cpu", "sync", False, 8192))
+                    restored = load(EngramPolicy("cpu", "sync", False, 8192, args.cache_bytes))
                     restored_optimizer = build_optimizer(restored, OptimizerPolicy("sgd", .01, True))
                     manager(restored, restored_optimizer).load()
                     compare(restored, reference, tolerance=tolerance, sharded_reference=args.bf16)
                     model, optimizer = restored, restored_optimizer
                     gradients = GradientPolicy(model, meshes, fsdp=not args.cpu)
             result = {"case":case,"rank":rank,"cp":cp_size,"ep":ep_size,"mode":mode,
+                      "experts":experts,"sequence_length":length,
+                      "reference_deduplicate":dedup and args.match_reference_dedup,
                       "reference":"same_topology" if args.bf16 else "unsharded", "dtype":str(dtype),
+                      "cache_bytes":args.cache_bytes, "activation_checkpoint":args.activation_checkpoint,
                       "storage":storage,"prefetch":prefetch,"offload":offload,"max_gradient_error":max_error,
                       "load_seconds":load_seconds,"parameter_bytes":parameter_memory(model,optimizer),
                       "peak_gib":0 if args.cpu else torch.cuda.max_memory_allocated(device)/1024**3}

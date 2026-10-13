@@ -9,7 +9,7 @@ from torch import nn
 
 from .policy import EngramPolicy
 from .routing import RowRouter, RowRequest
-from .storage import CPURowStore, LookupResult, RowStore
+from .storage import CPURowStore, CachedRowStore, LookupResult, RowStore
 
 
 @dataclass
@@ -34,6 +34,8 @@ class RowShardedEmbedding(nn.Module):
         self._executor = None
         self._pending = []
         self.metrics = {"lookup_rows": 0, "h2d_bytes": 0, "d2h_bytes": 0, "resolve_wait_seconds": 0.0}
+        self.metrics.update({key: 0 for key in ("cache_hits", "cache_misses", "cache_fill_rows", "cache_evictions",
+                                              "cache_invalidated_rows", "cache_metadata_h2d_bytes")})
         self.configure(policy or EngramPolicy())
 
     def configure(self, policy):
@@ -41,11 +43,16 @@ class RowShardedEmbedding(nn.Module):
         if policy.device == "cpu" and not self.sparse_gradients:
             raise ValueError("CPU Engram requires sparse gradients and SGD")
         self.policy = policy
-        self.store = CPURowStore(policy.staging_bytes, self.metrics) if policy.device == "cpu" else RowStore()
+        self.store = CPURowStore(policy.staging_bytes, self.metrics, policy.cache_bytes) if policy.device == "cpu" else RowStore()
+        if policy.device == "cuda" and policy.cache_bytes:
+            if not self.sparse_gradients:
+                raise ValueError("Engram cache requires sparse gradients")
+            self.store = CachedRowStore(policy.cache_bytes, self.metrics)
         if policy.device == "cpu" and not self.weight.is_meta:
             self.weight.data = self.weight.data.cpu()
 
     def _apply(self, fn, recurse=True):
+        self.clear_cache()
         if self.policy.device == "cpu" and not self.weight.is_meta:
             probe = fn(torch.empty(0, dtype=self.weight.dtype, device="cpu"))
             if probe.device.type != "cpu":
@@ -58,16 +65,23 @@ class RowShardedEmbedding(nn.Module):
         request = self.router.prepare(indices, self.policy.deduplicate)
         device = indices.device
         self.metrics["lookup_rows"] += request.local_ids.numel()
-        if self.policy.device == "cpu" and device.type == "cuda":
-            self.metrics["h2d_bytes"] += request.local_ids.numel() * self.embedding_dim * self.weight.element_size()
+        ids_ready = None
+        if self.policy.prefetch == "async" and request.local_ids.is_cuda:
+            # The caller enqueues D2H after routing; only the worker waits for
+            # completion. The ticket/autograd retain these IDs until consumption.
+            local_ids = torch.empty_like(request.local_ids, device="cpu", pin_memory=True)
+            local_ids.copy_(request.local_ids, non_blocking=True)
+            ids_ready = torch.cuda.Event()
+            ids_ready.record(torch.cuda.current_stream(device))
+            request.local_ids = local_ids
         grad_enabled = torch.is_grad_enabled()
         # Capture thread-local autograd mode; communication always remains on the caller thread.
         def lookup():
             with torch.set_grad_enabled(grad_enabled):
+                if ids_ready is not None:
+                    ids_ready.synchronize()
                 return self.store.lookup(self.weight, request.local_ids, sparse=self.sparse_gradients, device=device)
         if self.policy.prefetch == "async":
-            # Complete D2H IDs before letting the worker read them on its own CUDA stream.
-            request.local_ids = request.local_ids.cpu()
             if self._executor is None:
                 self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engram")
             result = self._executor.submit(lookup)
@@ -97,6 +111,16 @@ class RowShardedEmbedding(nn.Module):
     def forward(self, indices):
         return self.resolve(self.prefetch(indices))
 
+    def clear_cache(self):
+        self.synchronize()
+        cache = getattr(self.store, "cache", None)
+        if cache is not None:
+            cache.clear()
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        self.clear_cache()
+        return super()._load_from_state_dict(*args, **kwargs)
+
     def synchronize(self):
         for ticket in self._pending:
             result = ticket.result.result() if isinstance(ticket.result, Future) else ticket.result
@@ -112,3 +136,4 @@ class RowShardedEmbedding(nn.Module):
         for ticket in self._pending:
             ticket.resolved = True
         self._pending.clear()
+        self.clear_cache()

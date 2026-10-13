@@ -1,0 +1,2433 @@
+{
+  "workload": {
+    "world": 2,
+    "cp": 1,
+    "ep": 2,
+    "steps": 5,
+    "warmup": 2,
+    "microbatches": 2,
+    "sequence_length": 128,
+    "config": {
+      "vocab_size": 512,
+      "hidden_size": 128,
+      "num_hidden_layers": 5,
+      "num_attention_heads": 4,
+      "head_dim": 32,
+      "q_lora_rank": 64,
+      "qk_rope_head_dim": 16,
+      "rope_theta": 10000.0,
+      "compress_rope_theta": 160000.0,
+      "rope_scaling": null,
+      "max_position_embeddings": 512,
+      "attention_dropout": 0.0,
+      "cache_quantization": "none",
+      "sliding_window": 64,
+      "compress_ratios": [
+        0,
+        2,
+        2,
+        1,
+        1
+      ],
+      "kv_source_layer_ids": [
+        1,
+        3
+      ],
+      "index_source_layer_ids": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "candidate_source_layer_id": 3,
+      "candidate_topk_blocks": 8,
+      "candidate_block_size": 8,
+      "index_n_heads": 2,
+      "index_head_dim": 32,
+      "index_topk": 16,
+      "o_groups": 4,
+      "o_lora_rank": 64,
+      "moe_intermediate_size": 256,
+      "n_routed_experts": 8,
+      "num_experts_per_tok": 2,
+      "scoring_func": "sqrtsoftplus",
+      "gate_temp": 1.0,
+      "norm_topk_prob": true,
+      "routed_scaling_factor": 1.5,
+      "swiglu_limit": 10.0,
+      "hc_mult": 4,
+      "hc_sinkhorn_iters": 20,
+      "hc_eps": 1e-06,
+      "engram_layer_ids": [
+        1,
+        3
+      ],
+      "engram_vocab_size": 5300,
+      "engram_num_embeddings": [
+        65539,
+        65543
+      ],
+      "engram_max_ngram_size": 4,
+      "engram_n_heads": 4,
+      "engram_head_dim": 64,
+      "engram_pad_id": 0,
+      "engram_compressed_vocab_size": 512,
+      "initializer_range": 0.02,
+      "rms_norm_eps": 1e-20,
+      "router_aux_loss_coef": 0.001,
+      "pad_token_id": 0,
+      "bos_token_id": 1,
+      "eos_token_id": 2
+    },
+    "torch": "2.10.0+cu129",
+    "gpu": "NVIDIA H20",
+    "learning_rate": 0.0001,
+    "load_profiled": false
+  },
+  "loading_implementations": [
+    "/data0/guorunfan.grf/dsv41/Tiny-DSV41/dsv41_train/loading/source.py"
+  ],
+  "planned_trials": 15,
+  "completed_trials": 15,
+  "failures": [],
+  "variants": {
+    "combined": {
+      "completed_trials": 3,
+      "metrics": {
+        "tokens_per_second": {
+          "median": 1398.9240438379734,
+          "min": 1388.823543696661,
+          "max": 1439.5796232092757,
+          "samples": [
+            1388.823543696661,
+            1439.5796232092757,
+            1398.9240438379734
+          ]
+        },
+        "load_seconds": {
+          "median": 0.9720174670219421,
+          "min": 0.95562731300015,
+          "max": 1.0778815309749916,
+          "samples": [
+            1.0778815309749916,
+            0.9720174670219421,
+            0.95562731300015
+          ]
+        },
+        "load_peak_bytes": {
+          "median": 3159040,
+          "min": 3159040,
+          "max": 3159040,
+          "samples": [
+            3159040,
+            3159040,
+            3159040
+          ]
+        },
+        "train_peak_bytes": {
+          "median": 113867264,
+          "min": 113867264,
+          "max": 113867264,
+          "samples": [
+            113867264,
+            113867264,
+            113867264
+          ]
+        },
+        "allocated_bytes": {
+          "median": 73391104,
+          "min": 73391104,
+          "max": 73391104,
+          "samples": [
+            73391104,
+            73391104,
+            73391104
+          ]
+        },
+        "reserved_bytes": {
+          "median": 165675008,
+          "min": 165675008,
+          "max": 165675008,
+          "samples": [
+            165675008,
+            165675008,
+            165675008
+          ]
+        },
+        "cpu_max_rss_bytes": {
+          "median": 2252967936,
+          "min": 2240561152,
+          "max": 2256384000,
+          "samples": [
+            2240561152,
+            2252967936,
+            2256384000
+          ]
+        },
+        "logical_bytes_read": {
+          "median": 14836696,
+          "min": 14836696,
+          "max": 14836696,
+          "samples": [
+            14836696,
+            14836696,
+            14836696
+          ]
+        },
+        "engram_h2d_bytes_per_step": {
+          "median": 1555712.0,
+          "min": 1555712.0,
+          "max": 1555712.0,
+          "samples": [
+            1555712.0,
+            1555712.0,
+            1555712.0
+          ]
+        },
+        "engram_d2h_bytes_per_step": {
+          "median": 1555712.0,
+          "min": 1555712.0,
+          "max": 1555712.0,
+          "samples": [
+            1555712.0,
+            1555712.0,
+            1555712.0
+          ]
+        },
+        "engram_lookup_rows_per_step": {
+          "median": 12154.0,
+          "min": 12154.0,
+          "max": 12154.0,
+          "samples": [
+            12154.0,
+            12154.0,
+            12154.0
+          ]
+        },
+        "engram_resolve_host_ms_per_step_max_rank": {
+          "median": 1.3182813068851829,
+          "min": 1.285496586933732,
+          "max": 1.373266731388867,
+          "samples": [
+            1.373266731388867,
+            1.285496586933732,
+            1.3182813068851829
+          ]
+        }
+      },
+      "throughput_ratio_to_baseline": {
+        "median": 0.9310363578708727,
+        "min": 0.8940622745085629,
+        "max": 0.9827805475956962,
+        "samples": [
+          0.8940622745085629,
+          0.9827805475956962,
+          0.9310363578708727
+        ]
+      },
+      "max_loss_difference_from_baseline": 0.0,
+      "trials": [
+        {
+          "tokens_per_second": 1388.823543696661,
+          "load_seconds": 1.0778815309749916,
+          "load_peak_bytes": 3159040,
+          "train_peak_bytes": 113867264,
+          "allocated_bytes": 73391104,
+          "reserved_bytes": 165675008,
+          "cpu_max_rss_bytes": 2240561152,
+          "logical_bytes_read": 14836696,
+          "engram_h2d_bytes_per_step": 1555712.0,
+          "engram_d2h_bytes_per_step": 1555712.0,
+          "engram_lookup_rows_per_step": 12154.0,
+          "engram_resolve_host_ms_per_step_max_rank": 1.373266731388867,
+          "engram_lookup_rows_by_rank_per_step": [
+            6169.0,
+            5985.0
+          ],
+          "slowest_rank_step_ms": [
+            358.42744691763073,
+            392.0856099575758,
+            380.135728046298,
+            359.5105030108243,
+            357.540420955047
+          ],
+          "losses_by_rank": [
+            [
+              6.295065402984619,
+              6.295202732086182,
+              6.294191360473633,
+              6.294251441955566,
+              6.294589042663574
+            ],
+            [
+              6.283998012542725,
+              6.283568382263184,
+              6.283926963806152,
+              6.283775329589844,
+              6.284089088439941
+            ]
+          ],
+          "label": "combined-r0",
+          "repeat": 0
+        },
+        {
+          "tokens_per_second": 1439.5796232092757,
+          "load_seconds": 0.9720174670219421,
+          "load_peak_bytes": 3159040,
+          "train_peak_bytes": 113867264,
+          "allocated_bytes": 73391104,
+          "reserved_bytes": 165675008,
+          "cpu_max_rss_bytes": 2252967936,
+          "logical_bytes_read": 14836696,
+          "engram_h2d_bytes_per_step": 1555712.0,
+          "engram_d2h_bytes_per_step": 1555712.0,
+          "engram_lookup_rows_per_step": 12154.0,
+          "engram_resolve_host_ms_per_step_max_rank": 1.285496586933732,
+          "engram_lookup_rows_by_rank_per_step": [
+            6169.0,
+            5985.0
+          ],
+          "slowest_rank_step_ms": [
+            357.2274750331417,
+            353.70101197622716,
+            351.2104330584407,
+            369.5609220303595,
+            346.94458392914385
+          ],
+          "losses_by_rank": [
+            [
+              6.295065402984619,
+              6.295202732086182,
+              6.294191360473633,
+              6.294251441955566,
+              6.294589042663574
+            ],
+            [
+              6.283998012542725,
+              6.283568382263184,
+              6.283926963806152,
+              6.283775329589844,
+              6.284089088439941
+            ]
+          ],
+          "label": "combined-r1",
+          "repeat": 1
+        },
+        {
+          "tokens_per_second": 1398.9240438379734,
+          "load_seconds": 0.95562731300015,
+          "load_peak_bytes": 3159040,
+          "train_peak_bytes": 113867264,
+          "allocated_bytes": 73391104,
+          "reserved_bytes": 165675008,
+          "cpu_max_rss_bytes": 2256384000,
+          "logical_bytes_read": 14836696,
+          "engram_h2d_bytes_per_step": 1555712.0,
+          "engram_d2h_bytes_per_step": 1555712.0,
+          "engram_lookup_rows_per_step": 12154.0,
+          "engram_resolve_host_ms_per_step_max_rank": 1.3182813068851829,
+          "engram_lookup_rows_by_rank_per_step": [
+            6169.0,
+            5985.0
+          ],
+          "slowest_rank_step_ms": [
+            402.73198403883725,
+            361.4200090523809,
+            359.18159293942153,
+            359.06100599095225,
+            349.6426809579134
+          ],
+          "losses_by_rank": [
+            [
+              6.295065402984619,
+              6.295202732086182,
+              6.294191360473633,
+              6.294251441955566,
+              6.294589042663574
+            ],
+            [
+              6.283998012542725,
+              6.283568382263184,
+              6.283926963806152,
+              6.283775329589844,
+              6.284089088439941
+            ]
+          ],
+          "label": "combined-r2",
+          "repeat": 2
+        }
+      ]
+    },
+    "direct": {
+      "completed_trials": 3,
+      "metrics": {
+        "tokens_per_second": {
+          "median": 1488.231622063051,
+          "min": 1412.3241493253072,
+          "max": 1521.3614613023715,
+          "samples": [
+            1412.3241493253072,
+            1521.3614613023715,
+            1488.231622063051
+          ]
+        },
+        "load_seconds": {
+          "median": 0.9437946530524641,
+          "min": 0.9405583610059693,
+          "max": 0.955784076009877,
+          "samples": [
+            0.9437946530524641,
+            0.9405583610059693,
+            0.955784076009877
+          ]
+        },
+        "load_peak_bytes": {
+          "median": 14561280,
+          "min": 14561280,
+          "max": 14561280,
+          "samples": [
+            14561280,
+            14561280,
+            14561280
+          ]
+        },
+        "train_peak_bytes": {
+          "median": 128679936,
+          "min": 128679936,
+          "max": 128679936,
+          "samples": [
+            128679936,
+            128679936,
+            128679936
+          ]
+        },
+        "allocated_bytes": {
+          "median": 88602112,
+          "min": 88602112,
+          "max": 88602112,
+          "samples": [
+            88602112,
+            88602112,
+            88602112
+          ]
+        },
+        "reserved_bytes": {
+          "median": 167772160,
+          "min": 167772160,
+          "max": 167772160,
+          "samples": [
+            167772160,
+            167772160,
+            167772160
+          ]
+        },
+        "cpu_max_rss_bytes": {
+          "median": 2231148544,
+          "min": 2228494336,
+          "max": 2259525632,
+          "samples": [
+            2259525632,
+            2231148544,
+            2228494336
+          ]
+        },
+        "logical_bytes_read": {
+          "median": 14836696,
+          "min": 14836696,
+          "max": 14836696,
+          "samples": [
+            14836696,
+            14836696,
+            14836696
+          ]
+        },
+        "engram_h2d_bytes_per_step": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "samples": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "engram_d2h_bytes_per_step": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "samples": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "engram_lookup_rows_per_step": {
+          "median": 12288.0,
+          "min": 12288.0,
+          "max": 12288.0,
+          "samples": [
+            12288.0,
+            12288.0,
+            12288.0
+          ]
+        },
+        "engram_resolve_host_ms_per_step_max_rank": {
+          "median": 0.9785822359845042,
+          "min": 0.9432586375623941,
+          "max": 0.9870430454611778,
+          "samples": [
+            0.9785822359845042,
+            0.9432586375623941,
+            0.9870430454611778
+          ]
+        }
+      },
+      "throughput_ratio_to_baseline": {
+        "median": 0.9904738968331916,
+        "min": 0.9091909098316296,
+        "max": 1.0386118460724953,
+        "samples": [
+          0.9091909098316296,
+          1.0386118460724953,
+          0.9904738968331916
+        ]
+      },
+      "max_loss_difference_from_baseline": 0.0,
+      "trials": [
+        {
+          "tokens_per_second": 1412.3241493253072,
+          "load_seconds": 0.9437946530524641,
+          "load_peak_bytes": 14561280,
+          "train_peak_bytes": 128679936,
+          "allocated_bytes": 88602112,
+          "reserved_bytes": 167772160,
+          "cpu_max_rss_bytes": 2259525632,
+          "logical_bytes_read": 14836696,
+          "engram_h2d_bytes_per_step": 0.0,
+          "engram_d2h_bytes_per_step": 0.0,
+          "engram_lookup_rows_per_step": 12288.0,
+          "engram_resolve_host_ms_per_step_max_rank": 0.9785822359845042,
+          "engram_lookup_rows_by_rank_per_step": [
+            6241.0,
+            6047.0
+          ],
+          "slowest_rank_step_ms": [
+            354.00397202465683,
+            369.0630369819701,
+            360.5598289286718,
+            359.79637200944126,
+            371.26174196600914
+          ],
+          "losses_by_rank": [
+            [
+              6.295065402984619,
+              6.295202732086182,
+              6.294191360473633,
+              6.294251441955566,
+              6.294589042663574
+            ],
+            [
+              6.283998012542725,
+              6.283568382263184,
+              6.283926963806152,
+              6.283775329589844,
+              6.284089088439941
+            ]
+          ],
+          "label": "direct-r0",
+          "repeat": 0
+        },
+        {
+          "tokens_per_second": 1521.3614613023715,
+          "load_seconds": 0.9405583610059693,
+          "load_peak_bytes": 14561280,
+          "train_peak_bytes": 128679936,
+          "allocated_bytes": 88602112,
+          "reserved_bytes": 167772160,
+          "cpu_max_rss_bytes": 2231148544,
+          "logical_bytes_read": 14836696,
+          "engram_h2d_bytes_per_step": 0.0,
+          "engram_d2h_bytes_per_step": 0.0,
+          "engram_lookup_rows_per_step": 12288.0,
+          "engram_resolve_host_ms_per_step_max_rank": 0.9432586375623941,
+          "engram_lookup_rows_by_rank_per_step": [
+            6241.0,
+            6047.0
+          ],
+          "slowest_rank_step_ms": [
+            337.9924970213324,
+            337.929975008592,
+            336.551585001871,
+            339.1902749426663,
+            334.38424102496356
+          ],
+          "losses_by_rank": [
+            [
+              6.295065402984619,
+              6.295202732086182,
+              6.294191360473633,
+              6.294251441955566,
+              6.294589042663574
+            ],
+            [
+              6.283998012542725,
+              6.283568382263184,
+              6.283926963806152,
+              6.283775329589844,
+              6.284089088439941
+            ]
+          ],
+          "label": "direct-r1",
+          "repeat": 1
+        },
+        {
+          "tokens_per_second": 1488.231622063051,
+          "load_seconds": 0.955784076009877,
+          "load_peak_bytes": 14561280,
+          "train_peak_bytes": 128679936,
+          "allocated_bytes": 88602112,
+          "reserved_bytes": 167772160,
+          "cpu_max_rss_bytes": 2228494336,
+          "logical_bytes_read": 14836696,
+          "engram_h2d_bytes_per_step": 0.0,
+          "engram_d2h_bytes_per_step": 0.0,
+          "engram_lookup_rows_per_step": 12288.0,
+          "engram_resolve_host_ms_per_step_max_rank": 0.9870430454611778,
+          "engram_lookup_rows_by_rank_per_step": [
+            6241.0,
+            6047.0
+          ],
+          "slowest_rank_step_ms": [
+            332.07375707570463,
+            336.40961395576596,
+            353.6758190020919,
+            354.2482160264626,
+            348.635851056315
+          ],
+          "losses_by_rank": [
+            [
+              6.295065402984619,
+              6.295202732086182,
+              6.294191360473633,
+              6.294251441955566,
+              6.294589042663574
+            ],
+            [
+              6.283998012542725,
+              6.283568382263184,
+              6.283926963806152,
+              6.283775329589844,
+              6.284089088439941
+            ]
+          ],
+          "label": "direct-r2",
+          "repeat": 2
+        }
+      ]
+    },
+    "cpu": {
+      "completed_trials": 3,
+      "metrics": {
+        "tokens_per_second": {
+          "median": 1441.8222156996248,
+          "min": 1386.4563214427958,
+          "max": 1458.9350677252364,
+          "samples": [
+            1441.8222156996248,
+            1458.9350677252364,
+            1386.4563214427958
+          ]
+        },
+        "load_seconds": {
+          "median": 0.9711017679655924,
+          "min": 0.9620467759668827,
+          "max": 0.9962162160081789,
+          "samples": [
+            0.9962162160081789,
+            0.9620467759668827,
+            0.9711017679655924
+          ]
+        },
+        "load_peak_bytes": {
+          "median": 10422784,
+          "min": 10422784,
+          "max": 10422784,
+          "samples": [
+            10422784,
+            10422784,
+            10422784
+          ]
+        },
+        "train_peak_bytes": {
+          "median": 119865856,
+          "min": 119865856,
+          "max": 119865856,
+          "samples": [
+            119865856,
+            119865856,
+            119865856
+          ]
+        },
+        "allocated_bytes": {
+          "median": 79399936,
+          "min": 79399936,
+          "max": 79399936,
+          "samples": [
+            79399936,
+            79399936,
+            79399936
+          ]
+        },
+        "reserved_bytes": {
+          "median": 171966464,
+          "min": 171966464,
+          "max": 171966464,
+          "samples": [
+            171966464,
+            171966464,
+            171966464
+          ]
+        },
+        "cpu_max_rss_bytes": {
+          "median": 2250600448,
+          "min": 2247532544,
+          "max": 2272862208,
+          "samples": [
+            2250600448,
+            2247532544,
+            2272862208
+          ]
+        },
+        "logical_bytes_read": {
+          "median": 17736448,
+          "min": 17736448,
+          "max": 17736448,
+          "samples": [
+            17736448,
+            17736448,
+            17736448
+          ]
+        },
+        "engram_h2d_bytes_per_step": {
+          "median": 1572864.0,
+          "min": 1572864.0,
+          "max": 1572864.0,
+          "samples": [
+            1572864.0,
+            1572864.0,
+            1572864.0
+          ]
+        },
+        "engram_d2h_bytes_per_step": {
+          "median": 1572864.0,
+          "min": 1572864.0,
+          "max": 1572864.0,
+          "samples": [
+            1572864.0,
+            1572864.0,
+            1572864.0
+          ]
+        },
+        "engram_lookup_rows_per_step": {
+          "median": 12288.0,
+          "min": 12288.0,
+          "max": 12288.0,
+          "samples": [
+            12288.0,
+            12288.0,
+            12288.0
+          ]
+        },
+        "engram_resolve_host_ms_per_step_max_rank": {
+          "median": 1.1497068451717496,
+          "min": 1.1445204494521022,
+          "max": 1.1899630073457956,
+          "samples": [
+            1.1445204494521022,
+            1.1899630073457956,
+            1.1497068451717496
+          ]
+        }
+      },
+      "throughput_ratio_to_baseline": {
+        "median": 0.9281804412490112,
+        "min": 0.922738621549246,
+        "max": 0.9959942344621077,
+        "samples": [
+          0.9281804412490112,
+          0.9959942344621077,
+          0.922738621549246
+        ]
+      },
+      "max_loss_difference_from_baseline": 0.0,
+      "trials": [
+        {
+          "tokens_per_second": 1441.8222156996248,
+          "load_seconds": 0.9962162160081789,
+          "load_peak_bytes": 10422784,
+          "train_peak_bytes": 119865856,
+          "allocated_bytes": 79399936,
+          "reserved_bytes": 171966464,
+          "cpu_max_rss_bytes": 2250600448,
+          "logical_bytes_read": 17736448,
+          "engram_h2d_bytes_per_step": 1572864.0,
+          "engram_d2h_bytes_per_step": 1572864.0,
+          "engram_lookup_rows_per_step": 12288.0,
+          "engram_resolve_host_ms_per_step_max_rank": 1.1445204494521022,
+          "engram_lookup_rows_by_rank_per_step": [
+            6241.0,
+            6047.0
+          ],
+          "slowest_rank_step_ms": [
+            361.91756499465555,
+            360.74842291418463,
+            346.3879080954939,
+            362.5730579951778,
+            344.9796380009502
+          ],
+          "losses_by_rank": [
+            [
+              6.295065402984619,
+              6.295202732086182,
+              6.294191360473633,
+              6.294251441955566,
+              6.294589042663574
+            ],
+            [
+              6.283998012542725,
+              6.283568382263184,
+              6.283926963806152,
+              6.283775329589844,
+              6.284089088439941
+            ]
+          ],
+          "label": "cpu-r0",
+          "repeat": 0
+        },
+        {
+          "tokens_per_second": 1458.9350677252364,
+          "load_seconds": 0.9620467759668827,
+          "load_peak_bytes": 10422784,
+          "train_peak_bytes": 119865856,
+          "allocated_bytes": 79399936,
+          "reserved_bytes": 171966464,
+          "cpu_max_rss_bytes": 2247532544,
+          "logical_bytes_read": 17736448,
+          "engram_h2d_bytes_per_step": 1572864.0,
+          "engram_d2h_bytes_per_step": 1572864.0,
+          "engram_lookup_rows_per_step": 12288.0,
+          "engram_resolve_host_ms_per_step_max_rank": 1.1899630073457956,
+          "engram_lookup_rows_by_rank_per_step": [
+            6241.0,
+            6047.0
+          ],
+          "slowest_rank_step_ms": [
+            349.2649559630081,
+            349.38784199766815,
+            356.1274780659005,
+            350.5348010221496,
+            353.25143090449274
+          ],
+          "losses_by_rank": [
+            [
+              6.295065402984619,
+              6.295202732086182,
+              6.294191360473633,
+              6.294251441955566,
+              6.294589042663574
+            ],
+            [
+              6.283998012542725,
+              6.283568382263184,
+              6.283926963806152,
+              6.283775329589844,
+              6.284089088439941
+            ]
+          ],
+          "label": "cpu-r1",
+          "repeat": 1
+        },
+        {
+          "tokens_per_second": 1386.4563214427958,
+          "load_seconds": 0.9711017679655924,
+          "load_peak_bytes": 10422784,
+          "train_peak_bytes": 119865856,
+          "allocated_bytes": 79399936,
+          "reserved_bytes": 171966464,
+          "cpu_max_rss_bytes": 2272862208,
+          "logical_bytes_read": 17736448,
+          "engram_h2d_bytes_per_step": 1572864.0,
+          "engram_d2h_bytes_per_step": 1572864.0,
+          "engram_lookup_rows_per_step": 12288.0,
+          "engram_resolve_host_ms_per_step_max_rank": 1.1497068451717496,
+          "engram_lookup_rows_by_rank_per_step": [
+            6241.0,
+            6047.0
+          ],
+          "slowest_rank_step_ms": [
+            344.0304748946801,
+            353.7435010075569,
+            398.2858069939539,
+            411.6552530322224,
+            342.40966103971004
+          ],
+          "losses_by_rank": [
+            [
+              6.295065402984619,
+              6.295202732086182,
+              6.294191360473633,
+              6.294251441955566,
+              6.294589042663574
+            ],
+            [
+              6.283998012542725,
+              6.283568382263184,
+              6.283926963806152,
+              6.283775329589844,
+              6.284089088439941
+            ]
+          ],
+          "label": "cpu-r2",
+          "repeat": 2
+        }
+      ]
+    },
+    "cpu_async": {
+      "completed_trials": 3,
+      "metrics": {
+        "tokens_per_second": {
+          "median": 1418.685842783074,
+          "min": 1357.4257153090027,
+          "max": 1485.9551360491084,
+          "samples": [
+            1357.4257153090027,
+            1485.9551360491084,
+            1418.685842783074
+          ]
+        },
+        "load_seconds": {
+          "median": 0.9351483010686934,
+          "min": 0.8835640220204368,
+          "max": 0.9677720450563356,
+          "samples": [
+            0.9351483010686934,
+            0.8835640220204368,
+            0.9677720450563356
+          ]
+        },
+        "load_peak_bytes": {
+          "median": 10422784,
+          "min": 10422784,
+          "max": 10422784,
+          "samples": [
+            10422784,
+            10422784,
+            10422784
+          ]
+        },
+        "train_peak_bytes": {
+          "median": 119853568,
+          "min": 119853568,
+          "max": 119853568,
+          "samples": [
+            119853568,
+            119853568,
+            119853568
+          ]
+        },
+        "allocated_bytes": {
+          "median": 79399936,
+          "min": 79399936,
+          "max": 79399936,
+          "samples": [
+            79399936,
+            79399936,
+            79399936
+          ]
+        },
+        "reserved_bytes": {
+          "median": 171966464,
+          "min": 171966464,
+          "max": 171966464,
+          "samples": [
+            171966464,
+            171966464,
+            171966464
+          ]
+        },
+        "cpu_max_rss_bytes": {
+          "median": 2262704128,
+          "min": 2250096640,
+          "max": 2269376512,
+          "samples": [
+            2250096640,
+            2262704128,
+            2269376512
+          ]
+        },
+        "logical_bytes_read": {
+          "median": 17736448,
+          "min": 17736448,
+          "max": 17736448,
+          "samples": [
+            17736448,
+            17736448,
+            17736448
+          ]
+        },
+        "engram_h2d_bytes_per_step": {
+          "median": 1572864.0,
+          "min": 1572864.0,
+          "max": 1572864.0,
+          "samples": [
+            1572864.0,
+            1572864.0,
+            1572864.0
+          ]
+        },
+        "engram_d2h_bytes_per_step": {
+          "median": 1572864.0,
+          "min": 1572864.0,
+          "max": 1572864.0,
+          "samples": [
+            1572864.0,
+            1572864.0,
+            1572864.0
+          ]
+        },
+        "engram_lookup_rows_per_step": {
+          "median": 12288.0,
+          "min": 12288.0,
+          "max": 12288.0,
+          "samples": [
+            12288.0,
+            12288.0,
+            12288.0
+          ]
+        },
+        "engram_resolve_host_ms_per_step_max_rank": {
+          "median": 1.3190245954319835,
+          "min": 1.3066520215943456,
+          "max": 1.3300390914082527,
+          "samples": [
+            1.3300390914082527,
+            1.3190245954319835,
+            1.3066520215943456
+          ]
+        }
+      },
+      "throughput_ratio_to_baseline": {
+        "median": 0.9441885753882334,
+        "min": 0.8738497615580835,
+        "max": 1.0144404510626241,
+        "samples": [
+          0.8738497615580835,
+          1.0144404510626241,
+          0.9441885753882334
+        ]
+      },
+      "max_loss_difference_from_baseline": 0.0,
+      "trials": [
+        {
+          "tokens_per_second": 1357.4257153090027,
+          "load_seconds": 0.9351483010686934,
+          "load_peak_bytes": 10422784,
+          "train_peak_bytes": 119853568,
+          "allocated_bytes": 79399936,
+          "reserved_bytes": 171966464,
+          "cpu_max_rss_bytes": 2250096640,
+          "logical_bytes_read": 17736448,
+          "engram_h2d_bytes_per_step": 1572864.0,
+          "engram_d2h_bytes_per_step": 1572864.0,
+          "engram_lookup_rows_per_step": 12288.0,
+          "engram_resolve_host_ms_per_step_max_rank": 1.3300390914082527,
+          "engram_lookup_rows_by_rank_per_step": [
+            6241.0,
+            6047.0
+          ],
+          "slowest_rank_step_ms": [
+            369.5758869871497,
+            369.0288659418002,
+            376.52911606710404,
+            394.0624740207568,
+            394.7235819650814
+          ],
+          "losses_by_rank": [
+            [
+              6.295065402984619,
+              6.295202732086182,
+              6.294191360473633,
+              6.294251441955566,
+              6.294589042663574
+            ],
+            [
+              6.283998012542725,
+              6.283568382263184,
+              6.283926963806152,
+              6.283775329589844,
+              6.284089088439941
+            ]
+          ],
+          "label": "cpu_async-r0",
+          "repeat": 0
+        },
+        {
+          "tokens_per_second": 1485.9551360491084,
+          "load_seconds": 0.8835640220204368,
+          "load_peak_bytes": 10422784,
+          "train_peak_bytes": 119853568,
+          "allocated_bytes": 79399936,
+          "reserved_bytes": 171966464,
+          "cpu_max_rss_bytes": 2262704128,
+          "logical_bytes_read": 17736448,
+          "engram_h2d_bytes_per_step": 1572864.0,
+          "engram_d2h_bytes_per_step": 1572864.0,
+          "engram_lookup_rows_per_step": 12288.0,
+          "engram_resolve_host_ms_per_step_max_rank": 1.3190245954319835,
+          "engram_lookup_rows_by_rank_per_step": [
+            6241.0,
+            6047.0
+          ],
+          "slowest_rank_step_ms": [
+            353.9451229153201,
+            355.91816308442503,
+            346.30046505481005,
+            334.36593995429575,
+            338.06443598587066
+          ],
+          "losses_by_rank": [
+            [
+              6.295065402984619,
+              6.295202732086182,
+              6.294191360473633,
+              6.294251441955566,
+              6.294589042663574
+            ],
+            [
+              6.283998012542725,
+              6.283568382263184,
+              6.283926963806152,
+              6.283775329589844,
+              6.284089088439941
+            ]
+          ],
+          "label": "cpu_async-r1",
+          "repeat": 1
+        },
+        {
+          "tokens_per_second": 1418.685842783074,
+          "load_seconds": 0.9677720450563356,
+          "load_peak_bytes": 10422784,
+          "train_peak_bytes": 119853568,
+          "allocated_bytes": 79399936,
+          "reserved_bytes": 171966464,
+          "cpu_max_rss_bytes": 2269376512,
+          "logical_bytes_read": 17736448,
+          "engram_h2d_bytes_per_step": 1572864.0,
+          "engram_d2h_bytes_per_step": 1572864.0,
+          "engram_lookup_rows_per_step": 12288.0,
+          "engram_resolve_host_ms_per_step_max_rank": 1.3066520215943456,
+          "engram_lookup_rows_by_rank_per_step": [
+            6241.0,
+            6047.0
+          ],
+          "slowest_rank_step_ms": [
+            354.69498101156205,
+            358.3913079928607,
+            372.22901603672653,
+            362.8917650785297,
+            361.9520290521905
+          ],
+          "losses_by_rank": [
+            [
+              6.295065402984619,
+              6.295202732086182,
+              6.294191360473633,
+              6.294251441955566,
+              6.294589042663574
+            ],
+            [
+              6.283998012542725,
+              6.283568382263184,
+              6.283926963806152,
+              6.283775329589844,
+              6.284089088439941
+            ]
+          ],
+          "label": "cpu_async-r2",
+          "repeat": 2
+        }
+      ]
+    },
+    "baseline": {
+      "completed_trials": 3,
+      "metrics": {
+        "tokens_per_second": {
+          "median": 1502.5450209453506,
+          "min": 1464.8027239968337,
+          "max": 1553.3856905661885,
+          "samples": [
+            1553.3856905661885,
+            1464.8027239968337,
+            1502.5450209453506
+          ]
+        },
+        "load_seconds": {
+          "median": 0.9245056250365451,
+          "min": 0.8706942129647359,
+          "max": 0.9483927530236542,
+          "samples": [
+            0.8706942129647359,
+            0.9483927530236542,
+            0.9245056250365451
+          ]
+        },
+        "load_peak_bytes": {
+          "median": 18813440,
+          "min": 18813440,
+          "max": 18813440,
+          "samples": [
+            18813440,
+            18813440,
+            18813440
+          ]
+        },
+        "train_peak_bytes": {
+          "median": 128679936,
+          "min": 128679936,
+          "max": 128679936,
+          "samples": [
+            128679936,
+            128679936,
+            128679936
+          ]
+        },
+        "allocated_bytes": {
+          "median": 88602112,
+          "min": 88602112,
+          "max": 88602112,
+          "samples": [
+            88602112,
+            88602112,
+            88602112
+          ]
+        },
+        "reserved_bytes": {
+          "median": 167772160,
+          "min": 167772160,
+          "max": 167772160,
+          "samples": [
+            167772160,
+            167772160,
+            167772160
+          ]
+        },
+        "cpu_max_rss_bytes": {
+          "median": 2258595840,
+          "min": 2255958016,
+          "max": 2267959296,
+          "samples": [
+            2267959296,
+            2255958016,
+            2258595840
+          ]
+        },
+        "logical_bytes_read": {
+          "median": 17736448,
+          "min": 17736448,
+          "max": 17736448,
+          "samples": [
+            17736448,
+            17736448,
+            17736448
+          ]
+        },
+        "engram_h2d_bytes_per_step": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "samples": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "engram_d2h_bytes_per_step": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "samples": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "engram_lookup_rows_per_step": {
+          "median": 12288.0,
+          "min": 12288.0,
+          "max": 12288.0,
+          "samples": [
+            12288.0,
+            12288.0,
+            12288.0
+          ]
+        },
+        "engram_resolve_host_ms_per_step_max_rank": {
+          "median": 0.974065437912941,
+          "min": 0.9699075948446989,
+          "max": 1.0461579775437713,
+          "samples": [
+            0.9699075948446989,
+            1.0461579775437713,
+            0.974065437912941
+          ]
+        }
+      },
+      "throughput_ratio_to_baseline": {
+        "median": 1.0,
+        "min": 1.0,
+        "max": 1.0,
+        "samples": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "max_loss_difference_from_baseline": 0.0,
+      "trials": [
+        {
+          "tokens_per_second": 1553.3856905661885,
+          "load_seconds": 0.8706942129647359,
+          "load_peak_bytes": 18813440,
+          "train_peak_bytes": 128679936,
+          "allocated_bytes": 88602112,
+          "reserved_bytes": 167772160,
+          "cpu_max_rss_bytes": 2267959296,
+          "logical_bytes_read": 17736448,
+          "engram_h2d_bytes_per_step": 0.0,
+          "engram_d2h_bytes_per_step": 0.0,
+          "engram_lookup_rows_per_step": 12288.0,
+          "engram_resolve_host_ms_per_step_max_rank": 0.9699075948446989,
+          "engram_lookup_rows_by_rank_per_step": [
+            6241.0,
+            6047.0
+          ],
+          "slowest_rank_step_ms": [
+            331.86348900198936,
+            334.04140605125576,
+            333.37665209546685,
+            326.8510230118409,
+            322.1660200506449
+          ],
+          "losses_by_rank": [
+            [
+              6.295065402984619,
+              6.295202732086182,
+              6.294191360473633,
+              6.294251441955566,
+              6.294589042663574
+            ],
+            [
+              6.283998012542725,
+              6.283568382263184,
+              6.283926963806152,
+              6.283775329589844,
+              6.284089088439941
+            ]
+          ],
+          "label": "baseline-r0",
+          "repeat": 0
+        },
+        {
+          "tokens_per_second": 1464.8027239968337,
+          "load_seconds": 0.9483927530236542,
+          "load_peak_bytes": 18813440,
+          "train_peak_bytes": 128679936,
+          "allocated_bytes": 88602112,
+          "reserved_bytes": 167772160,
+          "cpu_max_rss_bytes": 2255958016,
+          "logical_bytes_read": 17736448,
+          "engram_h2d_bytes_per_step": 0.0,
+          "engram_d2h_bytes_per_step": 0.0,
+          "engram_lookup_rows_per_step": 12288.0,
+          "engram_resolve_host_ms_per_step_max_rank": 1.0461579775437713,
+          "engram_lookup_rows_by_rank_per_step": [
+            6241.0,
+            6047.0
+          ],
+          "slowest_rank_step_ms": [
+            349.8267609393224,
+            348.20112702436745,
+            356.4759030705318,
+            348.5207810299471,
+            346.75104497000575
+          ],
+          "losses_by_rank": [
+            [
+              6.295065402984619,
+              6.295202732086182,
+              6.294191360473633,
+              6.294251441955566,
+              6.294589042663574
+            ],
+            [
+              6.283998012542725,
+              6.283568382263184,
+              6.283926963806152,
+              6.283775329589844,
+              6.284089088439941
+            ]
+          ],
+          "label": "baseline-r1",
+          "repeat": 1
+        },
+        {
+          "tokens_per_second": 1502.5450209453506,
+          "load_seconds": 0.9245056250365451,
+          "load_peak_bytes": 18813440,
+          "train_peak_bytes": 128679936,
+          "allocated_bytes": 88602112,
+          "reserved_bytes": 167772160,
+          "cpu_max_rss_bytes": 2258595840,
+          "logical_bytes_read": 17736448,
+          "engram_h2d_bytes_per_step": 0.0,
+          "engram_d2h_bytes_per_step": 0.0,
+          "engram_lookup_rows_per_step": 12288.0,
+          "engram_resolve_host_ms_per_step_max_rank": 0.974065437912941,
+          "engram_lookup_rows_by_rank_per_step": [
+            6241.0,
+            6047.0
+          ],
+          "slowest_rank_step_ms": [
+            335.42042993940413,
+            334.4604290323332,
+            345.8124460885301,
+            346.6276960680261,
+            343.34186697378755
+          ],
+          "losses_by_rank": [
+            [
+              6.295065402984619,
+              6.295202732086182,
+              6.294191360473633,
+              6.294251441955566,
+              6.294589042663574
+            ],
+            [
+              6.283998012542725,
+              6.283568382263184,
+              6.283926963806152,
+              6.283775329589844,
+              6.284089088439941
+            ]
+          ],
+          "label": "baseline-r2",
+          "repeat": 2
+        }
+      ]
+    }
+  },
+  "profiles": {
+    "combined-r0": {
+      "sampled_ranks": 2,
+      "note": "Profiled samples only. Region durations are inclusive and overlap; NCCL is excluded from compute overlap.",
+      "activity_by_rank": {
+        "device_busy_ms": {
+          "mean": 75.68615380859376,
+          "max": 106.0309150390625,
+          "samples": [
+            106.0309150390625,
+            45.341392578125
+          ]
+        },
+        "h2d_compute_overlap_ms": {
+          "mean": 0.0009423828125,
+          "max": 0.001884765625,
+          "samples": [
+            0.001884765625,
+            0.0
+          ]
+        },
+        "h2d_compute_overlap_fraction": {
+          "mean": 0.0010445610840920383,
+          "max": 0.0020891221681840766,
+          "samples": [
+            0.0020891221681840766,
+            0.0
+          ]
+        },
+        "compute_calls": {
+          "mean": 18287.0,
+          "max": 18320.0,
+          "samples": [
+            18254.0,
+            18320.0
+          ]
+        },
+        "compute_duration_ms": {
+          "mean": 31.067940499999146,
+          "max": 31.24933799999867,
+          "samples": [
+            30.88654299999962,
+            31.24933799999867
+          ]
+        },
+        "compute_bytes": {
+          "mean": 0.0,
+          "max": 0.0,
+          "samples": [
+            0.0,
+            0.0
+          ]
+        },
+        "nccl_calls": {
+          "mean": 234.0,
+          "max": 234.0,
+          "samples": [
+            234.0,
+            234.0
+          ]
+        },
+        "nccl_duration_ms": {
+          "mean": 42.729634,
+          "max": 73.56513299999999,
+          "samples": [
+            73.56513299999999,
+            11.894135
+          ]
+        },
+        "nccl_bytes": {
+          "mean": 0.0,
+          "max": 0.0,
+          "samples": [
+            0.0,
+            0.0
+          ]
+        },
+        "h2d_calls": {
+          "mean": 452.0,
+          "max": 452.0,
+          "samples": [
+            452.0,
+            452.0
+          ]
+        },
+        "h2d_duration_ms": {
+          "mean": 0.8813985000000009,
+          "max": 0.9021630000000002,
+          "samples": [
+            0.9021630000000002,
+            0.8606340000000015
+          ]
+        },
+        "h2d_bytes": {
+          "mean": 12902880.0,
+          "max": 12914224.0,
+          "samples": [
+            12914224.0,
+            12891536.0
+          ]
+        },
+        "d2d_calls": {
+          "mean": 465.0,
+          "max": 466.0,
+          "samples": [
+            464.0,
+            466.0
+          ]
+        },
+        "d2d_duration_ms": {
+          "mean": 0.4735955000000006,
+          "max": 0.47742800000000074,
+          "samples": [
+            0.46976300000000043,
+            0.47742800000000074
+          ]
+        },
+        "d2d_bytes": {
+          "mean": 39267328.0,
+          "max": 39431456.0,
+          "samples": [
+            39103200.0,
+            39431456.0
+          ]
+        },
+        "d2h_calls": {
+          "mean": 298.5,
+          "max": 299.0,
+          "samples": [
+            298.0,
+            299.0
+          ]
+        },
+        "d2h_duration_ms": {
+          "mean": 0.8692500000000007,
+          "max": 0.8746510000000007,
+          "samples": [
+            0.8746510000000007,
+            0.8638490000000008
+          ]
+        },
+        "d2h_bytes": {
+          "mean": 6814106.0,
+          "max": 6826628.0,
+          "samples": [
+            6826628.0,
+            6801584.0
+          ]
+        }
+      },
+      "lookup_host_ms_by_rank": {
+        "engram_hash": {
+          "mean": 1.7232615500688553,
+          "max": 1.7292910488322377,
+          "samples": [
+            1.7292910488322377,
+            1.7172320513054729
+          ]
+        },
+        "engram_id_route": {
+          "mean": 5.915907502640039,
+          "max": 6.954548065550625,
+          "samples": [
+            6.954548065550625,
+            4.877266939729452
+          ]
+        },
+        "engram_prefetch": {
+          "mean": 6.447407999075949,
+          "max": 7.491279044188559,
+          "samples": [
+            7.491279044188559,
+            5.403536953963339
+          ]
+        },
+        "engram_store": {
+          "mean": 2.8365086182020605,
+          "max": 2.928881091065705,
+          "samples": [
+            2.928881091065705,
+            2.744136145338416
+          ]
+        },
+        "engram_row_route": {
+          "mean": 1.716039958409965,
+          "max": 1.717400853522122,
+          "samples": [
+            1.717400853522122,
+            1.7146790632978082
+          ]
+        },
+        "engram_resolve": {
+          "mean": 2.1405709558166564,
+          "max": 2.1436888491734862,
+          "samples": [
+            2.1436888491734862,
+            2.1374530624598265
+          ]
+        }
+      }
+    },
+    "direct-r0": {
+      "sampled_ranks": 2,
+      "note": "Profiled samples only. Region durations are inclusive and overlap; NCCL is excluded from compute overlap.",
+      "activity_by_rank": {
+        "device_busy_ms": {
+          "mean": 173.1763095703125,
+          "max": 281.689298828125,
+          "samples": [
+            281.689298828125,
+            64.6633203125
+          ]
+        },
+        "h2d_compute_overlap_ms": {
+          "mean": 0.00083154296875,
+          "max": 0.0016630859375,
+          "samples": [
+            0.0016630859375,
+            0.0
+          ]
+        },
+        "h2d_compute_overlap_fraction": {
+          "mean": 0.0038274651527614835,
+          "max": 0.007654930305522967,
+          "samples": [
+            0.007654930305522967,
+            0.0
+          ]
+        },
+        "compute_calls": {
+          "mean": 18507.0,
+          "max": 18540.0,
+          "samples": [
+            18474.0,
+            18540.0
+          ]
+        },
+        "compute_duration_ms": {
+          "mean": 31.43986049999925,
+          "max": 31.53694799999903,
+          "samples": [
+            31.342772999999465,
+            31.53694799999903
+          ]
+        },
+        "compute_bytes": {
+          "mean": 0.0,
+          "max": 0.0,
+          "samples": [
+            0.0,
+            0.0
+          ]
+        },
+        "nccl_calls": {
+          "mean": 234.0,
+          "max": 234.0,
+          "samples": [
+            234.0,
+            234.0
+          ]
+        },
+        "nccl_duration_ms": {
+          "mean": 142.83420600000002,
+          "max": 253.41456900000003,
+          "samples": [
+            253.41456900000003,
+            32.25384300000003
+          ]
+        },
+        "nccl_bytes": {
+          "mean": 0.0,
+          "max": 0.0,
+          "samples": [
+            0.0,
+            0.0
+          ]
+        },
+        "h2d_calls": {
+          "mean": 148.0,
+          "max": 148.0,
+          "samples": [
+            148.0,
+            148.0
+          ]
+        },
+        "h2d_duration_ms": {
+          "mean": 0.17933050000000011,
+          "max": 0.21725000000000022,
+          "samples": [
+            0.21725000000000022,
+            0.141411
+          ]
+        },
+        "h2d_bytes": {
+          "mean": 117408.0,
+          "max": 117840.0,
+          "samples": [
+            116976.0,
+            117840.0
+          ]
+        },
+        "d2d_calls": {
+          "mean": 471.0,
+          "max": 472.0,
+          "samples": [
+            470.0,
+            472.0
+          ]
+        },
+        "d2d_duration_ms": {
+          "mean": 0.49230450000000014,
+          "max": 0.49276600000000015,
+          "samples": [
+            0.4918430000000002,
+            0.49276600000000015
+          ]
+        },
+        "d2d_bytes": {
+          "mean": 39415912.0,
+          "max": 39577544.0,
+          "samples": [
+            39254280.0,
+            39577544.0
+          ]
+        },
+        "d2h_calls": {
+          "mean": 146.5,
+          "max": 147.0,
+          "samples": [
+            146.0,
+            147.0
+          ]
+        },
+        "d2h_duration_ms": {
+          "mean": 0.344908,
+          "max": 0.3461770000000002,
+          "samples": [
+            0.3461770000000002,
+            0.3436389999999998
+          ]
+        },
+        "d2h_bytes": {
+          "mean": 1226.0,
+          "max": 1232.0,
+          "samples": [
+            1220.0,
+            1232.0
+          ]
+        }
+      },
+      "lookup_host_ms_by_rank": {
+        "engram_hash": {
+          "mean": 1.6947435215115547,
+          "max": 1.699840067885816,
+          "samples": [
+            1.6896469751372933,
+            1.699840067885816
+          ]
+        },
+        "engram_id_route": {
+          "mean": 8.996885444503278,
+          "max": 14.454378979280591,
+          "samples": [
+            14.454378979280591,
+            3.539391909725964
+          ]
+        },
+        "engram_store": {
+          "mean": 0.3641219809651375,
+          "max": 0.37291692569851875,
+          "samples": [
+            0.37291692569851875,
+            0.3553270362317562
+          ]
+        },
+        "engram_prefetch": {
+          "mean": 9.536601428408176,
+          "max": 15.00259293243289,
+          "samples": [
+            15.00259293243289,
+            4.0706099243834615
+          ]
+        },
+        "engram_row_route": {
+          "mean": 2.3785560624673963,
+          "max": 3.192683099769056,
+          "samples": [
+            1.5644290251657367,
+            3.192683099769056
+          ]
+        },
+        "engram_resolve": {
+          "mean": 2.5758424890227616,
+          "max": 3.3822860568761826,
+          "samples": [
+            1.7693989211693406,
+            3.3822860568761826
+          ]
+        }
+      }
+    },
+    "cpu-r0": {
+      "sampled_ranks": 2,
+      "note": "Profiled samples only. Region durations are inclusive and overlap; NCCL is excluded from compute overlap.",
+      "activity_by_rank": {
+        "device_busy_ms": {
+          "mean": 187.297193359375,
+          "max": 326.7349404296875,
+          "samples": [
+            326.7349404296875,
+            47.8594462890625
+          ]
+        },
+        "h2d_compute_overlap_ms": {
+          "mean": 0.002400390625,
+          "max": 0.00480078125,
+          "samples": [
+            0.00480078125,
+            0.0
+          ]
+        },
+        "h2d_compute_overlap_fraction": {
+          "mean": 0.005662537636984802,
+          "max": 0.011325075273969604,
+          "samples": [
+            0.011325075273969604,
+            0.0
+          ]
+        },
+        "compute_calls": {
+          "mean": 18477.0,
+          "max": 18510.0,
+          "samples": [
+            18444.0,
+            18510.0
+          ]
+        },
+        "compute_duration_ms": {
+          "mean": 31.37324499999952,
+          "max": 31.46530399999953,
+          "samples": [
+            31.281185999999515,
+            31.46530399999953
+          ]
+        },
+        "compute_bytes": {
+          "mean": 0.0,
+          "max": 0.0,
+          "samples": [
+            0.0,
+            0.0
+          ]
+        },
+        "nccl_calls": {
+          "mean": 234.0,
+          "max": 234.0,
+          "samples": [
+            234.0,
+            234.0
+          ]
+        },
+        "nccl_duration_ms": {
+          "mean": 156.94596149999995,
+          "max": 298.44058999999993,
+          "samples": [
+            298.44058999999993,
+            15.451333
+          ]
+        },
+        "nccl_bytes": {
+          "mean": 0.0,
+          "max": 0.0,
+          "samples": [
+            0.0,
+            0.0
+          ]
+        },
+        "h2d_calls": {
+          "mean": 152.0,
+          "max": 152.0,
+          "samples": [
+            152.0,
+            152.0
+          ]
+        },
+        "h2d_duration_ms": {
+          "mean": 0.29766499999999996,
+          "max": 0.4239059999999999,
+          "samples": [
+            0.4239059999999999,
+            0.17142399999999997
+          ]
+        },
+        "h2d_bytes": {
+          "mean": 903840.0,
+          "max": 915824.0,
+          "samples": [
+            915824.0,
+            891856.0
+          ]
+        },
+        "d2d_calls": {
+          "mean": 465.0,
+          "max": 466.0,
+          "samples": [
+            464.0,
+            466.0
+          ]
+        },
+        "d2d_duration_ms": {
+          "mean": 0.48547000000000035,
+          "max": 0.48864200000000024,
+          "samples": [
+            0.48229800000000045,
+            0.48864200000000024
+          ]
+        },
+        "d2d_bytes": {
+          "mean": 39270544.0,
+          "max": 39434384.0,
+          "samples": [
+            39106704.0,
+            39434384.0
+          ]
+        },
+        "d2h_calls": {
+          "mean": 152.5,
+          "max": 153.0,
+          "samples": [
+            152.0,
+            153.0
+          ]
+        },
+        "d2h_duration_ms": {
+          "mean": 0.38033750000000005,
+          "max": 0.3806110000000004,
+          "samples": [
+            0.3806110000000004,
+            0.3800639999999997
+          ]
+        },
+        "d2h_bytes": {
+          "mean": 836802.0,
+          "max": 849988.0,
+          "samples": [
+            849988.0,
+            823616.0
+          ]
+        }
+      },
+      "lookup_host_ms_by_rank": {
+        "engram_hash": {
+          "mean": 1.632223546039313,
+          "max": 1.7183340387418866,
+          "samples": [
+            1.5461130533367395,
+            1.7183340387418866
+          ]
+        },
+        "engram_id_route": {
+          "mean": 10.319169028662145,
+          "max": 16.98853401467204,
+          "samples": [
+            16.98853401467204,
+            3.6498040426522493
+          ]
+        },
+        "engram_store": {
+          "mean": 1.7658165306784213,
+          "max": 1.7880030209198594,
+          "samples": [
+            1.743630040436983,
+            1.7880030209198594
+          ]
+        },
+        "engram_prefetch": {
+          "mean": 12.316761014517397,
+          "max": 18.959439010359347,
+          "samples": [
+            18.959439010359347,
+            5.6740830186754465
+          ]
+        },
+        "engram_row_route": {
+          "mean": 1.5238200430758297,
+          "max": 1.5484719770029187,
+          "samples": [
+            1.4991681091487408,
+            1.5484719770029187
+          ]
+        },
+        "engram_resolve": {
+          "mean": 1.9048450631089509,
+          "max": 1.9487709505483508,
+          "samples": [
+            1.860919175669551,
+            1.9487709505483508
+          ]
+        }
+      }
+    },
+    "cpu_async-r0": {
+      "sampled_ranks": 2,
+      "note": "Profiled samples only. Region durations are inclusive and overlap; NCCL is excluded from compute overlap.",
+      "activity_by_rank": {
+        "device_busy_ms": {
+          "mean": 172.508255859375,
+          "max": 289.9912158203125,
+          "samples": [
+            289.9912158203125,
+            55.0252958984375
+          ]
+        },
+        "h2d_compute_overlap_ms": {
+          "mean": 0.00049609375,
+          "max": 0.0009921875,
+          "samples": [
+            0.0009921875,
+            0.0
+          ]
+        },
+        "h2d_compute_overlap_fraction": {
+          "mean": 0.0020193507866722847,
+          "max": 0.004038701573344569,
+          "samples": [
+            0.004038701573344569,
+            0.0
+          ]
+        },
+        "compute_calls": {
+          "mean": 18477.0,
+          "max": 18510.0,
+          "samples": [
+            18444.0,
+            18510.0
+          ]
+        },
+        "compute_duration_ms": {
+          "mean": 31.342902999999424,
+          "max": 31.44442099999925,
+          "samples": [
+            31.2413849999996,
+            31.44442099999925
+          ]
+        },
+        "compute_bytes": {
+          "mean": 0.0,
+          "max": 0.0,
+          "samples": [
+            0.0,
+            0.0
+          ]
+        },
+        "nccl_calls": {
+          "mean": 234.0,
+          "max": 234.0,
+          "samples": [
+            234.0,
+            234.0
+          ]
+        },
+        "nccl_duration_ms": {
+          "mean": 141.27083149999999,
+          "max": 259.938103,
+          "samples": [
+            259.938103,
+            22.60355999999998
+          ]
+        },
+        "nccl_bytes": {
+          "mean": 0.0,
+          "max": 0.0,
+          "samples": [
+            0.0,
+            0.0
+          ]
+        },
+        "h2d_calls": {
+          "mean": 152.0,
+          "max": 152.0,
+          "samples": [
+            152.0,
+            152.0
+          ]
+        },
+        "h2d_duration_ms": {
+          "mean": 0.20984350000000007,
+          "max": 0.2456630000000002,
+          "samples": [
+            0.2456630000000002,
+            0.17402399999999996
+          ]
+        },
+        "h2d_bytes": {
+          "mean": 903840.0,
+          "max": 915824.0,
+          "samples": [
+            915824.0,
+            891856.0
+          ]
+        },
+        "d2d_calls": {
+          "mean": 465.0,
+          "max": 466.0,
+          "samples": [
+            464.0,
+            466.0
+          ]
+        },
+        "d2d_duration_ms": {
+          "mean": 0.48613900000000043,
+          "max": 0.4871400000000005,
+          "samples": [
+            0.4851380000000004,
+            0.4871400000000005
+          ]
+        },
+        "d2d_bytes": {
+          "mean": 39270544.0,
+          "max": 39434384.0,
+          "samples": [
+            39106704.0,
+            39434384.0
+          ]
+        },
+        "d2h_calls": {
+          "mean": 152.5,
+          "max": 153.0,
+          "samples": [
+            152.0,
+            153.0
+          ]
+        },
+        "d2h_duration_ms": {
+          "mean": 0.38422399999999984,
+          "max": 0.39055700000000015,
+          "samples": [
+            0.39055700000000015,
+            0.37789099999999953
+          ]
+        },
+        "d2h_bytes": {
+          "mean": 836802.0,
+          "max": 849988.0,
+          "samples": [
+            849988.0,
+            823616.0
+          ]
+        }
+      },
+      "lookup_host_ms_by_rank": {
+        "engram_hash": {
+          "mean": 1.966265495866537,
+          "max": 2.2204950219020247,
+          "samples": [
+            1.7120359698310494,
+            2.2204950219020247
+          ]
+        },
+        "engram_id_route": {
+          "mean": 10.410083050373942,
+          "max": 14.128225040622056,
+          "samples": [
+            6.691941060125828,
+            14.128225040622056
+          ]
+        },
+        "engram_prefetch": {
+          "mean": 10.972738033160567,
+          "max": 14.695535995997488,
+          "samples": [
+            7.249940070323646,
+            14.695535995997488
+          ]
+        },
+        "engram_store": {
+          "mean": 4.048149043228477,
+          "max": 5.013840040192008,
+          "samples": [
+            5.013840040192008,
+            3.0824580462649465
+          ]
+        },
+        "engram_row_route": {
+          "mean": 1.8014415982179344,
+          "max": 1.9838521257042885,
+          "samples": [
+            1.6190310707315803,
+            1.9838521257042885
+          ]
+        },
+        "engram_resolve": {
+          "mean": 2.2946560056880116,
+          "max": 2.510791178792715,
+          "samples": [
+            2.078520832583308,
+            2.510791178792715
+          ]
+        }
+      }
+    },
+    "baseline-r0": {
+      "sampled_ranks": 2,
+      "note": "Profiled samples only. Region durations are inclusive and overlap; NCCL is excluded from compute overlap.",
+      "activity_by_rank": {
+        "device_busy_ms": {
+          "mean": 95.19428466796874,
+          "max": 95.8045009765625,
+          "samples": [
+            94.584068359375,
+            95.8045009765625
+          ]
+        },
+        "h2d_compute_overlap_ms": {
+          "mean": 0.0009921875,
+          "max": 0.001087890625,
+          "samples": [
+            0.000896484375,
+            0.001087890625
+          ]
+        },
+        "h2d_compute_overlap_fraction": {
+          "mean": 0.006446458435791329,
+          "max": 0.006850620799075105,
+          "samples": [
+            0.006042296072507553,
+            0.006850620799075105
+          ]
+        },
+        "compute_calls": {
+          "mean": 18507.0,
+          "max": 18540.0,
+          "samples": [
+            18474.0,
+            18540.0
+          ]
+        },
+        "compute_duration_ms": {
+          "mean": 31.396821999999503,
+          "max": 31.581938999999274,
+          "samples": [
+            31.211704999999732,
+            31.581938999999274
+          ]
+        },
+        "compute_bytes": {
+          "mean": 0.0,
+          "max": 0.0,
+          "samples": [
+            0.0,
+            0.0
+          ]
+        },
+        "nccl_calls": {
+          "mean": 234.0,
+          "max": 234.0,
+          "samples": [
+            234.0,
+            234.0
+          ]
+        },
+        "nccl_duration_ms": {
+          "mean": 63.286469999999994,
+          "max": 63.72268499999996,
+          "samples": [
+            62.85025500000002,
+            63.72268499999996
+          ]
+        },
+        "nccl_bytes": {
+          "mean": 0.0,
+          "max": 0.0,
+          "samples": [
+            0.0,
+            0.0
+          ]
+        },
+        "h2d_calls": {
+          "mean": 148.0,
+          "max": 148.0,
+          "samples": [
+            148.0,
+            148.0
+          ]
+        },
+        "h2d_duration_ms": {
+          "mean": 0.15357049999999994,
+          "max": 0.15878099999999995,
+          "samples": [
+            0.14835999999999996,
+            0.15878099999999995
+          ]
+        },
+        "h2d_bytes": {
+          "mean": 117408.0,
+          "max": 117840.0,
+          "samples": [
+            116976.0,
+            117840.0
+          ]
+        },
+        "d2d_calls": {
+          "mean": 471.0,
+          "max": 472.0,
+          "samples": [
+            470.0,
+            472.0
+          ]
+        },
+        "d2d_duration_ms": {
+          "mean": 0.489429,
+          "max": 0.49040499999999976,
+          "samples": [
+            0.48845300000000025,
+            0.49040499999999976
+          ]
+        },
+        "d2d_bytes": {
+          "mean": 39415912.0,
+          "max": 39577544.0,
+          "samples": [
+            39254280.0,
+            39577544.0
+          ]
+        },
+        "d2h_calls": {
+          "mean": 146.5,
+          "max": 147.0,
+          "samples": [
+            146.0,
+            147.0
+          ]
+        },
+        "d2h_duration_ms": {
+          "mean": 0.34561700000000006,
+          "max": 0.34736600000000034,
+          "samples": [
+            0.34736600000000034,
+            0.3438679999999998
+          ]
+        },
+        "d2h_bytes": {
+          "mean": 1226.0,
+          "max": 1232.0,
+          "samples": [
+            1220.0,
+            1232.0
+          ]
+        }
+      },
+      "lookup_host_ms_by_rank": {
+        "engram_hash": {
+          "mean": 1.538864045869559,
+          "max": 1.5417290851473808,
+          "samples": [
+            1.5359990065917373,
+            1.5417290851473808
+          ]
+        },
+        "engram_id_route": {
+          "mean": 4.8854335327632725,
+          "max": 5.163569934666157,
+          "samples": [
+            5.163569934666157,
+            4.607297130860388
+          ]
+        },
+        "engram_store": {
+          "mean": 0.34354993840679526,
+          "max": 0.3489669179543853,
+          "samples": [
+            0.33813295885920525,
+            0.3489669179543853
+          ]
+        },
+        "engram_prefetch": {
+          "mean": 5.393791070673615,
+          "max": 5.663858028128743,
+          "samples": [
+            5.663858028128743,
+            5.123724113218486
+          ]
+        },
+        "engram_row_route": {
+          "mean": 1.7281229957006872,
+          "max": 1.923728035762906,
+          "samples": [
+            1.5325179556384683,
+            1.923728035762906
+          ]
+        },
+        "engram_resolve": {
+          "mean": 1.9237470114603639,
+          "max": 2.137078088708222,
+          "samples": [
+            1.7104159342125058,
+            2.137078088708222
+          ]
+        }
+      }
+    }
+  },
+  "note": "Median and range are descriptive, not confidence intervals. Peak memory is the maximum over ranks; transfer bytes are global sums."
+}

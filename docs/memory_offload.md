@@ -16,6 +16,7 @@ The measured version is 2.10.0+cu129 on NVIDIA H20.
 | `--engram-device` | `cuda` | `cpu` keeps each owned table shard on the host. |
 | `--engram-prefetch` | `sync` | `async` overlaps CPU lookup/H2D with backbone computation. Requires CPU tables. |
 | `--engram-deduplicate` | off | Removes duplicate requests and restores their original order. Works with CPU or GPU tables. |
+| `--engram-cache-mib` | `0` | Experimental GPU row cache budget per local CPU table; independent of request deduplication. |
 | `--fsdp-offload-layers` | empty | Comma-separated global layer IDs and half-open ranges, such as `1,3:6`. |
 | `--fsdp-offload-targets` | `dense,experts` | Intersection of selected layers and parameter domains. Excludes Engram tables. |
 | `--fsdp-offload-pin-memory` | off | Pins the CPU shards managed by FSDP. |
@@ -58,6 +59,12 @@ Enable each option independently to measure its effect. For example, adding
 `--fsdp-offload-layers 1,3 --fsdp-offload-targets experts` to offload only the
 experts in global layers 1 and 3.
 
+For cache experiments, add `--engram-cache-mib 8` to CPU Engram. Two local
+tables then reserve at most 16 MiB of persistent GPU cache per rank, in addition
+to transient query outputs. The budget is per table, not per model. The cache
+can reduce transfers when requests repeat within gradient accumulation; it does
+not guarantee higher throughput. See [cache measurements](engram_cache_results.md).
+
 Combined configuration and checkpoint save:
 
 ```bash
@@ -87,6 +94,7 @@ state are restored from the checkpoint.
 | `models/dsv4/weights.py` | DSV4 names, gate/up concatenation, grouped projection mapping. |
 | `models/dsv4/materialize.py` | Meta FSDP wrapping, final local allocation, per-domain placement, and wrapping lifecycle. |
 | `models/dsv4/engram/storage.py` | Differentiable local row reads; CPU staging has no process-group knowledge. |
+| `models/dsv4/engram/cache.py` | Bounded owner-local GPU rows, CPU tags, and update invalidation; no collectives or optimizer updates. |
 | `models/dsv4/engram/routing.py` | Owner requests, response exchange, inverse mapping and global gradient averaging. |
 | `models/dsv4/engram/table.py` | Sole parameter registration and single-use lookup tickets. |
 | `models/dsv4/policies.py` | Selective FSDP policy and once-per-step gradient normalization. |
@@ -106,15 +114,34 @@ least one aligned decode block; an undersized budget fails explicitly. The
 pipeline holds at most the current chunk and one future read. It never constructs
 a complete decoded layer.
 
-CPU lookup retains autograd through the device copy. Only returned rows live on
-the GPU, and backward sends their gradients to the sparse CPU table. Prefetch
-exchanges IDs on the main thread, then workers perform local lookup and H2D on
+CPU lookup retains autograd through the device copy. With caching disabled,
+only returned rows live on the GPU; backward sends their gradients to the sparse
+CPU table. Prefetch exchanges IDs and enqueues their pinned D2H copy on the main
+thread. Workers wait for the ID event, then perform local lookup and H2D on
 independent copy streams. Response collectives run on the main thread in layer
 order; implicit cross-layer FSDP backward prefetch is disabled. There is at most
 one outstanding ticket per table. Pinned buffers are bounded per active table,
 so the aggregate budget scales with the number of tables being prefetched.
-Resolved values are not cached across optimizer steps. `close()` drains workers
-and invalidates pending tickets, including exception cleanup.
+Pinned row buffers are reused after their DMA completes. By default, resolved
+values are not cached across optimizer steps. `close()` drains workers and
+invalidates pending tickets, including exception cleanup.
+
+The optional row cache has fixed GPU slots and bounded CPU tag metadata. It
+caches the owner's rows, so request and response NCCL collectives still run.
+Cache hits skip CPU row gathering and value H2D; misses fill slots. Collisions
+evict previous rows. Each lookup returns its own row tensor, so later eviction
+cannot change values retained for backward or activation recomputation.
+Repeated misses share transferred values but preserve every gradient occurrence
+and its order; this is separate from router deduplication.
+
+The CPU parameter remains authoritative and is the only registered parameter.
+The optimizer invalidates touched cached rows after sparse SGD, while unmodified
+rows can survive the step. Unrecognized parameter version changes invalidate
+all rows. Parameter reload, placement/dtype changes and `close()` clear the cache.
+Caches are omitted from checkpoints. Direct untracked writes through `.data`
+must be followed by `table.clear_cache()`; ordinary `copy_` and supported state
+loading invalidate automatically. Cache use does not change the supported
+optimizer algorithms, gradient averaging, or accumulation rules.
 
 ## Checkpoint format
 

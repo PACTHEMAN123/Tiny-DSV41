@@ -42,7 +42,23 @@ def build_optimizer(model, policy):
         def synchronize_tables(optimizer, args, kwargs):
             for table in tables:
                 table.synchronize()
+                cache = getattr(table.store, "cache", None)
+                if cache is not None:
+                    cache.before_step(table.weight)
         result.register_step_pre_hook(synchronize_tables)
+        def invalidate_updated_rows(optimizer, args, kwargs):
+            groups_by_parameter = {id(p): group for group in optimizer.param_groups for p in group["params"]}
+            for table in tables:
+                cache = getattr(table.store, "cache", None)
+                if cache is None:
+                    continue
+                group = groups_by_parameter.get(id(table.weight))
+                if group is not None and not group.get("momentum") and not group.get("weight_decay"):
+                    cache.after_step(table.weight)
+                else:
+                    cache.clear()
+        if any(getattr(table.store, "cache", None) is not None for table in tables):
+            result.register_step_post_hook(invalidate_updated_rows)
     return result
 
 

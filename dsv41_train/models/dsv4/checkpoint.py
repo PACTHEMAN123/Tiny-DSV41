@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -331,26 +333,29 @@ def _load_direct(model, reader, policy):
     def fill(parameter, source, offset=None, shape=None):
         offsets, _ = local_slice(parameter)
         source.fill(reader, local_tensor(parameter), offset or offsets,
-                    shape or tuple(parameter.shape), policy)
+                    shape or tuple(parameter.shape), policy, executor=executor)
 
-    for parameter, name in ((model.model.embedding.weight, "embed.weight"),
-                            (model.model.norm.weight, "norm.weight"),
-                            (model.lm_head.weight, "head.weight")):
-        fill(parameter, WeightSource((name,)))
-    for layer in model.model.layers:
-        parameters = dict(layer.named_parameters())
-        buffers = dict(layer.named_buffers())
-        sources = layer_sources(layer)
-        if set(parameters) - set(sources):
-            raise RuntimeError(f"unmapped checkpoint parameters: {set(parameters) - set(sources)}")
-        for name, source in sources.items():
-            fill(parameters[name] if name in parameters else buffers[name], source)
-        if layer.engram is not None:
-            table = model.model.engram_tables[str(layer.layer_id)]
-            offsets, _ = local_slice(table.weight)
-            fill(table.weight, WeightSource((f"layers.{layer.layer_id}.engram.embed",), "fp8_rows"),
-                 (table.row_start + offsets[0], 0),
-                 (table.global_num_embeddings, table.embedding_dim))
+    context = (ThreadPoolExecutor(max_workers=1, thread_name_prefix="weights")
+               if policy.pipeline else nullcontext(None))
+    with context as executor:
+        for parameter, name in ((model.model.embedding.weight, "embed.weight"),
+                                (model.model.norm.weight, "norm.weight"),
+                                (model.lm_head.weight, "head.weight")):
+            fill(parameter, WeightSource((name,)))
+        for layer in model.model.layers:
+            parameters = dict(layer.named_parameters())
+            buffers = dict(layer.named_buffers())
+            sources = layer_sources(layer)
+            if set(parameters) - set(sources):
+                raise RuntimeError(f"unmapped checkpoint parameters: {set(parameters) - set(sources)}")
+            for name, source in sources.items():
+                fill(parameters[name] if name in parameters else buffers[name], source)
+            if layer.engram is not None:
+                table = model.model.engram_tables[str(layer.layer_id)]
+                offsets, _ = local_slice(table.weight)
+                fill(table.weight, WeightSource((f"layers.{layer.layer_id}.engram.embed",), "fp8_rows"),
+                     (table.row_start + offsets[0], 0),
+                     (table.global_num_embeddings, table.embedding_dim))
 
 
 def load_dsv41_backbone_prefix(

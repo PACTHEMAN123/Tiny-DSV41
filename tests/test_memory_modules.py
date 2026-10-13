@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ from dsv41_train.checkpoint import CheckpointManager, TrainingState
 from dsv41_train.models.dsv4.model import CausalLMOutput
 from post_training_helpers import small_config
 from test_dsv4_loading import synthetic_checkpoint
+from memory_validation_cases import fixture_dimensions, validation_cases
 
 
 class LocalMaterializer:
@@ -36,6 +38,14 @@ def memory_config(**overrides):
 
 
 class MemoryModulesTest(unittest.TestCase):
+    def test_eight_rank_matrix_includes_full_cp_and_ep_sizes(self):
+        experts, length = fixture_dimensions(8)
+        cases = validation_cases(8, all_topologies=True)
+        expected = {(cp, ep) for cp in (1, 2, 4, 8) for ep in (1, 2, 4, 8)}
+        self.assertEqual({(case[0], case[1]) for case in cases}, expected)
+        self.assertTrue(all(experts % ep == length % cp == 0 for cp, ep in expected))
+        self.assertEqual(len(validation_cases(6, all_topologies=True)), 16)
+
     def test_output_tensors_are_visible_to_fsdp_hooks(self):
         from torch.utils._pytree import tree_flatten, tree_unflatten
         loss, logits, aux, router = (torch.randn(2, requires_grad=True) for _ in range(4))
@@ -173,11 +183,15 @@ class MemoryModulesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             config, expected = synthetic_checkpoint(Path(folder), memory_config())
             for pipeline in (False, True):
-                with patch("dsv41_train.loading.reader.ShardedSafeTensorReader.tensor", side_effect=AssertionError("full tensor read")):
+                with patch("dsv41_train.loading.reader.ShardedSafeTensorReader.tensor", side_effect=AssertionError("full tensor read")), \
+                     patch("dsv41_train.models.dsv4.checkpoint.ThreadPoolExecutor", wraps=ThreadPoolExecutor) as pools, \
+                     patch("dsv41_train.loading.source.ThreadPoolExecutor", side_effect=AssertionError("per-parameter pool")):
                     model = load_dsv41_backbone_window(folder, num_layers=config.num_hidden_layers, dtype=torch.float32,
                         load_policy=LoadPolicy("direct_shard", 7, 131072, pipeline),
                         materializer=LocalMaterializer(), sparse_engram_gradients=True,
                         engram_policy=EngramPolicy("cpu"))
+                self.assertEqual(pools.call_count, int(pipeline))
+                self.addCleanup(model.close)
                 for name, parameter in model.named_parameters():
                     torch.testing.assert_close(parameter, expected[name], msg=name)
                 self.assertGreater(model.loading_metrics["logical_bytes_read"], 0)

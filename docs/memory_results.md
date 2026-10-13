@@ -1,5 +1,10 @@
 # DSV4 memory-policy acceptance results
 
+The [eight-rank follow-up](memory_eight_results.md) passed the complete FP32
+matrix but exposed BF16 multi-step parity failures. Those failures remain open;
+the results below describe the earlier two/six-rank runs. Eight-GPU repeated
+performance and offload profiling have not yet run.
+
 Measured on 2026-09-29 with Python 3.10.20, PyTorch 2.10.0+cu129 and NVIDIA H20.
 The host exposes eight GPUs outside the coding sandbox; GPU acceptance was
 therefore performed with actual FSDP2/NCCL, including six-rank intersecting groups.

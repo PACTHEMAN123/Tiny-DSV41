@@ -1,0 +1,80 @@
+{
+  "date": "2026-09-29",
+  "python": "3.10.20",
+  "torch": "2.10.0+cu129",
+  "gpu": "NVIDIA H20",
+  "world": 8,
+  "workspace_unit_tests": {"total": 84, "passed": 79, "skipped_missing_hf_reference": 5},
+  "correctness_fixture": {"experts": 8, "sequence_length": 16, "steps": 3, "microbatches": 2, "learning_rate": 0.01},
+  "fp32": {
+    "status": "passed",
+    "reference": "unsharded",
+    "completed_topologies": 16,
+    "max_gradient_error": 0.000006756745278835297,
+    "raw_directory": "artifacts/memory-eight/fp32",
+    "topologies": [
+      {"cp": 1, "ep": 1, "max_gradient_error": 4.936009645462036e-8},
+      {"cp": 1, "ep": 2, "max_gradient_error": 0.0000013187527656555176},
+      {"cp": 1, "ep": 4, "max_gradient_error": 0.0000013187527656555176},
+      {"cp": 1, "ep": 8, "max_gradient_error": 0.0000013187527656555176},
+      {"cp": 2, "ep": 1, "max_gradient_error": 0.000005824491381645203},
+      {"cp": 2, "ep": 2, "max_gradient_error": 0.0000013988465070724487},
+      {"cp": 2, "ep": 4, "max_gradient_error": 0.000006756745278835297},
+      {"cp": 2, "ep": 8, "max_gradient_error": 0.000006756745278835297},
+      {"cp": 4, "ep": 1, "max_gradient_error": 6.332993507385254e-8},
+      {"cp": 4, "ep": 2, "max_gradient_error": 6.705522537231445e-8},
+      {"cp": 4, "ep": 4, "max_gradient_error": 6.51925802230835e-8},
+      {"cp": 4, "ep": 8, "max_gradient_error": 4.470348358154297e-8},
+      {"cp": 8, "ep": 1, "max_gradient_error": 2.654269337654114e-7},
+      {"cp": 8, "ep": 2, "max_gradient_error": 2.9616057872772217e-7},
+      {"cp": 8, "ep": 4, "max_gradient_error": 8.940696716308594e-8},
+      {"cp": 8, "ep": 8, "max_gradient_error": 9.685754776000977e-8}
+    ]
+  },
+  "bf16": {
+    "status": "failed",
+    "reference": "same-topology GPU, layerwise, without deduplication",
+    "logits_atol": 0.002,
+    "logits_rtol": 0.02,
+    "cases": [
+      {"case": 0, "cp": 1, "ep": 1, "status": "passed", "max_gradient_error": 0.0000040531158447265625},
+      {"case": 1, "cp": 1, "ep": 8, "status": "logits_failed", "largest_reported_absolute_error": 0.0556640625},
+      {"case": 2, "cp": 2, "ep": 4, "status": "nccl_error", "phase": "reference forward", "rerun_status": "blocked"},
+      {"case": 3, "cp": 4, "ep": 2, "status": "passed", "max_gradient_error": 0.000030517578125},
+      {"case": 4, "cp": 8, "ep": 1, "status": "logits_failed", "largest_reported_absolute_error": 0.013671875},
+      {"case": 5, "cp": 8, "ep": 8, "status": "logits_failed", "largest_reported_absolute_error": 0.013671875}
+    ],
+    "matching_dedup_diagnostic": {
+      "case": 1,
+      "status": "passed",
+      "max_gradient_error": 0.000011444091796875,
+      "raw_report": "artifacts/memory-eight/dedup-isolation.json",
+      "waives_original_failure": false
+    }
+  },
+  "eight_rank_fresh_process_resume": "not_run",
+  "eight_rank_benchmark": {
+    "status": "blocked_before_start",
+    "completed_trials": 0,
+    "config": "configs/memory_eight_profile.json",
+    "parameters": 423209462,
+    "cp": 2,
+    "ep": 4,
+    "sequence_length": 512,
+    "microbatches": 2,
+    "learning_rate": 0.0001,
+    "requested_repeats": 3,
+    "reason": "Sandbox cannot access NVIDIA driver; external execution automatic approval failed three times with stream disconnected before completion."
+  },
+  "historical_two_rank_measurements": {
+    "source": "docs/results/memory-offload-h20.json",
+    "fresh_process_trials_per_variant": 1,
+    "baseline_train_peak_mib_rounded": 157.74,
+    "combined_train_peak_mib_rounded": 90.28,
+    "cpu_sync_tokens_per_second_rounded": 1301.61,
+    "cpu_async_tokens_per_second_rounded": 1373.92,
+    "max_loss_difference_from_baseline": {"cpu_dedup": 0.01046133041381836, "gpu_dedup": 0.013753890991210938, "combined": 0.01046133041381836},
+    "stable_speedup_established": false,
+    "offload_cuda_overlap_trace_available": false
+  }
+}

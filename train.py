@@ -1,5 +1,6 @@
 import argparse
 import json
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -7,6 +8,8 @@ import torch
 import torch.distributed as dist
 
 from dsv41_train.checkpoint import CheckpointManager, TrainingState
+from dsv41_train.features import add_training_options, adapter_config, checkpoint_policy
+from dsv41_train.lora import inject_lora, load_adapter, save_adapter
 from dsv41_train.models.dsv4 import DeepSeekV41Config, DeepSeekV41ForCausalLM
 from dsv41_train.models.dsv4.parallel import apply_fsdp2
 from dsv41_train.parallel import ParallelMeshes
@@ -26,6 +29,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--output-dir", default="outputs/final")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--resume", action="store_true")
+    add_training_options(parser)
     parser.add_argument(
         "--local-rank",
         "--local_rank",
@@ -71,16 +76,26 @@ def validate_args(args: argparse.Namespace) -> None:
 def train(args: argparse.Namespace, runtime: Runtime) -> None:
     # All ranks initialize identical parameters; the per-rank generator below varies the data.
     torch.manual_seed(args.seed)
-    config = DeepSeekV41Config.tiny()
+    config = replace(DeepSeekV41Config.tiny(), cache_quantization=args.cache_quantization)
+    lora = adapter_config(args)
+    policy = checkpoint_policy(args)
     model = DeepSeekV41ForCausalLM(config)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     model = model.to(runtime.device)
+    model.set_activation_checkpointing(policy)
+    if lora is not None:
+        inject_lora(model, lora)
+    if args.adapter_in:
+        if args.resume:
+            raise ValueError("adapter-in and resume are mutually exclusive")
+        load_adapter(model, args.adapter_in)
 
     if runtime.distributed:
         meshes = ParallelMeshes.build(device_type=runtime.device.type)
         apply_fsdp2(model, meshes)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate)
     batch_generator = torch.Generator(device=runtime.device)
     batch_generator.manual_seed(args.seed + runtime.rank)
     checkpointer = CheckpointManager(
@@ -90,6 +105,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> None:
             optimizer,
             model_config=config.to_dict(),
             data_generator=batch_generator,
+            training_config={"lora": asdict(lora) if lora else None},
         ),
     )
 
@@ -107,7 +123,10 @@ def train(args: argparse.Namespace, runtime: Runtime) -> None:
             flush=True,
         )
 
-    for step in range(1, args.steps + 1):
+    start_step = checkpointer.load() if args.resume else 0
+    if start_step >= args.steps:
+        raise ValueError("steps must exceed the resumed step")
+    for step in range(start_step + 1, args.steps + 1):
         input_ids = make_batch(
             args.batch_size,
             args.seq_len,
@@ -131,7 +150,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> None:
 
         assert loss is not None
         loss.backward()
-        grad_norm = clip_grad_norm(model.parameters(), 1.0)
+        grad_norm = clip_grad_norm(trainable, 1.0)
         optimizer.step()
 
         should_log = step % args.log_every == 0 or step == args.steps
@@ -150,6 +169,8 @@ def train(args: argparse.Namespace, runtime: Runtime) -> None:
                 )
 
     checkpoint_path = checkpointer.save(args.steps)
+    if args.adapter_out:
+        save_adapter(model, args.adapter_out)
     if runtime.is_main:
         print(f"saved checkpoint to {checkpoint_path}", flush=True)
 

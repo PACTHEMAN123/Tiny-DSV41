@@ -9,6 +9,7 @@ class EngramPolicy:
     prefetch: str = "sync"
     deduplicate: bool = False
     staging_bytes: int = 256 * 1024**2
+    cache_bytes: int = 0
 
     def __post_init__(self):
         if self.device not in {"cpu", "cuda"}:
@@ -19,3 +20,5 @@ class EngramPolicy:
             raise ValueError("asynchronous Engram prefetch requires CPU storage")
         if self.staging_bytes < 4096:
             raise ValueError("Engram staging_bytes must be at least 4096")
+        if self.cache_bytes < 0:
+            raise ValueError("Engram cache requires a nonnegative byte budget")

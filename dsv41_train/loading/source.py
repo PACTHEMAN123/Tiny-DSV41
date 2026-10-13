@@ -1,7 +1,9 @@
 """Logical row slices over plain, block-quantized, and fused source tensors."""
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from dataclasses import dataclass
+from itertools import chain
 import math
 
 import torch
@@ -45,7 +47,7 @@ class WeightSource:
             return torch.empty((0, *self.shape(reader, self.names[0])[1:]), dtype=dtype)
         return parts[0] if len(parts) == 1 else torch.cat(parts)
 
-    def fill(self, reader, target, offsets, logical_shape, policy):
+    def fill(self, reader, target, offsets, logical_shape, policy, *, executor=None):
         if any(offsets[1:]):
             raise ValueError("direct loading currently requires dimension-zero FSDP shards")
         factor = math.prod(logical_shape[1:-1]) if len(logical_shape) > 2 else 1
@@ -58,30 +60,45 @@ class WeightSource:
         if rows and capacity < alignment:
             raise ValueError("loading staging budget cannot hold one aligned quantization block")
         chunk = max(1, min(policy.chunk_rows, capacity))
-        ranges, lo = [], start
-        while lo < start + rows:
-            # Bound the decoded block, including the prefix before a shard edge.
-            aligned_stop = (lo // alignment + capacity // alignment) * alignment
-            hi = min(lo + chunk, start + rows, aligned_stop)
-            ranges.append((lo, hi))
-            lo = hi
+        def row_ranges():
+            lo = start
+            while lo < start + rows:
+                # Bound the decoded block, including the prefix before a shard edge.
+                aligned_stop = (lo // alignment + capacity // alignment) * alignment
+                hi = min(lo + chunk, start + rows, aligned_stop)
+                yield lo, hi
+                lo = hi
+        ranges = row_ranges()
+        first = next(ranges, None)
+        if first is None:
+            return
+        pipelined = policy.pipeline and first[1] < start + rows
         def read(bounds):
             return self.read_rows(reader, *bounds, target.dtype)
         def copy(value, bounds):
-            if target.is_cuda and policy.pipeline:
+            if target.is_cuda and pipelined:
                 value = value.pin_memory()
-            flat[bounds[0]-start:bounds[1]-start].copy_(value, non_blocking=policy.pipeline)
+            flat[bounds[0]-start:bounds[1]-start].copy_(value, non_blocking=pipelined)
         with torch.no_grad():
-            if policy.pipeline and ranges:
-                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="weights") as executor:
-                    future = executor.submit(read, ranges[0])
-                    for index, bounds in enumerate(ranges):
-                        value = future.result()
-                        if index + 1 < len(ranges):
-                            future = executor.submit(read, ranges[index+1])
-                        copy(value, bounds)
-                        if target.is_cuda:
-                            torch.cuda.current_stream(target.device).synchronize()
+            if pipelined:
+                context = (nullcontext(executor) if executor is not None else
+                           ThreadPoolExecutor(max_workers=1, thread_name_prefix="weights"))
+                with context as worker:
+                    future = worker.submit(read, first)
+                    bounds = first
+                    try:
+                        while bounds is not None:
+                            value = future.result()
+                            following = next(ranges, None)
+                            if following is not None:
+                                future = worker.submit(read, following)
+                            copy(value, bounds)
+                            if target.is_cuda:
+                                torch.cuda.current_stream(target.device).synchronize()
+                            bounds = following
+                    finally:
+                        # A failed copy must not leave a reader active after its mmap closes.
+                        wait((future,))
             else:
-                for bounds in ranges:
+                for bounds in chain((first,), ranges):
                     copy(read(bounds), bounds)

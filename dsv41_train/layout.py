@@ -56,12 +56,18 @@ def parameter_layouts(model):
             expert_id = routed.expert_start + int(index)
             logical = prefix + "." + str(expert_id)
             role = "experts"
+        elif ".mlp.experts." in name:
+            role = "experts"
         if logical.startswith(layer_prefix):
             suffix = logical[len(layer_prefix):]
             index, tail = suffix.split(".", 1)
-            logical = layer_prefix + str(layers[int(index)].layer_id) + "." + tail
+            logical = layer_prefix + str(getattr(layers[int(index)], "layer_id", int(index))) + "." + tail
         offsets, shape = local_slice(parameter)
         global_shape = tuple(parameter.shape)
+        if ".mlp.experts." in name:
+            experts = modules[name.rsplit(".", 1)[0]]
+            global_shape = (experts.global_num_experts, *global_shape[1:])
+            offsets = (experts.expert_start + offsets[0], *offsets[1:])
         if "engram_tables." in name:
             table = modules[name.rsplit(".", 1)[0]]
             table_id = int(name.split("engram_tables.")[1].split(".")[0])

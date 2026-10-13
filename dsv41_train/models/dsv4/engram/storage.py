@@ -5,36 +5,60 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from .cache import RowCache
 
-class _StagedCopy(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, rows, device, budget, metrics):
-        ctx.source = rows.device
-        ctx.metrics = metrics
+
+class _PinnedStager:
+    def __init__(self, budget, metrics):
+        self.budget = budget
+        self.metrics = metrics
+        self.buffers = [None, None]
+
+    @property
+    def allocated_bytes(self):
+        return sum(buffer.numel() * buffer.element_size() for buffer in self.buffers if buffer is not None)
+
+    def copy(self, rows, device):
         result = torch.empty(rows.shape, dtype=rows.dtype, device=device)
         if not rows.numel():
             return result
-        row_bytes = rows.shape[-1] * rows.element_size()
-        if budget < 2 * row_bytes:
+        width = rows.shape[-1]
+        row_bytes = width * rows.element_size()
+        if self.budget < 2 * row_bytes:
             raise ValueError("Engram staging budget must hold two complete rows")
-        count = max(1, min(rows.shape[0], budget // (2 * row_bytes)))
-        buffers = [torch.empty((count, rows.shape[-1]), dtype=rows.dtype, pin_memory=True) for _ in range(2)]
+        limit = self.budget // (2 * row_bytes)
+        count = min(rows.shape[0], limit)
+        capacity = min(1 << (count - 1).bit_length(), limit)
         events = [None, None]
-        for number, start in enumerate(range(0, rows.shape[0], count)):
-            slot = number % 2
-            if events[slot] is not None:
-                events[slot].synchronize()
-            stop = min(start + count, rows.shape[0])
-            buffer = buffers[slot][:stop-start]
-            buffer.copy_(rows[start:stop])
-            result[start:stop].copy_(buffer, non_blocking=True)
-            events[slot] = torch.cuda.Event()
-            events[slot].record()
-        # The buffers must survive their DMA operations, including exception-free exit.
-        for event in events:
-            if event is not None:
-                event.synchronize()
+        try:
+            for number, start in enumerate(range(0, rows.shape[0], count)):
+                slot = number % 2
+                if events[slot] is not None:
+                    events[slot].synchronize()
+                buffer = self.buffers[slot]
+                if buffer is None or buffer.dtype != rows.dtype or buffer.shape[1] != width or buffer.shape[0] < count:
+                    buffer = self.buffers[slot] = torch.empty((capacity, width), dtype=rows.dtype, pin_memory=True)
+                stop = min(start + count, rows.shape[0])
+                buffer = buffer[:stop-start]
+                buffer.copy_(rows[start:stop])
+                result[start:stop].copy_(buffer, non_blocking=True)
+                events[slot] = torch.cuda.Event()
+                events[slot].record()
+        finally:
+            # Completion also makes reuse safe after a failed lookup.
+            for event in events:
+                if event is not None:
+                    event.synchronize()
+        self.metrics["h2d_bytes"] += rows.numel() * rows.element_size()
         return result
+
+
+class _StagedCopy(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, rows, device, stager, metrics):
+        ctx.source = rows.device
+        ctx.metrics = metrics
+        return stager.copy(rows, device)
 
     @staticmethod
     def backward(ctx, gradient):
@@ -53,20 +77,43 @@ class RowStore:
         return LookupResult(F.embedding(local_ids, weight, sparse=sparse))
 
 
+class CachedRowStore(RowStore):
+    """GPU-resident control using the same cache policy and coherence checks."""
+
+    def __init__(self, budget, metrics):
+        self.cache = RowCache(budget, metrics)
+
+    def lookup(self, weight, local_ids, *, sparse, device):
+        if not sparse:
+            raise ValueError("Engram cache requires sparse gradients")
+        return LookupResult(self.cache.lookup(weight, local_ids.cpu(), device,
+                                             lambda rows, target: rows.to(target)))
+
+
 class CPURowStore(RowStore):
-    def __init__(self, staging_bytes, metrics):
+    def __init__(self, staging_bytes, metrics, cache_bytes=0):
         self.staging_bytes = staging_bytes
         self.metrics = metrics
         self.stream = None
+        self.stager = _PinnedStager(staging_bytes, metrics)
+        self.cache = RowCache(cache_bytes, metrics) if cache_bytes else None
 
     def lookup(self, weight, local_ids, *, sparse, device):
-        rows = F.embedding(local_ids.cpu(), weight, sparse=sparse)
+        local_ids = local_ids.cpu()
         if device.type == "cpu":
-            return LookupResult(rows)
-        if self.stream is None:
+            return LookupResult(F.embedding(local_ids, weight, sparse=sparse))
+        if self.stream is None or self.stream.device != device:
             self.stream = torch.cuda.Stream(device=device)
         with torch.cuda.device(device), torch.cuda.stream(self.stream):
-            rows = _StagedCopy.apply(rows, device, self.staging_bytes, self.metrics)
+            if self.cache is not None:
+                if not sparse:
+                    raise ValueError("Engram cache requires sparse gradients")
+                rows = self.cache.lookup(weight, local_ids, device, self.stager.copy)
+            else:
+                rows = F.embedding(local_ids, weight, sparse=sparse)
+                rows = _StagedCopy.apply(rows, device, self.stager, self.metrics)
             event = torch.cuda.Event()
             event.record(self.stream)
+            if self.cache is not None:
+                event.synchronize()
         return LookupResult(rows, event)

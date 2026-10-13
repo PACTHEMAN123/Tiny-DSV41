@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
+from torch.utils._pytree import register_pytree_node
 
 from ...dispatch import TokenDispatcher
 from ...parallel import ContextParallel
@@ -265,6 +266,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         dispatcher: TokenDispatcher,
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
+        self.engram = None
         self.self_attn = Qwen3MoeAttention(config, layer_id, context_parallel)
         is_sparse = (
             layer_id not in config.mlp_only_layers
@@ -286,7 +289,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None,
         position_ids: torch.Tensor,
+        engram_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.engram is not None:
+            token_mask = (torch.ones(hidden.shape[:2], dtype=torch.bool, device=hidden.device)
+                          if attention_mask is None else attention_mask.bool())
+            hidden = self.engram(hidden.unsqueeze(-2), engram_rows, token_mask).squeeze(-2)
         residual = hidden
         hidden = self.self_attn(
             self.input_layernorm(hidden),
@@ -355,6 +363,12 @@ class Qwen3MoeModel(nn.Module):
 
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
+        tickets = {}
+        if hasattr(self, "engram_hash"):
+            mask = torch.ones_like(input_ids, dtype=torch.bool) if attention_mask is None else attention_mask.bool()
+            hashes = self.context_parallel.shard(self.engram_hash(input_ids, mask))
+            for index, layer_id in enumerate(self.engram_layer_ids):
+                tickets[layer_id] = self.engram_tables[str(layer_id)].prefetch(hashes[:, :, index])
         input_ids = self.context_parallel.shard(input_ids)
         position_ids = self.context_parallel.shard(position_ids)
         if attention_mask is not None:
@@ -364,6 +378,9 @@ class Qwen3MoeModel(nn.Module):
 
         collected_logits = []
         for layer in self.layers:
+            rows = None
+            if layer.layer_id in tickets:
+                rows = self.engram_tables[str(layer.layer_id)].resolve(tickets.pop(layer.layer_id))
             if self.gradient_checkpointing and self.training:
                 hidden, router_logits = checkpoint(
                     layer,
@@ -372,6 +389,7 @@ class Qwen3MoeModel(nn.Module):
                     sin,
                     attention_mask,
                     position_ids,
+                    rows,
                     use_reentrant=False,
                 )
             else:
@@ -381,6 +399,7 @@ class Qwen3MoeModel(nn.Module):
                     sin,
                     attention_mask,
                     position_ids,
+                    rows,
                 )
             if output_router_logits and router_logits is not None:
                 collected_logits.append(router_logits)
@@ -435,6 +454,14 @@ class Qwen3MoeCausalLMOutput:
     logits: torch.Tensor
     aux_loss: torch.Tensor | int | None
     router_logits: tuple[torch.Tensor, ...] | None
+
+
+# FSDP installs pre-backward hooks on tensors discovered through pytree.
+register_pytree_node(
+    Qwen3MoeCausalLMOutput,
+    lambda output: ([output.loss, output.logits, output.aux_loss, output.router_logits], None),
+    lambda values, context: Qwen3MoeCausalLMOutput(*values),
+)
 
 
 class Qwen3MoeForCausalLM(nn.Module):

@@ -22,6 +22,7 @@ from dsv41_train.optimization import OptimizerPolicy, build_optimizer
 from dsv41_train.sharded_state import StateAdapter
 from test_dsv4_loading import synthetic_checkpoint
 from test_memory_modules import memory_config
+from memory_validation_cases import fixture_dimensions
 
 
 def main():
@@ -31,19 +32,23 @@ def main():
     parser.add_argument("--cp", type=int, default=1)
     parser.add_argument("--ep", type=int, default=2)
     parser.add_argument("--optimizer", choices=("sgd", "adamw"), default="sgd")
+    parser.add_argument("--cache-bytes", type=int, default=0)
     args = parser.parse_args()
+    if args.cache_bytes and args.optimizer != "sgd":
+        parser.error("CPU Engram cache requires sparse SGD")
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     torch.set_num_threads(1)
     dist.init_process_group("nccl", device_id=device, timeout=datetime.timedelta(seconds=60))
     rank = dist.get_rank()
+    experts, length = fixture_dimensions(dist.get_world_size())
     folder = Path(args.folder)
     model = None
     try:
         if args.phase == "save" and rank == 0:
             folder.mkdir(parents=True, exist_ok=True)
             torch.manual_seed(42)
-            synthetic_checkpoint(folder, memory_config(n_routed_experts=6,
+            synthetic_checkpoint(folder, memory_config(n_routed_experts=experts,
                 engram_layer_ids=[1, 3], engram_num_embeddings=[127, 131]))
         dist.barrier()
         meshes, cp, dispatcher = build_parallelism(args.cp, args.ep)
@@ -53,7 +58,8 @@ def main():
             context_parallel=cp, token_dispatcher=dispatcher, engram_mesh=meshes.engram,
             sparse_engram_gradients=args.optimizer == "sgd", materializer=FSDPMaterializer(meshes, fsdp),
             load_policy=LoadPolicy("direct_shard"),
-            engram_policy=EngramPolicy("cpu", "async", True) if saving and args.optimizer == "sgd" else EngramPolicy())
+            engram_policy=EngramPolicy("cpu", "async", True, cache_bytes=args.cache_bytes)
+                          if saving and args.optimizer == "sgd" else EngramPolicy())
         optimizer = build_optimizer(model, OptimizerPolicy(args.optimizer, .01 if args.optimizer == "sgd" else .001))
         gradients = GradientPolicy(model, meshes)
         generator = torch.Generator(device=device).manual_seed(123 + rank // args.cp)
@@ -64,7 +70,7 @@ def main():
         def step():
             optimizer.zero_grad(set_to_none=True)
             gradients.begin_step()
-            tokens = torch.randint(3, 32, (1, 12), generator=generator, device=device)
+            tokens = torch.randint(3, 32, (1, length), generator=generator, device=device)
             for _ in range(2):
                 output = model(tokens, labels=tokens)
                 loss = output.loss + F.dropout(output.logits, p=.2, training=True).square().mean() * .01
@@ -102,6 +108,7 @@ def main():
         if rank == 0:
             report = {"phase": args.phase, "optimizer": args.optimizer, "cp": args.cp, "ep": args.ep,
                       "world": dist.get_world_size(), "format": StateAdapter.VERSION,
+                      "cache_bytes": args.cache_bytes if saving else 0,
                       "max_parameter_error": max(errors), "rng_exact": True, "passed": True}
             (folder / f"{args.phase}-result.json").write_text(json.dumps(report, indent=2) + "\n")
             print(f"fresh-process {args.phase} passed (CP{args.cp}/EP{args.ep}, {args.optimizer})", flush=True)

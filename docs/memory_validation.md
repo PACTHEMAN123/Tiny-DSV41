@@ -54,6 +54,24 @@ cover baseline, GPU deduplication, synchronous CPU/FSDP offload, asynchronous CP
 deduplication, and their combination with activation checkpointing. Six-GPU
 cases specifically cover CP2/EP3 and CP3/EP2.
 
+Eight-rank fixtures use eight experts and length 16, so the complete matrix
+includes every CP/EP pair in `{1,2,4,8}`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+python3 tests/run_memory_validation.py --suite cuda --ranks 8 \
+  --all-topologies --output-dir artifacts/memory-eight/fp32
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+python3 tests/run_memory_validation.py --suite cuda --ranks 8 --bf16 \
+  --keep-going --output-dir artifacts/memory-eight/bf16
+```
+
+The eight-rank BF16 suite has six selected placement/topology cases. Its current
+failures and diagnostics are documented in [memory_eight_results.md](memory_eight_results.md).
+`--match-reference-dedup` on `dsv4_memory_parallel.py` is an isolation diagnostic;
+it does not replace the default non-deduplicated reference.
+
 ## Lifecycle and fresh-process resume
 
 ```bash
@@ -94,6 +112,33 @@ separately from correctness tests to avoid host contention. Reports contain all
 rank measurements and policies. CPU RSS includes fixture construction; it is a
 process high-water mark, not isolated loader allocation. Logical reads measure
 requested encoded bytes, not physical disk I/O after filesystem caching.
+
+For a larger shared fixture, repeated trials and CUDA/worker-thread profiling,
+see the [eight-rank measurement commands](memory_eight_results.md#resume-commands).
+`--config` constructs the shared checkpoint outside benchmark workers;
+`--repeats` shuffles variant order reproducibly. `--trace-variants` collects
+separate post-timing traces on the first repetition. Summarize the folder with
+`tests/summarize_memory_benchmark.py`; retain both the manifest and run summary
+to identify unfinished trials.
+
+To diagnose weight loading, run `tests/dsv4_memory_benchmark.py` under the same
+`torch.distributed.run` command with `--load-trace-dir <directory>`. It records
+CPU decode/read/fill regions, background workers and CUDA copies in per-rank
+traces. This must be a separate diagnostic invocation: its `load_seconds`
+includes profiler overhead, and the report sets `load_profiled=true`. The
+summarizer rejects mixing those loads with unprofiled timing runs. Training
+`--trace-dir` continues to capture a separate sample after timed updates.
+Loading shape capture is disabled because the profiler's tensor references
+interfere with FSDP's meta-to-local storage swap; region and copy metrics remain
+available.
+
+When GPU execution is unavailable, the [simplified CPU component profile](memory_component_profile.md)
+measures loader read/decode/fill work and local Engram execution in fresh
+processes. Its CPU results and any historical CUDA context are explicitly
+separated; it does not substitute for offload DMA or distributed acceptance.
+
+The [loading review](loading_review.md) records the subsequent loader fixes,
+CPU before/after measurements and actual two-GPU timing and transfer traces.
 
 Run the LoRA/full-training FSDP regression with:
 

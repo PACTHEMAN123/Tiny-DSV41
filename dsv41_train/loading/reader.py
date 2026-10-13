@@ -16,6 +16,8 @@ def _torch_dtype(name: str) -> torch.dtype:
         return torch.bfloat16
     if name == "F32":
         return torch.float32
+    if name == "F16":
+        return torch.float16
     if name == "I8":
         return torch.int8
     attribute = {

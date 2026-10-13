@@ -162,6 +162,7 @@ class CheckpointManager:
         options = {}
         if getattr(self.state, "state_adapter", None) is not None:
             from .sharded_state import ShardLoadPlanner
+            self.state.model.synchronize_engram()
             metadata = dcp.FileSystemReader(str(checkpoint_path)).read_metadata()
             if "train.layout.version" not in metadata.state_dict_metadata:
                 raise ValueError("checkpoint lacks global parameter layout metadata; unsafe legacy shards cannot be restored")
