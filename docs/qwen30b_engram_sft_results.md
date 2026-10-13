@@ -2,6 +2,9 @@
 
 测试日期：2026-10-13。硬件为本机 8 张 NVIDIA H20，每卡约 95.58 GiB；PyTorch 2.10.0+cu129。
 
+功能介绍、入口选择和完整数据准备命令见 [Engram 功能与使用指南](engram_features.md)。
+本文中的 `artifacts/` 链接指测试机器的本地产物，不随 Git 发布；仓库保留报告与紧凑 JSON 统计，timeline 可按指南重新生成。
+
 ## 结论
 
 使用真实 Qwen3-30B-A3B-Instruct-2507 权重，新增 11.063B 个可训练 Engram 表参数，运行 Alpaca 回答部分监督的全参数 SFT。

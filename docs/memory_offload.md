@@ -4,6 +4,8 @@ The training entry point is `train_dsv4_checkpoint.py`. Runtime policies are
 separate from `DeepSeekV41Config`; all performance switches default to disabled.
 This implementation requires PyTorch 2.10 or later for the FSDP2 APIs used here.
 The measured version is 2.10.0+cu129 on NVIDIA H20.
+For a feature overview, cache lifecycle and the separate Qwen SFT workflow, see
+the [Engram feature guide](engram_features.md).
 
 ## Policies and compatibility
 
@@ -16,15 +18,16 @@ The measured version is 2.10.0+cu129 on NVIDIA H20.
 | `--engram-device` | `cuda` | `cpu` keeps each owned table shard on the host. |
 | `--engram-prefetch` | `sync` | `async` overlaps CPU lookup/H2D with backbone computation. Requires CPU tables. |
 | `--engram-deduplicate` | off | Removes duplicate requests and restores their original order. Works with CPU or GPU tables. |
-| `--engram-cache-mib` | `0` | Experimental GPU row cache budget per local CPU table; independent of request deduplication. |
+| `--engram-cache-mib` | `0` | Experimental GPU row cache budget per local table, with CPU or GPU source weights; independent of request deduplication. |
 | `--fsdp-offload-layers` | empty | Comma-separated global layer IDs and half-open ranges, such as `1,3:6`. |
 | `--fsdp-offload-targets` | `dense,experts` | Intersection of selected layers and parameter domains. Excludes Engram tables. |
 | `--fsdp-offload-pin-memory` | off | Pins the CPU shards managed by FSDP. |
 | `--optimizer-foreach` | off | Enables foreach for dense groups; sparse groups use the compatible path. |
 | `--gradient-accumulation-steps` | `1` | Normalizes once after all microbatches, before the update. |
 
-CPU Engram supports trainable sparse SGD with zero momentum and weight decay.
-GPU dense AdamW remains available. Parameter dtype is preserved and no persistent
+CPU Engram and cached tables support trainable sparse SGD with zero momentum and
+weight decay. GPU dense AdamW remains available with caching disabled.
+Parameter dtype is preserved and no persistent
 FP32 master weights are created. Duplicate sparse rows are coalesced before SGD.
 Low-precision coalescing and deduplication use temporary FP32 arithmetic. CPU
 dense BF16/FP16 SGD also uses temporary FP32 arithmetic to match the CUDA dense
@@ -64,6 +67,10 @@ tables then reserve at most 16 MiB of persistent GPU cache per rank, in addition
 to transient query outputs. The budget is per table, not per model. The cache
 can reduce transfers when requests repeat within gradient accumulation; it does
 not guarantee higher throughput. See [cache measurements](engram_cache_results.md).
+GPU-resident tables also accept a cache budget with `--optimizer sgd`; this
+retains the complete local GPU table shard and adds cache storage. It is an
+experimental comparison mode, not a way to reduce GPU table residency. The
+[Qwen four-way comparison](qwen30b_engram_sft_results.md) measures both placements.
 
 Combined configuration and checkpoint save:
 
@@ -134,7 +141,9 @@ cannot change values retained for backward or activation recomputation.
 Repeated misses share transferred values but preserve every gradient occurrence
 and its order; this is separate from router deduplication.
 
-The CPU parameter remains authoritative and is the only registered parameter.
+The source table parameter, on CPU or GPU, remains authoritative and is the only
+registered table parameter. For GPU source tables, cache misses gather rows from
+the GPU shard; CPU tag management and cache metadata transfers still add overhead.
 The optimizer invalidates touched cached rows after sparse SGD, while unmodified
 rows can survive the step. Unrecognized parameter version changes invalidate
 all rows. Parameter reload, placement/dtype changes and `close()` clear the cache.

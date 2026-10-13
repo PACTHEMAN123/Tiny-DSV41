@@ -4,6 +4,28 @@ Pure PyTorch training for DeepSeek V4.1 and Qwen3 MoE.
 
 Run all commands from the repository root.
 
+## Engram support
+
+This branch supports trainable, row-sharded Engram tables with independent
+placement, prefetch and cache policies. DSV4 uses its existing Engram structure;
+the Qwen experiment adds newly initialized Engram to a pretrained Qwen3 MoE.
+
+| Feature | Behavior and entry point |
+| --- | --- |
+| Trainable CPU offload | Keeps owned table rows and sparse gradients on CPU; transfers requested rows to GPU and updates tables with SGD. |
+| Asynchronous prefetch | Overlaps CPU lookup/H2D with earlier layers using bounded pinned buffers and copy streams; row-routing collectives remain ordered on the main thread. |
+| Request deduplication | Restores lookup order and repeated-row gradients; works with CPU or GPU tables independently of caching. |
+| Bounded GPU row cache | Supports CPU or GPU source tables, with a per-table/per-rank budget and invalidation after updates. GPU-resident tables retain their full shard. |
+| Loading and FSDP policies | DSV4 supports direct shard loading and selective dense/expert CPU offload, independently of Engram placement. |
+| Sharded training state | The DSV4 entry point saves parameters, optimizer and RNG state without gathering the full model; restore requires the same topology. |
+| Qwen SFT and profiling | A dedicated runner compares all four offload/cache combinations on real SFT data and exports timing, memory and CPU/CUDA traces. |
+
+Read the [Engram feature and usage guide (Chinese)](docs/engram_features.md)
+for commands, defaults, compatibility and cache semantics. Performance policies
+are opt-in in the general training path; the Qwen comparison runner explicitly
+selects its four experimental configurations. CPU tables and cached tables use
+the supported sparse SGD path. Prefetch and cache do not guarantee a speedup.
+
 ## Post-training and profiling
 
 DSV4 supports selective activation checkpointing and native PyTorch linear LoRA.
@@ -23,7 +45,7 @@ DSV4 supports direct shard loading, trainable CPU Engram tables, asynchronous
 row prefetch, selective FSDP CPU offload and sharded training-state resume.
 These policies default to disabled. See [configuration and examples](docs/memory_offload.md),
 [validation](docs/memory_validation.md), and [measurements](docs/memory_results.md).
-An optional bounded GPU cache for CPU Engram tables is described in
+An optional bounded GPU row cache is described in
 [cache measurements](docs/engram_cache_results.md); it remains disabled by default.
 The [95B, 40-layer H20 measurements](docs/dsv41_large_scale_results.md) cover
 near-capacity training, loading costs, full timelines and prefetch deadlines.
@@ -68,6 +90,8 @@ python3 -m torch.distributed.run --standalone --nproc-per-node=8 \
 The real Alpaca SFT comparison with newly added trainable Engram, CPU offload,
 and GPU row caching is documented in
 [`docs/qwen30b_engram_sft_results.md`](docs/qwen30b_engram_sft_results.md).
+Use the [Engram SFT runner](docs/engram_features.md#qwen-sft-四组对照)
+for that experiment; `train_qwen.py` below does not attach Engram automatically.
 
 ### One node, 8 GPUs
 
