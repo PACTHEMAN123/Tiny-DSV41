@@ -178,12 +178,19 @@ user turn. Reference answers stay outside the prompt:
 {"messages":[{"role":"user","content":"What is 2 + 2?"}],"answer":4,"task":"arithmetic"}
 ```
 
-Text input requires the checkpoint's `tokenizer.json`. Messages also require
+Text input requires the checkpoint's `tokenizer.json` and metadata loadable by
+Transformers `AutoTokenizer` with `local_files_only=True`, `trust_remote_code=False`
+and `use_fast=True`. Supply `tokenizer_class` in `tokenizer_config.json` when the
+model type is not registered with Transformers (the tiny example uses
+`PreTrainedTokenizerFast`). Messages also require
 `chat_template.jinja` or `tokenizer_config.json`'s `chat_template`; a template
 file takes precedence. Named templates require a `default` entry. Plain
 `prompt` text becomes a user message when a template exists, otherwise it uses
-the tokenizer's normal special-token processing. Templates are rendered with
-`add_generation_prompt=true` in sandboxed Jinja2, the only added dependency.
+the tokenizer class's normal special-token processing, including its BOS/EOS
+switches. Templates use `apply_chat_template(add_generation_prompt=True)` with
+sandboxed Jinja2 and no duplicate special-token insertion. The tokenizer
+dependency is `transformers>=4.57.6,<5`; checkpoint token IDs must remain unchanged,
+and truncation/padding are controlled by the RL runtime.
 No remote tokenizer code is executed. Tools, multimodal content and interactive
 multi-turn environment rollout are outside this MVP; conversation history is
 supported. The included tiny tokenizer is illustrative, not a production tokenizer.

@@ -85,6 +85,10 @@ class EvaluationTests(unittest.TestCase):
             root = Path(directory)
             base = root / "base"
             shutil.copytree(repository / "examples/rl/tiny-dsv41", base)
+            tokenizer_path = base / "tokenizer_config.json"
+            tokenizer_config = json.loads(tokenizer_path.read_text())
+            tokenizer_config.update(add_bos_token=True, add_eos_token=False)
+            tokenizer_path.write_text(json.dumps(tokenizer_config))
             (base / "generation_config.json").write_text(json.dumps({"eos_token_id": [2, 31]}))
             torch.manual_seed(19)
             model = DeepSeekV41ForCausalLM(DSV41Config.from_model_dir(base))

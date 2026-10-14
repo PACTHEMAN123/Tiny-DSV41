@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from pathlib import Path
 
-from jinja2 import TemplateError, nodes
-from jinja2.ext import Extension
-from jinja2.sandbox import ImmutableSandboxedEnvironment
+from jinja2 import TemplateError
 from tokenizers import Tokenizer
+from transformers import AutoTokenizer
 
 
 def _read_json(directory: Path, name: str) -> dict:
@@ -74,26 +72,6 @@ def _chat_template(directory: Path, config: dict) -> str | None:
     return template
 
 
-class _GenerationBlock(Extension):
-    tags = {"generation"}
-
-    def parse(self, parser):
-        line = next(parser.stream).lineno
-        body = parser.parse_statements(["name:endgeneration"], drop_needle=True)
-        return nodes.CallBlock(self.call_method("_render"), [], [], body).set_lineno(line)
-
-    def _render(self, caller):
-        return caller()
-
-
-def _raise_exception(message):
-    raise TemplateError(message)
-
-
-def _tojson(value, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
-    return json.dumps(value, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
-
-
 class ModelTokenizer:
     def __init__(self, model_dir):
         directory = Path(model_dir)
@@ -101,33 +79,23 @@ class ModelTokenizer:
         if not path.is_file():
             raise ValueError(f"{path} is required; only local tokenizers tokenizer.json checkpoints are supported")
         try:
-            self._tokenizer = Tokenizer.from_file(str(path))
+            vocabulary = Tokenizer.from_file(str(path)).get_vocab(with_added_tokens=True)
         except Exception as error:
             raise ValueError(f"unsupported or invalid tokenizer.json at {path}: {error}") from error
-        # Prompt length validation and batch padding belong to the RL runtime.
-        self._tokenizer.no_truncation()
-        self._tokenizer.no_padding()
         config = _read_json(directory, "config.json")
         text_config = _text_config(config)
         tokenizer_config = _read_json(directory, "tokenizer_config.json")
-        special_tokens = _read_json(directory, "special_tokens_map.json")
-        special_tokens.update({key: value for key, value in tokenizer_config.items() if key.endswith("_token") or key == "additional_special_tokens"})
-        self._special_tokens = {}
-        for name, value in special_tokens.items():
-            if value is None:
-                continue
-            values = value if name == "additional_special_tokens" else [value]
-            if not isinstance(values, list):
-                raise ValueError(f"{name} must be a list of special tokens")
-            contents = []
-            for token in values:
-                content = token.get("content") if isinstance(token, dict) else token
-                if not isinstance(content, str) or not content or self._tokenizer.token_to_id(content) is None:
-                    raise ValueError(f"{name} must name a token present in tokenizer.json")
-                contents.append(content)
-            self._special_tokens[name] = contents if name == "additional_special_tokens" else contents[0]
-
-        vocabulary = self._tokenizer.get_vocab(with_added_tokens=True)
+        self._template_source = _chat_template(directory, tokenizer_config)
+        try:
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                str(directory.resolve()), local_files_only=True, trust_remote_code=False, use_fast=True,
+            )
+        except Exception as error:
+            raise ValueError(f"cannot load local tokenizer at {directory}: {error}") from error
+        # Metadata must not create token IDs without matching checkpoint embeddings.
+        if self._tokenizer.get_vocab() != vocabulary:
+            raise ValueError("tokenizer metadata changes the checkpoint vocabulary; all tokens must retain their IDs from tokenizer.json")
+        self._vocabulary_ids = set(vocabulary.values())
         vocab_size = config.get("vocab_size", text_config.get("vocab_size"))
         if vocab_size is not None:
             if type(vocab_size) is not int or vocab_size <= 0:
@@ -135,13 +103,13 @@ class ModelTokenizer:
             if any(token_id >= vocab_size for token_id in vocabulary.values()):
                 raise ValueError("tokenizer vocabulary contains IDs outside the model vocabulary")
         fallback = tokenizer_config.get("eos_token_id")
-        if "eos_token" in self._special_tokens:
-            fallback = self._tokenizer.token_to_id(self._special_tokens["eos_token"])
+        if self._tokenizer.eos_token_id is not None:
+            fallback = self._tokenizer.eos_token_id
         self._eos_token_ids = read_eos_token_ids(directory, fallback=fallback)
         for token_id in self._eos_token_ids:
             self._validate_id(token_id, "eos_token_id")
         for name in ("bos_token", "eos_token", "pad_token", "unk_token"):
-            if name in self._special_tokens:
+            if getattr(self._tokenizer, name) is not None:
                 continue
             id_name = name + "_id"
             value = tokenizer_config.get(id_name, config.get(id_name, text_config.get(id_name)))
@@ -150,16 +118,14 @@ class ModelTokenizer:
             if value is not None:
                 token_id = _token_ids(value, id_name)[0]
                 self._validate_id(token_id, id_name)
-                self._special_tokens[name] = self._tokenizer.id_to_token(token_id)
-        self._template_source = _chat_template(directory, tokenizer_config)
-        self._template = None
+                setattr(self._tokenizer, name, self._tokenizer.convert_ids_to_tokens(token_id))
 
     @property
     def eos_token_ids(self) -> tuple[int, ...]:
         return self._eos_token_ids
 
     def _validate_id(self, token_id, name):
-        if type(token_id) is not int or token_id < 0 or self._tokenizer.id_to_token(token_id) is None:
+        if type(token_id) is not int or token_id not in self._vocabulary_ids:
             raise ValueError(f"{name} contains an ID outside the tokenizer vocabulary: {token_id!r}")
 
     def encode_prompt(self, prompt: str | None = None, messages: list[dict] | None = None) -> list[int]:
@@ -169,7 +135,8 @@ class ModelTokenizer:
             if not isinstance(prompt, str) or not prompt.strip():
                 raise ValueError("prompt must be a nonempty string")
             if self._template_source is None:
-                return self._tokenizer.encode(prompt, add_special_tokens=True).ids
+                # Prompt length validation and batch padding belong to the RL runtime.
+                return self._tokenizer.encode(prompt, add_special_tokens=True, padding=False, truncation=False)
             messages = [{"role": "user", "content": prompt}]
         if self._template_source is None:
             raise ValueError("messages require a checkpoint chat template")
@@ -185,15 +152,12 @@ class ModelTokenizer:
         if messages[-1]["role"] != "user":
             raise ValueError("messages must end with a user message for generation")
         try:
-            if self._template is None:
-                environment = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols", _GenerationBlock])
-                environment.globals.update(raise_exception=_raise_exception, strftime_now=lambda format: datetime.now().strftime(format))
-                environment.filters["tojson"] = _tojson
-                self._template = environment.from_string(self._template_source)
-            rendered = self._template.render(**self._special_tokens, messages=messages, add_generation_prompt=True)
+            ids = self._tokenizer.apply_chat_template(
+                messages, chat_template=self._template_source, tokenize=True,
+                add_generation_prompt=True, padding=False, truncation=False,
+            )
         except (TemplateError, TypeError, ValueError) as error:
             raise ValueError(f"cannot render checkpoint chat template: {error}") from error
-        ids = self._tokenizer.encode(rendered, add_special_tokens=False).ids
         if not ids:
             raise ValueError("chat template produced an empty tokenized prompt")
         return ids

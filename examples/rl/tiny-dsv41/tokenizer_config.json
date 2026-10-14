@@ -1,4 +1,5 @@
 {
+  "tokenizer_class": "PreTrainedTokenizerFast",
   "bos_token": "<bos>",
   "eos_token": "<eos>",
   "pad_token": "<pad>",
