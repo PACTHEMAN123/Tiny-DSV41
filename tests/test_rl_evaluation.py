@@ -47,7 +47,7 @@ class EvaluationTests(unittest.TestCase):
             identity = run_identity(base, data, True)
             legacy_identity = {key: value for key, value in identity.items()
                                if key not in {"identity_version", "text_assets_sha256"}}
-            config = RLConfig()
+            config = RLConfig(rollout_engine="native-pytorch")
             model_config = DSV41Config.from_model_dir(base)
             model = make_model(base, model_config, config, ("cpu",), True)
             optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad])
@@ -65,7 +65,7 @@ class EvaluationTests(unittest.TestCase):
             self.assertEqual(generation_options(base, model_config, config)["eos_token_id"], (2, 31))
             with self.assertRaisesRegex(ValueError, "eos_token_ids"):
                 load_training_checkpoint(checkpoint, model, optimizer,
-                                         RLConfig(eos_token_ids=(2, 31)), identity)
+                                         RLConfig(rollout_engine="native-pytorch", eos_token_ids=(2, 31)), identity)
             (base / "chat_template.jinja").write_text("{{ messages }}")
             changed = run_identity(base, data, True)
             validate_identity(legacy_identity, changed)
@@ -105,7 +105,8 @@ class EvaluationTests(unittest.TestCase):
                                           "eval_interval": 1, "log_samples_per_step": 2,
                                           "output_dir": str(root / "run")}))
             command = [sys.executable, "-m", "dsv41_train.rl.train", "--model-dir", str(base),
-                       "--data", str(training), "--eval-data", str(validation), "--config", str(config)]
+                       "--data", str(training), "--eval-data", str(validation), "--config", str(config),
+                       "--rollout-engine", "native-pytorch"]
             def run(arguments):
                 result = subprocess.run(arguments, cwd=repository, capture_output=True, text=True,
                                         env={**os.environ, "PYTHONPATH": str(repository)}, timeout=120)
@@ -146,7 +147,7 @@ class EvaluationTests(unittest.TestCase):
         weights = model.transitions.detach().clone()
         rng = torch.get_rng_state().clone()
         records = [PromptRecord([1, 0], [2], {"answer": "two"})]
-        config = RLConfig(eval_samples_per_prompt=3, max_new_tokens=3)
+        config = RLConfig(rollout_engine="native-pytorch", eval_samples_per_prompt=3, max_new_tokens=3)
         with tempfile.TemporaryDirectory() as directory:
             options = dict(eos_token_id=(2,), stop_token_sequences=(), truncated_reward=0.0)
             first = evaluate_policy(model, records, config, reward_fn=build_reward("exact_match"),

@@ -1,4 +1,5 @@
 {
+  "rollout_engine": "native-pytorch",
   "max_steps": 3,
   "group_size": 4,
   "max_new_tokens": 16,

@@ -42,7 +42,7 @@ class RuntimeTests(unittest.TestCase):
         return subprocess.run(
             [sys.executable, "-m", "dsv41_train.rl.train", "--model-dir",
              str(ROOT / "examples/rl/tiny-dsv41"), "--data", str(ROOT / "examples/rl/prompts.jsonl"),
-             "--config", str(config), "--allow-random-init", *extra],
+             "--config", str(config), "--rollout-engine", "native-pytorch", "--allow-random-init", *extra],
             cwd=ROOT, env={**os.environ, "PYTHONPATH": str(ROOT)},
             text=True, capture_output=True, timeout=90,
         )

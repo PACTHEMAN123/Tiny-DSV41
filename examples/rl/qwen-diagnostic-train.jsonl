@@ -1,0 +1,3 @@
+{"messages":[{"role":"system","content":"Give a concise response."},{"role":"user","content":"Write one short, pleasant greeting in any language."}],"metadata":{"case_id":"diagnostic-greeting","purpose":"token-ID reward plumbing, not answer quality"}}
+{"messages":[{"role":"system","content":"Give a concise response."},{"role":"user","content":"Name one color chosen freely. Reply only with its name."}],"metadata":{"case_id":"diagnostic-color","purpose":"token-ID reward plumbing, not answer quality"}}
+{"messages":[{"role":"system","content":"Give a concise response."},{"role":"user","content":"Write a two-word imaginary town name."}],"metadata":{"case_id":"diagnostic-town","purpose":"token-ID reward plumbing, not answer quality"}}

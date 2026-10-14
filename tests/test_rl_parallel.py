@@ -21,7 +21,7 @@ def shared_table_child(tables, connection):
     try:
         torch.set_num_threads(1)
         model = make_model(MODEL_DIR, DSV41Config.from_model_dir(MODEL_DIR),
-                           RLConfig(seed=37), ("cpu",), True, engram_weights=tables)
+                           RLConfig(rollout_engine="native-pytorch", seed=37), ("cpu",), True, engram_weights=tables)
         model.assert_engram_invariants()
         table = model.backend.model.engram_tables["1"].weight
         connection.send((table.is_shared(), table.data_ptr() == tables["1"].data_ptr()))
@@ -38,7 +38,7 @@ class ParallelRLTests(unittest.TestCase):
         self.config = DSV41Config.from_model_dir(MODEL_DIR)
 
     def model(self, **kwargs):
-        return make_model(MODEL_DIR, self.config, RLConfig(seed=37), ("cpu",), True, **kwargs)
+        return make_model(MODEL_DIR, self.config, RLConfig(rollout_engine="native-pytorch", seed=37), ("cpu",), True, **kwargs)
 
     def test_gpu_counts_resolve_to_independent_device_lists(self):
         config = RLConfig.from_dict({"trainer_num_gpus": 3, "rollout_num_gpus": 2})
@@ -106,7 +106,7 @@ class ParallelRLTests(unittest.TestCase):
             torch.save(base.state_dict(), root / "pytorch_model.bin")
             tables = {name: torch.full_like(table.weight, 0.25).share_memory_()
                       for name, table in base.model.engram_tables.items()}
-            model = make_model(root, self.config, RLConfig(), ("cpu",), False, engram_weights=tables)
+            model = make_model(root, self.config, RLConfig(rollout_engine="native-pytorch"), ("cpu",), False, engram_weights=tables)
             for name, table in model.backend.model.engram_tables.items():
                 self.assertEqual(table.weight.data_ptr(), tables[name].data_ptr())
             model(torch.tensor([[1, 4, 7]])).sum().backward()
@@ -135,7 +135,7 @@ class ParallelRLTests(unittest.TestCase):
                 return read(reader, name, device)
 
             with patch.object(_SafeTensorShard, "tensor", read_backbone):
-                model = make_model(root, self.config, RLConfig(), ("cpu",), False, engram_weights=tables)
+                model = make_model(root, self.config, RLConfig(rollout_engine="native-pytorch"), ("cpu",), False, engram_weights=tables)
             for name, table in model.backend.model.engram_tables.items():
                 self.assertEqual(table.weight.data_ptr(), tables[name].data_ptr())
 
@@ -188,7 +188,7 @@ class ParallelRLTests(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.device_count() >= 2, "two CUDA devices required")
     def test_disabling_offload_places_frozen_tables_with_their_layers(self):
-        config = RLConfig(seed=37, engram_offload=False)
+        config = RLConfig(rollout_engine="native-pytorch", seed=37, engram_offload=False)
         model = make_model(MODEL_DIR, self.config, config, ("cuda:0", "cuda:1"), True)
         for layer in model.backend.model.layers:
             if layer.engram is not None:

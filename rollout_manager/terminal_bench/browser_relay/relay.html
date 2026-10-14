@@ -1,0 +1,645 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Evaluation Relay</title>
+<style>body{font:15px system-ui;margin:32px;max-width:900px;color:#20272b;background:#fafbfc}h1{font-size:24px}label{display:block;margin:18px 0 6px}input{box-sizing:border-box;width:100%;padding:9px}button{padding:8px 14px;margin:12px 8px 12px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#edf0f2;padding:14px;border-radius:4px;min-height:80px}.hidden{display:none}</style></head>
+<body><h1>Evaluation Relay</h1><p id="status">Connecting</p><section id="pair-controls" class="hidden"><label id="peer-label" for="peer">Peer private launch URL</label><input id="peer" type="password" autocomplete="off" spellcheck="false"><button id="connect">Connect</button></section><section id="execution-controls" class="hidden"><button id="echo" disabled>Echo / Stream Test</button><button id="start" disabled>Start Relay</button><button id="stop" disabled>Stop</button><button id="cancel" disabled>Cancel Active</button></section><pre id="log"></pre>
+<script>
+"use strict";
+const fragment = new URLSearchParams(location.hash.slice(1));
+const token = fragment.get("token"), pairNonce = fragment.get("nonce"), parentOrigin = fragment.get("parentOrigin") || fragment.get("cpuOrigin");
+history.replaceState(null, "", location.pathname + location.search);
+const base = new URL(".", location.href), logNode = document.querySelector("#log"), statusNode = document.querySelector("#status");
+const MAX_MESSAGE = 2700000;
+let config, peerWindow = null, nonce = null, paired = false, running = false, peerCapacity = 0, loopEpoch = 0;
+let peerGenerationSeconds=120;
+let peerBootId=null,heartbeatEpoch=0,heartbeatActive=false,heartbeatController=null,capacityProbe=null,capacityFreshUntil=0;
+let heartbeatEnabled=true,relayDeadline=0;
+let claimRecoveryRequired=false;
+let deliveryRecoveryRequired=false;
+const relayWakeups=new Set();
+const cpuTasks = new Map(), pending = new Map(), gpuTasks = new Map();
+const acknowledgements = new Map();
+const seen = new Set();
+const completionWaiters = new Map();
+let completionPumpActive=false;
+const artifactWaiters=new Map();
+let artifactPumpActive=false;
+function log(text) { logNode.textContent = (logNode.textContent + text + "\n").slice(-6000); }
+function status(text) { statusNode.textContent = text; }
+function idOK(id) { return typeof id === "string" && /^[a-f0-9]{32}$/.test(id); }
+function nonceOK(n) { return typeof n === "string" && /^[a-f0-9]{64}$/.test(n); }
+function safeMessage(value) { try { return value && typeof value === "object" && !Array.isArray(value) && JSON.stringify(value).length <= MAX_MESSAGE; } catch { return false; } }
+function responseDiagnostic(response,path,text) {
+  const allowedRoutes=new Set(["api/config","api/status","api/claim","api/claim-receipt","api/pulse","api/pair","api/result","api/cancel","api/qualify","api/telemetry","api/echo","api/submit","api/completion","api/completions","api/complete-ack"]);
+  const routeCategory=url=>url.origin===base.origin && url.pathname.startsWith(base.pathname) ? url.pathname.slice(base.pathname.length) : null;
+  let requestRoute="other",finalOrigin="unavailable",finalPath="unavailable",finalRoute="other";
+  try {const route=routeCategory(new URL(path,base));if(allowedRoutes.has(route))requestRoute=route;}catch {}
+  try {
+    const finalURL=new URL(response.url);
+    finalOrigin=finalURL.origin===base.origin?"same_origin":"other_origin";
+    const route=routeCategory(finalURL);
+    if(allowedRoutes.has(route))finalRoute=route;
+    finalPath=allowedRoutes.has(route)?"relay_api":finalOrigin!=="same_origin"?"other_origin":["","relay.html"].includes(route)?"relay_page":"other_same_origin";
+  }catch {}
+  const rawType=(response.headers.get("Content-Type")||"").slice(0,256).split(";",1)[0].trim().toLowerCase();
+  const contentType=["application/json","application/problem+json","text/html","text/plain","application/octet-stream"].includes(rawType)?rawType:rawType?"other":"missing";
+  const prefix=text.slice(0,16384);
+  return {http_status:Number.isInteger(response.status)&&response.status>=0&&response.status<=599?response.status:null,
+    content_type:contentType,redirected:response.redirected===true,request_route:requestRoute,
+    final_origin_category:finalOrigin,final_path_category:finalPath,final_route:finalRoute,
+    body_utf8_bytes_observed:new TextEncoder().encode(prefix).length,body_prefix_truncated:prefix.length!==text.length};
+}
+function responseError(message,response,path,text,legacyStatus=false) {
+  const diagnostic=responseDiagnostic(response,path,text);
+  const error=new Error(message+" [http_diagnostic="+JSON.stringify(diagnostic)+"]");
+  error.diagnostic=diagnostic;
+  // Non-JSON errors historically had no status; preserve retry classification.
+  if(legacyStatus)error.status=response.status;
+  return error;
+}
+async function api(path, body, timeout = 130000, signal) {
+  const deadlineSignal=AbortSignal.timeout(Math.max(1,Math.ceil(timeout)));
+  const response = await fetch(new URL(path, base), {method: body === undefined ? "GET" : "POST", credentials:"same-origin", cache:"no-store", headers:{"X-Relay-Token":token,"X-Relay-Origin":location.origin,"Content-Type":"application/json"}, body: body === undefined ? undefined : JSON.stringify(body), signal:signal?AbortSignal.any([signal,deadlineSignal]):deadlineSignal});
+  const text = await response.text();
+  if (text.length > MAX_MESSAGE) throw responseError("Oversized API response",response,path,text);
+  let value; try { value = JSON.parse(text); } catch { throw responseError("Gateway returned a non-JSON response",response,path,text); }
+  if (!response.ok) throw responseError("Relay HTTP error",response,path,text,value!==null);
+  return value;
+}
+function telemetry(id,event,duration) { return api("api/telemetry",{request_id:id,event,duration_ms:Math.max(0,Math.round(duration))},10000).catch(()=>{}); }
+function post(target,targetOrigin,data) { target.postMessage({...data,nonce},targetOrigin); }
+function capacity() {return Math.min(config.max_inflight,peerCapacity);}
+function capacityOK(value) {return Number.isInteger(value) && value>=1 && value<=64;}
+function generationSeconds(value) {const seconds=value===undefined?120:value;if(!Number.isInteger(seconds)||seconds<1||seconds>600)throw new Error("Invalid generation budget");return seconds;}
+function generationBudgetMs() {return Math.min(generationSeconds(config.generation_seconds),peerGenerationSeconds)*1000;}
+function trainingKernelProof(value) {
+  const keys=["enable_cutedsl_warmup","enable_flashinfer_autotune","enable_jit_warmup","moe_backend"];
+  return safeMessage(value) && JSON.stringify(Object.keys(value).sort())===JSON.stringify(keys) && value.moe_backend==="triton" && keys.slice(0,3).every(k=>value[k]===false);
+}
+function trainingStartupProof(value) {
+  const keys=["applied_count","bypassed_unrelated_minimax_import","model_type","preserves_original_warmup_body","profile","stock_kernel_warmup_sha256"];
+  return safeMessage(value) && JSON.stringify(Object.keys(value).sort())===JSON.stringify(keys) && value.profile==="qwen3-moe-minimax-import-guard-v1" && Number.isSafeInteger(value.applied_count) && value.applied_count>=1 && value.stock_kernel_warmup_sha256==="69d9f633e353d02898b0e0054613f10596747341ea23e4369c1cdfd88ec2cac5" && value.model_type==="qwen3_moe" && value.preserves_original_warmup_body===true && value.bypassed_unrelated_minimax_import===true;
+}
+function trainingEngineProof(p) {
+  const e=p.vllm_engine;
+  if(!safeMessage(e) || e.schema_version!==1 || e.serving_profile!=="vllm-training-v1" || e.version!=="0.31.0" || e.tensor_parallel_size!==1 || e.logprobs_mode!=="processed_logprobs" || e.prefix_caching!==false || e.enforce_eager!==false || e.compilation_mode!==0 || e.cudagraph_mode!=="FULL_DECODE_ONLY" || !Number.isSafeInteger(e.max_model_len) || e.max_model_len<1 || e.max_model_len!==Number(p.policy.identities?.vllm_max_model_len) || e.gpu_memory_utilization!==.70 || e.kv_bytes_per_token!==98304 || e.full_context_raw_kv_bytes!==e.max_model_len*e.kv_bytes_per_token || e.full_context_raw_kv_bytes>e.kv_cache_memory_bytes || e.kv_cache_memory_bytes!==34359738368 || e.kv_cache_memory_bytes!==Number(p.policy.identities?.vllm_kv_cache_memory_bytes) || !safeMessage(e.actor_process) || !Number.isSafeInteger(e.actor_process.pid) || e.actor_process.pid<=0 || !Number.isSafeInteger(e.actor_process.start_ticks) || e.actor_process.start_ticks<=0 || typeof e.actor_process.cmdline_sha256!=="string" || !/^[a-f0-9]{64}$/.test(e.actor_process.cmdline_sha256) || JSON.stringify(e.cudagraph_capture_sizes)!=="[1]" || !safeMessage(e.loaded_policy_ack) || !safeMessage(e.loaded_trainable_tensors) || !Array.isArray(e.workers) || e.workers.length!==1)throw new Error("Invalid actual vLLM engine configuration proof");
+  if(!trainingKernelProof(e.kernel_config) || p.policy.identities?.vllm_moe_backend!=="triton" || !["vllm_enable_jit_warmup","vllm_enable_cutedsl_warmup","vllm_enable_flashinfer_autotune"].every(k=>p.policy.identities?.[k]==="false"))throw new Error("Invalid supported vLLM kernel configuration proof");
+  if(!trainingStartupProof(e.startup_adapter) || p.policy.identities?.vllm_startup_adapter!=="qwen3-moe-minimax-import-guard-v1")throw new Error("Invalid owned Qwen startup adapter proof");
+  if(e.worker_rpc_method!=="rollout_manager_owned_call" || e.insecure_serialization!==false || p.policy.identities?.vllm_worker_rpc!=="rollout_manager_owned_call" || p.policy.identities?.vllm_insecure_serialization!=="false")throw new Error("Invalid secure named vLLM worker RPC proof");
+  for(const k of ["version","digest","lineage"])if(e.loaded_policy_ack[k]!==p.policy_ack[k])throw new Error("vLLM engine loaded policy differs from controller acknowledgement");
+  for(const w of e.workers)if(!safeMessage(w) || !Number.isSafeInteger(w.pid) || w.pid<=0 || !Number.isSafeInteger(w.start_ticks) || w.start_ticks<=0 || typeof w.cmdline_sha256!=="string" || !/^[a-f0-9]{64}$/.test(w.cmdline_sha256) || typeof w.device!=="string" || !w.device || typeof w.device_uuid!=="string" || !w.device_uuid || !safeMessage(w.graph) || !["captured_graph_count","replay_calls"].every(k=>Number.isSafeInteger(w.graph[k])&&w.graph[k]>=0))throw new Error("Invalid actual vLLM worker and graph proof");
+  const expertClass="vllm.model_executor.layers.fused_moe.experts.triton_moe.TritonExperts";
+  for(const w of e.workers)if(!trainingKernelProof(w.kernel_config) || !Array.isArray(w.moe_implementations) || !w.moe_implementations.length || !w.moe_implementations.every(m=>safeMessage(m)&&typeof m.module==="string"&&m.module&&m.backend==="TRITON"&&m.selected_experts_class===expertClass&&m.experts_class===expertClass))throw new Error("Invalid actual vLLM Triton expert implementation proof");
+  for(const w of e.workers)if(!trainingStartupProof(w.startup_adapter) || !Object.keys(e.startup_adapter).every(k=>w.startup_adapter[k]===e.startup_adapter[k]))throw new Error("Actual vLLM worker startup adapter differs from engine proof");
+  for(const w of e.workers)if(w.worker_rpc_method!==e.worker_rpc_method || w.insecure_serialization!==false)throw new Error("Actual vLLM worker RPC security differs from engine proof");
+  return e;
+}
+function modelCapacityProof(value) {
+  const keys=["model_max_num_seqs","model_capacity_source","model_pid","model_pid_start_ticks","model_cmdline_sha256"],present=keys.filter(key=>Object.hasOwn(value,key));
+  const controlled=value.serving_profile==="native-pytorch-v1" || value.serving_profile==="vllm-training-v1";
+  const proofKeys=["native_controller","training_controller"].filter(key=>Object.hasOwn(value,key));
+  if(proofKeys.length) {
+    const key=value.serving_profile==="native-pytorch-v1"?"native_controller":"training_controller",p=value[key];
+    if(!controlled || proofKeys.length!==1 || !Object.hasOwn(value,key) || present.length || !safeMessage(p) || p.schema_version!==1 || p.serving_profile!==value.serving_profile || p.served_model!==config.model || p.generation_slots!==1 || value.max_inflight!==1 || !["running","paused"].includes(p.controller_state) || !Number.isInteger(p.active_generations) || p.active_generations<0 || p.active_generations>1 || !["model_pid","model_pid_start_ticks","netns_inode"].every(k=>Number.isSafeInteger(p[k])&&p[k]>0) || typeof p.model_cmdline_sha256!=="string" || !/^[a-f0-9]{64}$/.test(p.model_cmdline_sha256) || !["started_unix","expires_unix","observed_unix"].every(k=>Number.isFinite(p[k])&&p[k]>0) || p.expires_unix<=p.observed_unix || !safeMessage(p.policy) || !safeMessage(p.policy_ack) || !safeMessage(p.capabilities))throw new Error("Invalid training controller ownership or loaded policy proof");
+    if(value.serving_profile==="vllm-training-v1")trainingEngineProof(p);
+    return {[key]:p};
+  }
+  if(controlled && value.role!=="cpu")throw new Error("Training serving requires an actual controller proof");
+  if(!present.length)return {};
+  if(present.length!==keys.length || !Number.isInteger(value.model_max_num_seqs) || value.model_max_num_seqs<1 || value.model_max_num_seqs>1024 || value.model_capacity_source!=="owned_vllm_process" || !Number.isSafeInteger(value.model_pid) || value.model_pid<=0 || !Number.isSafeInteger(value.model_pid_start_ticks) || value.model_pid_start_ticks<=0 || typeof value.model_cmdline_sha256!=="string" || !/^[a-f0-9]{64}$/.test(value.model_cmdline_sha256))throw new Error("Invalid owned model capacity proof");
+  return Object.fromEntries(keys.map(key=>[key,value[key]]));
+}
+function modelCapacityIdentity(value) {
+  const proof=modelCapacityProof(value),key=Object.hasOwn(proof,"training_controller")?"training_controller":"native_controller";
+  if(!proof[key])return proof;
+  const p=proof[key],keys=["schema_version","serving_profile","served_model","model_pid","model_pid_start_ticks","model_cmdline_sha256","generation_slots","started_unix","expires_unix","model_dir","python_executable","netns_inode"];
+  const engine=p.serving_profile==="vllm-training-v1"?trainingEngineProof(p):null;
+  const vllm_engine=engine?{...Object.fromEntries(["schema_version","version","serving_profile","tensor_parallel_size","logprobs_mode","prefix_caching","enforce_eager","compilation_mode","cudagraph_mode","cudagraph_capture_sizes","max_model_len","kv_cache_memory_bytes","gpu_memory_utilization","kv_bytes_per_token","full_context_raw_kv_bytes","kernel_config","startup_adapter","worker_rpc_method","insecure_serialization"].map(k=>[k,engine[k]])),actor_process:engine.actor_process,workers:engine.workers.map(w=>Object.fromEntries(["pid","start_ticks","cmdline_sha256","device","device_uuid","kernel_config","moe_implementations","startup_adapter","worker_rpc_method","insecure_serialization"].map(k=>[k,w[k]])))}:undefined;
+  return {...Object.fromEntries(keys.map(k=>[k,p[k]])),lineage:p.policy.lineage,identities:p.policy.identities,sampling:p.policy.sampling,...(engine?{vllm_engine}: {})};
+}
+function sendReady() {post(peerWindow,config.peer_origin,{type:"ready",protocol:2,delivery_transport:"cpu-commit-ack-v1",artifact_transport:config.artifact_transport,serving_profile:config.serving_profile||"vllm-v1",max_inflight:config.max_inflight,generation_seconds:generationSeconds(config.generation_seconds),model:config.model,boot_id:config.boot_id});}
+function artifactRPC(route,value) {
+  if(!paired || peerWindow.closed)throw new Error("Artifact peer is unavailable");
+  const rpcId=Array.from(crypto.getRandomValues(new Uint8Array(16)),x=>x.toString(16).padStart(2,"0")).join("");
+  return new Promise((resolve,reject)=>{
+    const timer=setTimeout(()=>{artifactWaiters.delete(rpcId);reject(new Error("Artifact receipt timed out; identical file delivery remains resumable"));},15000);
+    artifactWaiters.set(rpcId,{resolve,reject,timer,peerBootId});
+    post(peerWindow,config.peer_origin,{type:"artifact_request",rpc_id:rpcId,boot_id:config.boot_id,route,value});
+  });
+}
+async function artifactReceive(data) {
+  if(!idOK(data.rpc_id) || data.boot_id!==peerBootId || !["api/artifact-start","api/artifact-chunk","api/artifact-commit"].includes(data.route) || !safeMessage(data.value))return;
+  try {
+    const receipt=await api(data.route,data.value,12000);
+    post(peerWindow,config.peer_origin,{type:"artifact_receipt",rpc_id:data.rpc_id,boot_id:config.boot_id,ok:true,receipt});
+  } catch(error) {
+    post(peerWindow,config.peer_origin,{type:"artifact_receipt",rpc_id:data.rpc_id,boot_id:config.boot_id,ok:false,error:String(error.message).slice(0,300)});
+  }
+}
+async function artifactRetry(route,value) {
+  let error;
+  for(let attempt=0;attempt<3;attempt++) {
+    try {return await artifactRPC(route,value);}catch(cause){error=cause;if(!paired)break;}
+  }
+  throw error;
+}
+async function artifactPump() {
+  if(artifactPumpActive || config?.artifact_transport!=="durable-chunks-v1")return;
+  artifactPumpActive=true;
+  try {
+    while(paired && !peerWindow.closed) {
+      try {
+        const manifest=await api("api/artifact-next",{},5000);
+        if(manifest!==null) {
+          if(!safeMessage(manifest) || !/^[a-f0-9]{64}$/.test(manifest.id) || manifest.chunk_bytes!==131072 || !Number.isSafeInteger(manifest.bytes) || manifest.bytes<=0 || manifest.bytes>536870912)throw new Error("Invalid outgoing artifact manifest");
+          const started=await artifactRetry("api/artifact-start",manifest);
+          const count=Math.ceil(manifest.bytes/manifest.chunk_bytes);
+          if(started.id!==manifest.id || !Number.isInteger(started.next_index) || started.next_index<0 || started.next_index>count)throw new Error("Invalid durable artifact progress");
+          for(let index=started.next_index;index<count;index++) {
+            const chunk=await api("api/artifact-read",{id:manifest.id,index},5000);
+            if(chunk.id!==manifest.id || chunk.index!==index)throw new Error("Artifact read changed identity");
+            const receipt=await artifactRetry("api/artifact-chunk",chunk);
+            if(receipt.id!==manifest.id || receipt.index!==index || receipt.sha256!==chunk.sha256 || receipt.durable!==true)throw new Error("Artifact chunk receipt differs");
+          }
+          const receipt=await artifactRetry("api/artifact-commit",{id:manifest.id});
+          if(receipt.id!==manifest.id || receipt.sha256!==manifest.sha256 || receipt.bytes!==manifest.bytes || receipt.durable!==true)throw new Error("Artifact final durable receipt differs");
+          await api("api/artifact-ack",receipt,5000);
+          log("Artifact delivered: "+manifest.kind+" "+manifest.key+" ("+manifest.bytes+" bytes)");
+        }
+      } catch(error) {log("Artifact delivery retained: "+error.message);}
+      await new Promise(resolve=>setTimeout(resolve,1000));
+    }
+  } finally {artifactPumpActive=false;}
+}
+function wakeRelay() {const callbacks=[...relayWakeups];relayWakeups.clear();for(const resolve of callbacks)resolve();}
+function waitForRelayChange() {return new Promise(resolve=>relayWakeups.add(resolve));}
+function stopHeartbeat() {
+  heartbeatEnabled=false;heartbeatEpoch++;heartbeatActive=false;capacityFreshUntil=0;
+  heartbeatController?.abort();capacityProbe?.reject(new Error("Readiness stopped"));wakeRelay();
+}
+function temporaryConfigUnavailable(error) {
+  const d=error.diagnostic;
+  return error.phase==="readiness-config" && d?.http_status===503 && d.redirected===false && d.request_route==="api/config" && d.final_route==="api/config" && d.final_origin_category==="same_origin" && d.final_path_category==="relay_api";
+}
+async function capacityProbeRequest(id) {
+  try {await sendCapacity(id);}
+  catch(error) {
+    if(temporaryConfigUnavailable(error)) {
+      post(peerWindow,config.peer_origin,{type:"capacity_unavailable",id,boot_id:config.boot_id,reason:"temporary_config_503"});
+      log("Readiness temporarily unavailable; authenticated artifact delivery continues");
+    } else {
+      post(peerWindow,config.peer_origin,{type:"capacity_invalid",id,boot_id:config.boot_id});
+      paired=false;wakeRelay();peerError(error.message);
+    }
+  }
+}
+async function heartbeat() {
+  if(config.role!=="cpu" || heartbeatActive || !heartbeatEnabled)return;
+  heartbeatActive=true;
+  const epoch=++heartbeatEpoch;
+  heartbeatController?.abort();capacityProbe?.reject(new Error("Readiness probe superseded"));
+  const controller=new AbortController();heartbeatController=controller;
+  let failures=0;
+  while(paired && heartbeatEnabled && epoch===heartbeatEpoch && !peerWindow.closed && performance.now()<relayDeadline) {
+    let probe,retryDelay=0;
+    try {
+      const pulse=await phaseApi("readiness-pulse","api/pulse",{},10000,controller.signal);
+      if(epoch!==heartbeatEpoch || !paired)break;
+      if(!idOK(pulse.challenge_id) || !Number.isFinite(pulse.ttl_ms) || pulse.ttl_ms<=0 || pulse.ttl_ms>15000)throw new Error("Invalid readiness challenge");
+      const completion=new Promise((resolve,reject)=>{
+        probe={id:pulse.challenge_id,started:performance.now(),resolve,reject,responding:false,epoch};
+        probe.timer=setTimeout(()=>reject(Object.assign(new Error("Paired readiness roundtrip expired"),{temporaryReadiness:true})),pulse.ttl_ms);
+        capacityProbe=probe;
+        post(peerWindow,config.peer_origin,{type:"capacity_probe",id:probe.id});
+      });
+      await completion;
+      if(failures)status(running?"Relay running; capacity "+capacity():"GPU connected; capacity "+capacity());
+      failures=0;
+    } catch(error) {
+      if(epoch!==heartbeatEpoch)break;
+      capacityFreshUntil=0;wakeRelay();log("Readiness unavailable: "+error.message);
+      if(error.temporaryReadiness!==true) {paired=false;peerError(error.message);break;}
+      failures=Math.min(failures+1,4);status("Readiness paused; waiting for fresh policy proof");
+      retryDelay=Math.min(5000,1000*2**(failures-1),Math.max(0,relayDeadline-performance.now()));
+    } finally {
+      if(probe)clearTimeout(probe.timer);
+      if(capacityProbe===probe)capacityProbe=null;
+    }
+    if(retryDelay)await new Promise(resolve=>setTimeout(resolve,retryDelay));
+  }
+  if(epoch===heartbeatEpoch) {
+    heartbeatActive=false;capacityFreshUntil=0;wakeRelay();
+    if(performance.now()>=relayDeadline) {paired=false;peerError("Relay lifetime expired; no new admission");}
+  }
+}
+async function sendCapacity(id) {
+  if(deliveryRecoveryRequired)throw new Error("Delivery cleanup requires reconciliation; no new admission");
+  const started=performance.now(),fresh=await phaseApi("readiness-config","api/config",undefined,5000);
+  if(!paired || fresh.boot_id!==config.boot_id || fresh.model!==config.model || fresh.max_inflight!==config.max_inflight || generationSeconds(fresh.generation_seconds)!==generationSeconds(config.generation_seconds))throw new Error("GPU relay configuration changed; re-pair required");
+  const proof=modelCapacityProof(fresh);
+  if(JSON.stringify(modelCapacityIdentity(fresh))!==JSON.stringify(modelCapacityIdentity(config)))throw new Error("GPU model process changed; requalification required");
+  post(peerWindow,config.peer_origin,{type:"capacity",id,protocol:2,serving_profile:fresh.serving_profile||"vllm-v1",boot_id:fresh.boot_id,model:fresh.model,max_inflight:fresh.max_inflight,generation_seconds:generationSeconds(fresh.generation_seconds),uncertain:fresh.uncertain,lifetime_remaining_ms:Math.max(0,fresh.lifetime_remaining_ms-(performance.now()-started)),...proof});
+}
+async function recordCapacity(data,probe) {
+  if(!heartbeatEnabled || !paired || capacityProbe!==probe || probe.epoch!==heartbeatEpoch || performance.now()>=relayDeadline)throw new Error("Readiness probe superseded");
+  const remaining=data.lifetime_remaining_ms-(performance.now()-probe.started);
+  if(data.protocol!==2 || (data.serving_profile||"vllm-v1")!==(config.serving_profile||"vllm-v1") || data.boot_id!==peerBootId || data.model!==config.model || data.max_inflight!==peerCapacity || generationSeconds(data.generation_seconds)!==peerGenerationSeconds || !Number.isInteger(data.uncertain) || data.uncertain<0 || data.uncertain>data.max_inflight || !Number.isFinite(remaining) || remaining<=0)throw new Error("Paired GPU capacity no longer matches");
+  await phaseApi("readiness-receipt","api/pair",{protocol:2,serving_profile:data.serving_profile||"vllm-v1",boot_id:data.boot_id,model:data.model,max_inflight:data.max_inflight,generation_seconds:peerGenerationSeconds,uncertain:data.uncertain,lifetime_remaining_ms:remaining,challenge_id:probe.id,...modelCapacityProof(data)},5000,heartbeatController?.signal);
+  if(paired && capacityProbe===probe && probe.epoch===heartbeatEpoch) {capacityFreshUntil=data.uncertain ? 0 : probe.started+15000;wakeRelay();}
+}
+function connected() {
+  if(deliveryRecoveryRequired) {peerError("Delivery cleanup requires reconciliation; no new admission");return;}
+  const wasPaired=paired;
+  paired=true;status((config.role === "cpu" ? "GPU connected" : "CPU connected")+"; capacity "+capacity());
+  void artifactPump();
+  if(config.role === "cpu") {document.querySelector("#echo").disabled=claimRecoveryRequired;document.querySelector("#start").disabled=claimRecoveryRequired;if(!wasPaired)void heartbeat();}
+}
+function peerError(text) { status(text); log(text); }
+function cancelCpuRequest(id,reason) {
+  const item=pending.get(id);
+  if(item) {pending.delete(id);clearTimeout(item.timer);item.reject(new Error(reason));}
+  const task=cpuTasks.get(id);
+  if(task) {
+    task.cancelled=true;post(peerWindow,config.peer_origin,{type:"cancel",id});
+    void api("api/cancel",{id},10000).catch(()=>log("Cancellation commit uncertain for "+id+"; no replay"));
+  }
+}
+async function processJob(job,remainingMs) {
+  if (!paired || cpuTasks.size>=capacity() || !idOK(job?.id) || cpuTasks.has(job.id) || !["echo","generate"].includes(job.operation)) throw new Error("Cannot dispatch job");
+  const started=performance.now(),task={cancelled:false};cpuTasks.set(job.id,task);
+  document.querySelector("#cancel").disabled=false;
+  void telemetry(job.id,"browser_dispatch",0);
+  try {
+    if(!Number.isFinite(remainingMs) || remainingMs<=0) throw new Error("CPU request deadline expired before dispatch");
+    const response = await new Promise((resolve,reject)=>{
+      const milliseconds=Math.min(job.operation==="generate"?generationBudgetMs():120000,remainingMs);
+      const timer=setTimeout(()=>cancelCpuRequest(job.id,"Relay deadline expired; no replay"),milliseconds);
+      pending.set(job.id,{id:job.id,resolve,reject,timer,chunks:[],chunkTimes:[],started});
+      post(peerWindow,config.peer_origin,{type:"request",job,timeout_ms:milliseconds});
+    });
+    if(task.cancelled) throw new Error("Request cancelled before result commit");
+    await api("api/result",{id:job.id,ok:true,response});
+    task.terminalCommitted=true;task.creditDeadline=performance.now()+10000;
+    post(peerWindow,config.peer_origin,{type:"complete_ack",id:job.id});
+    void telemetry(job.id,"browser_complete",performance.now()-started);
+    log(job.operation+" "+job.id+" committed in "+Math.round(performance.now()-started)+" ms");
+  } catch (error) {
+    running=false;
+    post(peerWindow,config.peer_origin,{type:"cancel",id:job.id});
+    let committed=false;
+    const negative={id:job.id,ok:false,error:String(error.message).slice(0,1000)};
+    if(safeMessage(error.generation_failure))negative.generation_failure=error.generation_failure;
+    try { await api("api/result",negative);committed=true; }
+    catch {try {await api("api/cancel",{id:job.id});committed=true;} catch {paired=false;log("Result commit uncertain. Do not replay the claimed job.");}}
+    if(committed) {task.terminalCommitted=true;task.creditDeadline=performance.now()+10000;post(peerWindow,config.peer_origin,{type:"complete_ack",id:job.id});}
+    void telemetry(job.id,"browser_error",performance.now()-started);
+    peerError(error.message);
+    throw error;
+  } finally {
+    const item=pending.get(job.id);if(item){clearTimeout(item.timer);pending.delete(job.id);}
+    let release=true;
+    if(task.terminalCommitted && !task.creditReleased) {
+      try {
+        await new Promise((resolve,reject)=>{
+          task.creditResolve=resolve;task.creditReject=reject;
+          task.creditTimer=setTimeout(()=>reject(new Error("GPU cleanup credit unavailable; committed CPU result retained")),Math.max(1,task.creditDeadline-performance.now()));
+          if(task.cleanupBlocked)reject(new Error("GPU cleanup acknowledgment uncertain; committed CPU result retained"));
+        });
+      } catch(error) {
+        release=false;task.cleanupBlocked=true;deliveryRecoveryRequired=true;running=false;paired=false;capacityFreshUntil=0;requireClaimReconciliation();peerError(error.message);
+      } finally {clearTimeout(task.creditTimer);task.creditResolve=null;task.creditReject=null;}
+    }
+    if(release && cpuTasks.get(job.id)===task) cpuTasks.delete(job.id);
+    wakeRelay();
+    document.querySelector("#cancel").disabled=cpuTasks.size===0;
+    if(!running) status(cpuTasks.size ? "Draining "+cpuTasks.size+" requests" : "Relay stopped");
+  }
+}
+function requireClaimReconciliation() {
+  claimRecoveryRequired=true;document.querySelector("#start").disabled=true;document.querySelector("#echo").disabled=true;
+}
+async function claimJob(options={wait_ms:5000}) {
+  if(claimRecoveryRequired)throw new Error("Claim reconciliation required; no replay");
+  const claimId=crypto.randomUUID().replaceAll("-",""),bootId=config.boot_id;
+  let requested=performance.now(),value;
+  try {
+    try {
+      value=await api("api/claim",{...options,claim_id:claimId,boot_id:bootId},15000);
+    } catch(error) {
+      log("Claim response unavailable; checking its receipt without replay");
+      requested=performance.now();
+      value=await api("api/claim-receipt?claim_id="+claimId+"&boot_id="+bootId+"&wait_ms=5000",undefined,10000);
+      if(value.claim_id!==claimId || value.boot_id!==bootId || value.pending!==false)throw new Error("Claim receipt unknown or pending; reconcile without replay");
+      log("Claim response recovered from original receipt"+(value.job?" for "+value.job.id:" (empty)"));
+    }
+    if(value.claim_id!==claimId || value.boot_id!==bootId || config.boot_id!==bootId || value.pending!==false || (value.job!==null && (!safeMessage(value.job) || !idOK(value.job.id) || (options.id && value.job.id!==options.id))) || !Number.isFinite(value.remaining_ms) || value.remaining_ms<0)throw new Error("Invalid claim receipt; reconcile without replay");
+    const serverWait=Number.isFinite(value.server_wait_ms)?Math.max(0,Math.min(5000,value.server_wait_ms)):0;
+    return {...value,remaining_ms:value.remaining_ms-Math.max(0,performance.now()-requested-serverWait)};
+  } catch(error) {
+    requireClaimReconciliation();
+    throw new Error("Claim recovery failed; reconcile without replay: "+error.message);
+  }
+}
+async function relayLoop(epoch) {
+  while(running && epoch===loopEpoch) {
+    try {
+      if(!paired || peerWindow.closed) throw new Error("Peer closed; no replay");
+      if(performance.now()>=capacityFreshUntil || cpuTasks.size>=capacity()) {await waitForRelayChange();continue;}
+      const value=await claimJob();
+      if(value.job) {
+        if(!running || epoch!==loopEpoch || !paired || performance.now()>=capacityFreshUntil) {
+          try {const receipt=await api("api/cancel",{id:value.job.id});if(receipt.cancelled!==true)throw new Error("Claim cancellation not acknowledged");}
+          catch(error) {requireClaimReconciliation();throw error;}
+          continue;
+        }
+        void processJob(value.job,value.remaining_ms).catch(()=>{});
+      }
+    }
+    catch(error) {if(epoch===loopEpoch){running=false;peerError(error.message);}else log("Stopped claim loop: "+error.message);}
+  }
+  if(epoch===loopEpoch)status(cpuTasks.size ? "Draining "+cpuTasks.size+" requests" : "Relay stopped");
+}
+function finishGpuBrowser(id,item) {
+  if(gpuTasks.get(id)!==item) return;
+  clearTimeout(item.timer);gpuTasks.delete(id);
+  post(peerWindow,config.peer_origin,{type:"credit_released",id});
+}
+function acknowledgeCompletion(id) {
+  const item=gpuTasks.get(id);if(!item)return;
+  item.acknowledged=true;if(item.sent)void finishCommittedCompletion(id,item);
+}
+function finishCommittedCompletion(id,item) {
+  if(gpuTasks.get(id)!==item || !item.acknowledged || !item.sent)return;
+  if(!item.completion) {finishGpuBrowser(id,item);return;}
+  if(item.cleanupPromise)return item.cleanupPromise;
+  clearTimeout(item.timer);
+  item.cleanupPromise=(async()=>{
+    let lastError;
+    for(let attempt=1;attempt<=3;attempt++) {
+      const remaining=item.deliveryDeadline-performance.now();
+      if(remaining<=0) {lastError=new Error("completion-delivery-ack: cleanup deadline expired");break;}
+      if(gpuTasks.get(id)!==item || config.boot_id!==item.bootId) {lastError=new Error("completion-delivery-ack: browser ownership changed");break;}
+      try {
+        const receipt=await phaseApi("completion-delivery-ack","api/complete-ack",{id},Math.min(3000,remaining));
+        if(receipt.acknowledged!==true)throw Object.assign(new Error("completion-delivery-ack: invalid cleanup receipt"),{noRetry:true});
+        if(performance.now()>item.deliveryDeadline)throw Object.assign(new Error("completion-delivery-ack: late cleanup receipt"),{noRetry:true});
+        finishGpuBrowser(id,item);return;
+      } catch(error) {
+        lastError=error;
+        const code=error.status??error.diagnostic?.http_status;
+        const retryable=!error.noRetry && (code===undefined || code>=500 || [408,429].includes(code));
+        if(!retryable || attempt===3)break;
+        log("Cleanup acknowledgment unavailable for "+id+"; retrying only its idempotent acknowledgment ("+attempt+"/3)");
+        await new Promise(resolve=>setTimeout(resolve,Math.min(150,Math.max(0,item.deliveryDeadline-performance.now()))));
+      }
+    }
+    item.cleanupFailed=true;deliveryRecoveryRequired=true;paired=false;
+    const reason="CPU result retained; GPU cleanup acknowledgment uncertain for "+id+": "+lastError.message;
+    peerError(reason);
+    post(peerWindow,config.peer_origin,{type:"delivery_cleanup_blocked",id});
+  })();
+  return item.cleanupPromise;
+}
+async function cancelGpuRequest(id) {
+  const item=gpuTasks.get(id);if(item)item.controller.abort();
+  await api("api/cancel",{id},10000);
+}
+async function phaseApi(phase,path,body,timeout,signal) {
+  try {return await api(path,body,timeout,signal);}
+  catch(cause) {const error=new Error(phase+": "+cause.message);error.phase=phase;error.status=cause.status;if(cause.diagnostic)error.diagnostic=cause.diagnostic;throw error;}
+}
+function settleCompletion(id,error,value) {
+  const waiter=completionWaiters.get(id);if(!waiter)return;
+  completionWaiters.delete(id);waiter.item.controller.signal.removeEventListener("abort",waiter.abort);
+  if(error)waiter.reject(error);else waiter.resolve(value);
+}
+async function completionPump() {
+  if(completionPumpActive)return;
+  completionPumpActive=true;
+  let failures=0;
+  try {
+    while(completionWaiters.size) {
+      for(const [id,waiter] of completionWaiters)if(waiter.item.controller.signal.aborted || waiter.item.deadline<=performance.now())settleCompletion(id,new Error("completion-poll: original request cancelled or deadline expired; no replay"));
+      if(!completionWaiters.size)break;
+      const ids=[...completionWaiters.keys()],remaining=Math.min(...ids.map(id=>completionWaiters.get(id).item.deadline-performance.now()));
+      const wait=Math.min(1000,Math.max(0,Math.floor(remaining)));
+      let packet;
+      try {
+        packet=await phaseApi("completion-poll","api/completions?ids="+ids.join(",")+"&boot_id="+config.boot_id+"&wait_ms="+wait,undefined,Math.min(5000,Math.max(1,remaining)));
+      } catch(error) {
+        failures++;
+        const retryable=error.status===undefined || error.status>=500 || [408,429].includes(error.status);
+        if(retryable && failures<=3) {
+          log("Completion read unavailable; retrying read-only lookup ("+failures+"/3)");
+          const delay=Math.min(150,...ids.filter(id=>completionWaiters.has(id)).map(id=>Math.max(0,completionWaiters.get(id).item.deadline-performance.now())));
+          await new Promise(resolve=>setTimeout(resolve,delay));continue;
+        }
+        for(const id of ids)settleCompletion(id,error);
+        failures=0;continue;
+      }
+      failures=0;
+      if(!safeMessage(packet) || packet.boot_id!==config.boot_id || !Array.isArray(packet.polled_ids) || packet.polled_ids.length!==ids.length || packet.polled_ids.some((id,index)=>id!==ids[index]) || (packet.result!==null && (!safeMessage(packet.result) || !ids.includes(packet.result.id) || packet.result.pending!==false))) {
+        for(const id of ids)settleCompletion(id,new Error("completion-poll: invalid batch identity; no replay"));
+        continue;
+      }
+      if(packet.result!==null)settleCompletion(packet.result.id,null,packet.result);
+    }
+  } finally {
+    completionPumpActive=false;
+    if(completionWaiters.size)void completionPump();
+  }
+}
+function waitCompletion(job,item) {
+  if(completionWaiters.has(job.id))throw new Error("completion-poll: duplicate waiter; no replay");
+  if(item.controller.signal.aborted || item.deadline<=performance.now())throw new Error("completion-poll: original request cancelled or deadline expired; no replay");
+  return new Promise((resolve,reject)=>{
+    const waiter={item,resolve,reject,abort:()=>settleCompletion(job.id,new Error("completion-poll: request cancelled; no replay"))};
+    completionWaiters.set(job.id,waiter);item.controller.signal.addEventListener("abort",waiter.abort,{once:true});
+    void completionPump();
+  });
+}
+async function generateViaPoll(job,item) {
+  const budget=item.deadline-performance.now();
+  if(budget<=0)throw new Error("GPU browser deadline expired before admission");
+  const admission=await phaseApi("generation-admission","api/submit",{id:job.id,payload:job.payload,timeout_ms:budget},Math.min(10000,budget),item.controller.signal);
+  if(admission.id!==job.id || admission.admitted!==true)throw new Error("Invalid generation admission; no replay");
+    const result=await waitCompletion(job,item);
+    if(typeof result.ok!=="boolean" || (result.ok && (!safeMessage(result.response) || !Array.isArray(result.response.choices))) || (!result.ok && typeof result.error!=="string"))throw new Error("Invalid generation completion; no replay");
+    // Retain the completion until the CPU confirms its durable terminal commit.
+    item.completion=result;
+    if(!result.ok) {
+      const error=new Error(result.error.slice(0,1000));
+      if(safeMessage(result.generation_failure))error.generation_failure=result.generation_failure;
+      throw error;
+    }
+    return result.response;
+}
+async function gpuRequest(job,timeoutMs) {
+  if (deliveryRecoveryRequired || !paired || gpuTasks.size>=capacity() || seen.has(job.id)) throw new Error("Request already seen, delivery reconciliation required or GPU relay capacity occupied; no replay");
+  if (!idOK(job.id) || !["echo","generate"].includes(job.operation) || !Number.isFinite(job.deadline_unix) || !Number.isFinite(timeoutMs) || timeoutMs<=0 || timeoutMs>(job.operation==="generate"?generationBudgetMs():120000)) throw new Error("Invalid request or time budget");
+  if(seen.size>=10000) throw new Error("Relay session request limit reached");
+  const item={controller:new AbortController(),acknowledged:false,sent:false,deadline:performance.now()+timeoutMs,bootId:config.boot_id};
+  seen.add(job.id);gpuTasks.set(job.id,item);
+  item.timer=setTimeout(()=>{void cancelGpuRequest(job.id).catch(()=>{});},timeoutMs);
+  const started=performance.now();
+  let message;
+  try {
+    void telemetry(job.id,"browser_dispatch",0);
+    if(job.operation === "generate") {
+      const budget=item.deadline-performance.now();
+      if(budget<=0)throw new Error("GPU browser deadline expired before dispatch");
+      message={type:"result",id:job.id,response:await generateViaPoll(job,item)};
+    } else {
+      const response=await fetch(new URL("api/echo",base),{method:"POST",credentials:"same-origin",cache:"no-store",headers:{"X-Relay-Token":token,"X-Relay-Origin":location.origin,"Content-Type":"application/json"},body:JSON.stringify({id:job.id}),signal:AbortSignal.any([item.controller.signal,AbortSignal.timeout(20000)])});
+      if(!response.ok || !response.body) {
+        const errorBody=await response.text().catch(()=>"");
+        throw responseError("Echo stream unavailable",response,"api/echo",errorBody,true);
+      }
+      const reader=response.body.getReader(),decoder=new TextDecoder(); let buffer="",count=0;
+      while(true) {
+        const {done,value}=await reader.read(); if(done) break;
+        buffer+=decoder.decode(value,{stream:true}); if(buffer.length>4096) throw new Error("Oversized echo stream");
+        let end;
+        while((end=buffer.indexOf("\n"))>=0) {
+          const chunk=JSON.parse(buffer.slice(0,end));buffer=buffer.slice(end+1);
+          if(chunk.id!==job.id || chunk.sequence!==count || chunk.echo!=="relay-qualification" || count>=3) throw new Error("Invalid echo chunk");
+          await new Promise((resolve,reject)=>{
+            const key=job.id+":"+count,timer=setTimeout(()=>{acknowledgements.delete(key);reject(new Error("Chunk acknowledgment timed out"));},10000);
+            acknowledgements.set(key,()=>{clearTimeout(timer);resolve();});
+            post(peerWindow,config.peer_origin,{type:"chunk",id:job.id,sequence:count});
+          }); count++;
+        }
+      }
+      if(count!==3 || buffer) throw new Error("Incomplete echo stream");
+      message={type:"result",id:job.id,response:{qualification:"echo-stream",chunks:count,gpu_browser_duration_ms:Math.round(performance.now()-started)}};
+    }
+  } catch(error) {
+    message={type:"error",id:job.id,error:String(error.message).slice(0,1000)};
+    if(safeMessage(error.generation_failure))message.generation_failure=error.generation_failure;
+    void cancelGpuRequest(job.id).catch(()=>{});
+  }
+  clearTimeout(item.timer);item.sent=true;
+  item.deliveryDeadline=performance.now()+10000;
+  item.timer=setTimeout(()=>{deliveryRecoveryRequired=true;paired=false;peerError("Completion acknowledgment missing; reconcile claimed jobs before pairing");},10000);
+  post(peerWindow,config.peer_origin,message);
+  if(item.acknowledged)void finishCommittedCompletion(job.id,item);
+  void telemetry(job.id,message.type==="result"?"browser_complete":"browser_error",performance.now()-started);
+}
+function receiveMessage(event) {
+  const data=event.data;
+  if(!config || !safeMessage(data)) return;
+  if(event.origin!==config.peer_origin || event.source!==peerWindow || data.nonce!==nonce) return;
+  if(data.type==="artifact_request" && paired) {void artifactReceive(data);return;}
+  if(data.type==="artifact_receipt") {
+    const waiter=artifactWaiters.get(data.rpc_id);
+    if(!waiter || data.boot_id!==waiter.peerBootId || data.boot_id!==peerBootId)return;
+    artifactWaiters.delete(data.rpc_id);clearTimeout(waiter.timer);
+    if(data.ok===true && safeMessage(data.receipt))waiter.resolve(data.receipt);
+    else waiter.reject(new Error("Peer rejected artifact delivery"));
+    return;
+  }
+  if(data.type==="ready") {
+    if(deliveryRecoveryRequired) {peerError("Delivery cleanup requires reconciliation; no new admission");return;}
+    let generation;try {generation=generationSeconds(data.generation_seconds);}catch(error){peerError(error.message);return;}
+    if(data.protocol!==2 || data.artifact_transport!==config.artifact_transport || (data.serving_profile||"vllm-v1")!==(config.serving_profile||"vllm-v1") || data.delivery_transport!=="cpu-commit-ack-v1" || !capacityOK(data.max_inflight) || data.model!==config.model || !idOK(data.boot_id) || (paired && (data.boot_id!==peerBootId || data.max_inflight!==peerCapacity || generation!==peerGenerationSeconds))) {peerError("Peer protocol, model, capacity or delivery contract mismatch");return;}
+    peerCapacity=data.max_inflight;peerBootId=data.boot_id;peerGenerationSeconds=generation;const wasPaired=paired;connected();if(!wasPaired)sendReady();return;
+  }
+  if(config.role === "cpu") {
+    if(data.type==="capacity_invalid" && capacityProbe && data.id===capacityProbe.id && data.boot_id===peerBootId) {
+      capacityProbe.reject(new Error("GPU policy or process proof is invalid"));return;
+    }
+    if(data.type==="capacity_unavailable" && capacityProbe && !capacityProbe.responding && data.id===capacityProbe.id && data.boot_id===peerBootId && data.reason==="temporary_config_503") {
+      capacityProbe.responding=true;
+      capacityProbe.reject(Object.assign(new Error("GPU policy proof temporarily unavailable"),{temporaryReadiness:true}));return;
+    }
+    if(data.type==="delivery_cleanup_blocked" && idOK(data.id)) {
+      const task=cpuTasks.get(data.id);if(!task || !task.terminalCommitted)return;
+      task.cleanupBlocked=true;task.creditReject?.(new Error("GPU cleanup acknowledgment uncertain; committed CPU result retained"));
+      deliveryRecoveryRequired=true;running=false;loopEpoch++;paired=false;capacityFreshUntil=0;requireClaimReconciliation();wakeRelay();
+      peerError("GPU cleanup acknowledgment requires reconciliation for "+data.id+"; committed CPU results retained");return;
+    }
+    if(data.type==="credit_released" && idOK(data.id)) {
+      const task=cpuTasks.get(data.id);if(!task || !task.terminalCommitted || task.cleanupBlocked || performance.now()>task.creditDeadline)return;
+      task.creditReleased=true;task.creditResolve?.();return;
+    }
+    if(data.type==="capacity" && capacityProbe && data.id===capacityProbe.id && !capacityProbe.responding) {
+      const probe=capacityProbe;probe.responding=true;
+      void recordCapacity(data,probe).then(probe.resolve,probe.reject);return;
+    }
+    const item=pending.get(data.id);if(!item)return;
+    if(data.type==="chunk" && Number.isInteger(data.sequence) && data.sequence===item.chunks.length && data.sequence<3) {
+      item.chunks.push(data.sequence);item.chunkTimes.push(Math.round(performance.now()-item.started));
+      post(peerWindow,config.peer_origin,{type:"ack",id:data.id,sequence:data.sequence});
+      telemetry(data.id,"echo_chunk",performance.now()-item.started);return;
+    }
+    if(data.type==="result" && safeMessage(data.response)) {
+      pending.delete(data.id);clearTimeout(item.timer);
+      if(data.response.qualification==="echo-stream") {
+        if(item.chunks.length!==3 || data.response.chunks!==3) {item.reject(new Error("Missing echo acknowledgments"));return;}
+        data.response.cpu_browser_chunk_arrival_ms=item.chunkTimes;
+        data.response.cpu_browser_duration_ms=Math.round(performance.now()-item.started);
+      }
+      item.resolve(data.response);
+    } else if(data.type==="error" && typeof data.error==="string") {
+      pending.delete(data.id);clearTimeout(item.timer);
+      const error=new Error(data.error.slice(0,1000));
+      if(safeMessage(data.generation_failure))error.generation_failure=data.generation_failure;
+      item.reject(error);
+    }
+  } else {
+    if(data.type==="capacity_probe" && idOK(data.id) && paired) {void capacityProbeRequest(data.id);return;}
+    if(data.type==="complete_ack" && idOK(data.id)) {acknowledgeCompletion(data.id);return;}
+    if(data.type==="cancel" && idOK(data.id)) {void cancelGpuRequest(data.id).catch(error=>peerError(error.message));return;}
+    if(data.type==="ack" && idOK(data.id) && Number.isInteger(data.sequence)) {const key=data.id+":"+data.sequence,ack=acknowledgements.get(key);if(ack){acknowledgements.delete(key);ack();}return;}
+    if(data.type==="request" && safeMessage(data.job) && idOK(data.job.id)) {
+      if(gpuTasks.has(data.job.id) || seen.has(data.job.id))return;
+      gpuRequest(data.job,data.timeout_ms).catch(error=>post(peerWindow,config.peer_origin,{type:"error",id:data.job.id,error:String(error.message).slice(0,1000)}));
+    }
+  }
+}
+addEventListener("message",receiveMessage);
+addEventListener("visibilitychange",()=>{if(config?.role==="cpu" && paired && heartbeatEnabled && document.visibilityState==="visible")void heartbeat();},true);
+addEventListener("resume",()=>{if(config?.role==="cpu" && paired && heartbeatEnabled){capacityFreshUntil=0;wakeRelay();void heartbeat();}},true);
+document.querySelector("#connect").onclick=()=>{
+  try {
+    if(cpuTasks.size || running || gpuTasks.size) throw new Error("Drain the relay before pairing");
+    const input=document.querySelector("#peer"),url=new URL(input.value);
+    if(url.origin!==config.peer_origin || !["https:","http:"].includes(url.protocol) || url.username || url.password) throw new Error("Peer origin does not match configuration");
+    const peerToken=new URLSearchParams(url.hash.slice(1)).get("token");
+    if(!/^[a-f0-9]{64}$/.test(peerToken || "")) throw new Error("Peer launch token missing");
+    nonce=Array.from(crypto.getRandomValues(new Uint8Array(32)),x=>x.toString(16).padStart(2,"0")).join("");
+    url.hash=new URLSearchParams({token:peerToken,nonce,parentOrigin:location.origin}).toString();
+    document.querySelector("#echo").disabled=true;document.querySelector("#start").disabled=true;
+    paired=false;stopHeartbeat();heartbeatEnabled=true;peerWindow=window.open(url.toString(),"relay-"+nonce);input.value="";
+    if(!peerWindow) throw new Error("Companion popup blocked");
+    status(config.role === "cpu" ? "Waiting for GPU companion" : "Waiting for CPU companion");
+  } catch(error) {peerError(error.message);}
+};
+document.querySelector("#echo").onclick=async()=>{try {if(cpuTasks.size || running || claimRecoveryRequired) throw new Error("Stop relay and reconcile claims before qualification");const q=await api("api/qualify",{}),v=await claimJob({id:q.id});await processJob(v.job,v.remaining_ms);status("Echo stream qualification passed");}catch(error){peerError(error.message);}};
+document.querySelector("#start").onclick=()=>{if(!running && !cpuTasks.size && paired && !claimRecoveryRequired){heartbeatEnabled=true;running=true;document.querySelector("#stop").disabled=false;status("Relay running; capacity "+capacity());if(performance.now()>=capacityFreshUntil)void heartbeat();void relayLoop(++loopEpoch);}};
+document.querySelector("#stop").onclick=()=>{running=false;loopEpoch++;stopHeartbeat();status(cpuTasks.size ? "Draining "+cpuTasks.size+" requests" : "Relay stopped");};
+document.querySelector("#cancel").onclick=()=>{running=false;loopEpoch++;stopHeartbeat();for(const id of cpuTasks.keys())cancelCpuRequest(id,"Cancelled by operator; no replay");};
+(async()=>{
+  if(!/^[a-f0-9]{64}$/.test(token || "")) throw new Error("Open the private launch URL");
+  config=await api("api/config");
+  if(!["cpu","gpu"].includes(config.role) || config.protocol!==2 || !capacityOK(config.max_inflight) || !idOK(config.boot_id) || !Number.isFinite(config.lifetime_remaining_ms) || config.lifetime_remaining_ms<=0) throw new Error("Invalid relay role, protocol or capacity");
+  relayDeadline=performance.now()+config.lifetime_remaining_ms;
+  generationSeconds(config.generation_seconds);
+  modelCapacityProof(config);
+  if(config.role==="gpu" && config.generation_transport!=="submit-poll-v1")throw new Error("GPU relay requires matching submit-poll update");
+  if(config.role==="gpu" && config.completion_transport!=="shared-poll-v1")throw new Error("GPU relay requires matching shared-poll update");
+  if(config.role==="cpu" && config.readiness_transport!=="server-challenge-v1")throw new Error("CPU relay requires matching server-challenge update");
+  if(config.role==="cpu" && config.claim_transport!=="receipt-v1")throw new Error("CPU relay requires matching claim-receipt update");
+  if(config.role==="cpu") document.querySelector("#execution-controls").classList.remove("hidden");
+  if(pairNonce || parentOrigin) {
+    if(!nonceOK(pairNonce) || !opener || parentOrigin!==config.peer_origin) throw new Error("Companion requires its paired opener");
+    peerWindow = opener; nonce = pairNonce;
+    sendReady();
+  } else {
+    const peerName=config.role === "cpu" ? "GPU" : "CPU";
+    document.querySelector("#pair-controls").classList.remove("hidden");
+    document.querySelector("#peer-label").textContent=peerName+" private launch URL";
+    document.querySelector("#connect").textContent="Connect "+peerName;
+    status(config.role === "cpu" ? "CPU ready" : "GPU ready");
+  }
+})().catch(error=>peerError(error.message));
+</script></body></html>

@@ -72,6 +72,17 @@ def _chat_template(directory: Path, config: dict) -> str | None:
     return template
 
 
+def _json_copy(value, name):
+    try:
+        copied = json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+        if copied != value:
+            raise ValueError("only JSON values with string object keys are supported")
+        return copied
+    except (TypeError, ValueError, OverflowError, RecursionError) as error:
+        raise ValueError(f"{name} must contain finite JSON values: {error}") from error
+
+
+
 class ModelTokenizer:
     def __init__(self, model_dir):
         directory = Path(model_dir)
@@ -86,9 +97,17 @@ class ModelTokenizer:
         text_config = _text_config(config)
         tokenizer_config = _read_json(directory, "tokenizer_config.json")
         self._template_source = _chat_template(directory, tokenizer_config)
+        tokenizer_kwargs = {}
+        if tokenizer_config.get("tokenizer_class") in {"LlamaTokenizer", "LlamaTokenizerFast"}:
+            for name in ("add_bos_token", "add_eos_token"):
+                if name in tokenizer_config:
+                    if type(tokenizer_config[name]) is not bool:
+                        raise ValueError(f"{name} must be a boolean")
+                    tokenizer_kwargs[name] = tokenizer_config[name]
         try:
             self._tokenizer = AutoTokenizer.from_pretrained(
                 str(directory.resolve()), local_files_only=True, trust_remote_code=False, use_fast=True,
+                **tokenizer_kwargs,
             )
         except Exception as error:
             raise ValueError(f"cannot load local tokenizer at {directory}: {error}") from error
@@ -151,15 +170,124 @@ class ModelTokenizer:
                 raise ValueError("message content must be nonempty text; multimodal content is unsupported")
         if messages[-1]["role"] != "user":
             raise ValueError("messages must end with a user message for generation")
+        return self._encode_template(messages)
+
+    def encode_conversation(self, messages: list[dict], *, tools: list[dict] | None = None,
+                            chat_template_kwargs: dict | None = None) -> list[int]:
+        """Tokenize text/function-tool history with the checkpoint's own template.
+
+        Tool argument strings are preserved exactly. Generated action token IDs
+        must be retained separately for training rather than recovered from this
+        conversation. Template options currently support ``enable_thinking``.
+        """
+        if self._template_source is None:
+            raise ValueError("conversations require a checkpoint chat template")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("messages must be a nonempty list")
+        options = {} if chat_template_kwargs is None else chat_template_kwargs
+        if not isinstance(options, dict) or set(options) - {"enable_thinking"}:
+            raise ValueError("chat_template_kwargs support only enable_thinking")
+        if "enable_thinking" in options and type(options["enable_thinking"]) is not bool:
+            raise ValueError("enable_thinking must be a boolean")
+        messages = _json_copy(messages, "messages")
+        tools = _json_copy(tools, "tools")
+        tool_names = set()
+        if tools is not None:
+            if not isinstance(tools, list):
+                raise ValueError("tools must be a list of function definitions")
+            for tool in tools:
+                if not isinstance(tool, dict) or set(tool) != {"type", "function"} or tool["type"] != "function":
+                    raise ValueError("tools support only function definitions")
+                function = tool["function"]
+                if not isinstance(function, dict) or set(function) - {"name", "description", "parameters", "strict"}:
+                    raise ValueError("unsupported function definition fields")
+                name = function.get("name")
+                if not isinstance(name, str) or not name.strip() or name in tool_names:
+                    raise ValueError("function names must be nonempty and unique")
+                if ("description" in function and not isinstance(function["description"], str)
+                        or "parameters" in function and not isinstance(function["parameters"], dict)
+                        or "strict" in function and type(function["strict"]) is not bool):
+                    raise ValueError("function description, parameters, or strict has an invalid type")
+                tool_names.add(name)
+        pending = set()
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                raise ValueError("messages must contain objects")
+            role = message.get("role")
+            if not isinstance(role, str):
+                raise ValueError("message role must be text")
+            allowed = {"role", "content"}
+            if role == "assistant":
+                allowed.update({"tool_calls", "reasoning_content"})
+            elif role == "tool":
+                allowed.add("tool_call_id")
+            elif role not in {"system", "user"}:
+                raise ValueError("message role must be system, user, assistant, or tool")
+            if set(message) - allowed:
+                raise ValueError(f"unsupported {role} message fields")
+            if role == "system" and index != 0:
+                raise ValueError("system message must be first")
+            content = message.get("content")
+            if role == "assistant":
+                if content is not None and not isinstance(content, str):
+                    raise ValueError("assistant content must be text or null")
+                if "reasoning_content" in message and not isinstance(message["reasoning_content"], str):
+                    raise ValueError("assistant reasoning_content must be text")
+            elif not isinstance(content, str) or role != "tool" and not content.strip():
+                raise ValueError("message content must be text; system/user text must be nonempty")
+            if role == "tool":
+                identity = message.get("tool_call_id")
+                if not isinstance(identity, str) or identity not in pending:
+                    raise ValueError("tool_call_id must match an unanswered assistant tool call")
+                pending.remove(identity)
+                continue
+            if pending:
+                raise ValueError("assistant tool calls must receive results before the next message")
+            if role != "assistant":
+                continue
+            calls = message.get("tool_calls", [])
+            if not isinstance(calls, list):
+                raise ValueError("assistant tool_calls must be a list")
+            if not calls and (not isinstance(content, str) or not content.strip()):
+                raise ValueError("assistant messages require content or tool calls")
+            for call in calls:
+                if not isinstance(call, dict) or set(call) != {"id", "type", "function"} or call["type"] != "function":
+                    raise ValueError("assistant tool_calls support only identified function calls")
+                identity, function = call["id"], call["function"]
+                if not isinstance(identity, str) or not identity.strip() or identity in pending:
+                    raise ValueError("assistant tool call IDs must be nonempty and unique within a turn")
+                if not isinstance(function, dict) or set(function) != {"name", "arguments"}:
+                    raise ValueError("tool calls require function name and arguments")
+                name = function["name"]
+                if not isinstance(name, str) or not name.strip() or tools is not None and name not in tool_names:
+                    raise ValueError("tool call must name an available function")
+                arguments = function["arguments"]
+                try:
+                    parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+                    parsed = _json_copy(parsed, "tool arguments")
+                except (ValueError, RecursionError) as error:
+                    raise ValueError(f"invalid JSON tool arguments: {error}") from error
+                if not isinstance(parsed, dict):
+                    raise ValueError("tool arguments must be a JSON object or its JSON string")
+                pending.add(identity)
+        if pending or messages[-1]["role"] not in {"user", "tool"}:
+            raise ValueError("conversations must end with a user message or completed tool results")
+        return self._encode_template(messages, tools=tools, **options)
+
+
+    def _encode_template(self, messages, **template_kwargs):
         try:
             ids = self._tokenizer.apply_chat_template(
                 messages, chat_template=self._template_source, tokenize=True,
                 add_generation_prompt=True, padding=False, truncation=False,
+                return_dict=False, **template_kwargs,
             )
         except (TemplateError, TypeError, ValueError) as error:
             raise ValueError(f"cannot render checkpoint chat template: {error}") from error
-        if not ids:
-            raise ValueError("chat template produced an empty tokenized prompt")
+        if not isinstance(ids, list) or not ids:
+            raise ValueError("chat template must produce a nonempty flat list of token IDs")
+        for token_id in ids:
+            self._validate_id(token_id, "chat template token IDs")
         return ids
 
     def decode(self, ids, *, skip_special_tokens=True) -> str:

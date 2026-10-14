@@ -42,14 +42,28 @@ def response_log_probs(
     response_ids: Sequence[int],
     temperature: float = 1.0,
 ) -> Tensor:
-    """Teacher-forced probabilities, with the same temperature as generation.
+    """Action probabilities, with the same temperature as generation.
 
     There is no padding: token ID zero is a real token and the attention mask
-    therefore contains only ones. The returned tensor includes terminal EOS.
+    therefore contains only ones. Models may replay sampling prefixes through
+    a differentiable ``response_log_probs`` hook to avoid shape-dependent
+    rounding. Other models use one teacher-forced pass. Terminal EOS is included.
     """
     validate_temperature(temperature)
     prompt = validate_token_ids(prompt_ids, "prompt_ids")
     response = validate_token_ids(response_ids, "response_ids")
+    hook = getattr(model, "response_log_probs", None)
+    if hook is not None:
+        if not callable(hook):
+            raise ValueError("model response_log_probs hook must be callable")
+        log_probs = hook(prompt, response, temperature)
+        if not isinstance(log_probs, Tensor) or log_probs.shape != (len(response),):
+            raise ValueError("model response_log_probs hook must return one tensor value per action")
+        log_probs = log_probs.float()
+        _finite(log_probs, "response log probabilities")
+        if bool((log_probs > 1e-6).any()):
+            raise ValueError("response log probabilities must be nonpositive")
+        return log_probs
     tokens = torch.tensor([prompt + response[:-1]], dtype=torch.long, device=input_device(model))
     if getattr(model, "supports_token_log_probs", False):
         targets = torch.full_like(tokens, -100)

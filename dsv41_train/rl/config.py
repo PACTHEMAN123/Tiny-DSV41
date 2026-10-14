@@ -23,7 +23,12 @@ class RLConfig:
     reward: str = "token_accuracy"
     learner_devices: tuple[str, ...] = ("cpu",)
     rollout_devices: tuple[str, ...] = ("cpu",)
+    rollout_engine: str = "vllm"
     engram_offload: bool = True
+    trainable_scope: str = "all"
+    qwen_last_position_only: bool = False
+    qwen_kv_cache: bool = False
+    backprop_chunk_tokens: int = 0
     gradient_checkpointing: bool = False
     dtype: str = "float32"
     seed: int = 42
@@ -74,6 +79,8 @@ class RLConfig:
         return asdict(self)
 
     def validate(self) -> None:
+        if self.rollout_engine not in {"vllm", "native-pytorch"}:
+            raise ValueError("rollout_engine must be vllm or native-pytorch")
         for name in ("max_steps", "groups_per_step", "max_new_tokens", "queue_capacity",
                      "num_threads", "checkpoint_interval", "eval_samples_per_prompt"):
             value = getattr(self, name)
@@ -112,6 +119,17 @@ class RLConfig:
             raise ValueError("clip_eps must be in (0, 1)")
         if self.dtype not in ("float32", "bfloat16"):
             raise ValueError("dtype must be float32 or bfloat16")
+        if self.trainable_scope not in {"all", "lm_head"}:
+            raise ValueError("trainable_scope must be all or lm_head")
+        if type(self.qwen_last_position_only) is not bool:
+            raise ValueError("qwen_last_position_only must be a boolean")
+        if type(self.qwen_kv_cache) is not bool:
+            raise ValueError("qwen_kv_cache must be a boolean")
+        if type(self.backprop_chunk_tokens) is not int or self.backprop_chunk_tokens < 0:
+            raise ValueError("backprop_chunk_tokens must be a nonnegative integer")
+        if self.qwen_kv_cache and (self.trainable_scope != "lm_head" or not self.qwen_last_position_only
+                                   or self.backprop_chunk_tokens):
+            raise ValueError("qwen_kv_cache requires lm_head, last-position logits and unchunked turn replay")
         if not self.reward or not self.output_dir:
             raise ValueError("reward and output_dir must not be empty")
         for name in ("engram_offload", "gradient_checkpointing"):

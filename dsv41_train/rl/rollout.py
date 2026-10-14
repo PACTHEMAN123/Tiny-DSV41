@@ -110,6 +110,12 @@ def generate_group(
         record = PromptRecord.from_mapping(record)
     if reward_fn is None:
         reward_fn = build_reward("token_accuracy")
+    if getattr(model, "qwen_kv_cache", False):
+        from rollout_manager.backends.qwen_kv_cache import generate_cached_qwen_group
+        return generate_cached_qwen_group(model, record, group_size, max_new_tokens=max_new_tokens,
+            temperature=temperature, eos_token_id=eos_token_id, policy_version=policy_version,
+            group_id=group_id, generator=generator, reward_fn=reward_fn,
+            stop_token_sequences=stop_token_sequences, truncated_reward=truncated_reward)
     samples = []
     was_training = model.training
     model.eval()
@@ -120,12 +126,22 @@ def generate_group(
                 finish_reason, stop_count = "length", 0
                 for _ in range(max_new_tokens):
                     tokens = torch.tensor([record.prompt_ids + response], dtype=torch.long, device=input_device(model))
-                    logits = extract_logits(model(tokens, attention_mask=torch.ones_like(tokens)))
-                    if logits.shape[1] != tokens.shape[1]:
-                        raise ValueError("model must return one logits vector per input token")
+                    next_logits = getattr(model, "next_token_logits", None)
+                    if next_logits is None:
+                        logits = extract_logits(model(tokens, attention_mask=torch.ones_like(tokens)))
+                        if logits.shape[1] != tokens.shape[1]:
+                            raise ValueError("model must return one logits vector per input token")
+                        logits = logits[0, -1]
+                    else:
+                        if not callable(next_logits):
+                            raise ValueError("model next_token_logits hook must be callable")
+                        logits = next_logits(tokens, attention_mask=torch.ones_like(tokens))
+                        if not isinstance(logits, torch.Tensor) or logits.ndim != 2 or logits.shape[0] != 1 or logits.shape[1] == 0:
+                            raise ValueError("model next_token_logits must return [1, vocabulary_size]")
+                        logits = logits[0]
                     if any(token >= logits.shape[-1] for token in eos_ids + [t for ids in stops for t in ids]):
                         raise ValueError("stop token ID is outside the model vocabulary")
-                    log_probs = torch.log_softmax(logits[0, -1].float() / temperature, dim=-1)
+                    log_probs = torch.log_softmax(logits.float() / temperature, dim=-1)
                     if not torch.isfinite(log_probs).all().item():
                         raise ValueError("generation log probabilities contain non-finite values")
                     probabilities = log_probs.exp().cpu()

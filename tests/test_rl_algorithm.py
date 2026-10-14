@@ -36,6 +36,31 @@ class AlgorithmTests(unittest.TestCase):
         self.assertGreater(model.transitions.grad[:2].abs().sum().item(), 0)
         self.assertEqual(model.transitions.grad[2].abs().sum().item(), 0)
 
+    def test_model_probability_hook_keeps_shared_validation(self):
+        class HookModel(TransitionModel):
+            calls = 0
+
+            def response_log_probs(self, prompt, response, temperature):
+                self.calls += 1
+                self.inputs = prompt, response, temperature
+                return self.output
+
+        model = HookModel()
+        for output in ([-1.], torch.tensor([[-1.]]), torch.tensor([-1., -2.]),
+                       torch.tensor([float("nan")]), torch.tensor([.2])):
+            model.output = output
+            with self.subTest(output=output), self.assertRaises(ValueError):
+                response_log_probs(model, [0], [2], .8)
+        model.output = model.transitions[0, :1].log_softmax(-1)
+        calls = model.calls
+        for prompt, response, temperature in (([], [2], .8), ([0], [], .8), ([0], [-1], .8), ([0], [2], 0)):
+            with self.assertRaises(ValueError):
+                response_log_probs(model, prompt, response, temperature)
+        self.assertEqual(model.calls, calls)
+        actual = response_log_probs(model, [0], [2], .8)
+        self.assertEqual(model.inputs, ([0], [2], .8))
+        self.assertTrue(actual.requires_grad)
+
     def test_clipping_handles_positive_and_negative_advantages(self):
         behavior = [[math.log(0.25)], [math.log(0.25)]]
         current = [

@@ -44,10 +44,10 @@ class DSV41Tests(unittest.TestCase):
 
         torch.set_num_threads(1)
         self.config = DSV41Config.from_model_dir(MODEL_DIR)
-        self.rl = RLConfig(seed=37, max_new_tokens=3, temperature=0.8)
+        self.rl = RLConfig(rollout_engine="native-pytorch", seed=37, max_new_tokens=3, temperature=0.8)
 
     def policy(self, dtype="float32"):
-        return make_model(MODEL_DIR, self.config, RLConfig(seed=37, dtype=dtype), ("cpu",), True)
+        return make_model(MODEL_DIR, self.config, RLConfig(rollout_engine="native-pytorch", seed=37, dtype=dtype), ("cpu",), True)
 
     def native_base(self, root):
         from dsv41_train.models.dsv4.model import DeepSeekV41ForCausalLM
@@ -187,7 +187,7 @@ class DSV41Tests(unittest.TestCase):
             torch.testing.assert_close(policy(tokens[:, :length]), full[:, :length], rtol=1e-5, atol=1e-5)
 
     def test_bfloat16_rollout_probability_error_is_bounded(self):
-        policy = make_model(MODEL_DIR, self.config, RLConfig(seed=6, dtype="bfloat16"), ("cpu",), True)
+        policy = make_model(MODEL_DIR, self.config, RLConfig(rollout_engine="native-pytorch", seed=6, dtype="bfloat16"), ("cpu",), True)
         group = generate_group(
             policy, PromptRecord([1, 4, 7, 3, 8, 9]), group_size=1, max_new_tokens=12,
             temperature=0.8, eos_token_id=None, policy_version=0, group_id=0,
@@ -319,7 +319,8 @@ class DSV41Tests(unittest.TestCase):
             config_file = root / "rl.json"
             config_file.write_text(json.dumps(values))
             command = [sys.executable, "-m", "dsv41_train.rl.train", "--model-dir", str(root / "base"),
-                       "--data", str(ROOT / "examples/rl/prompts.jsonl"), "--config", str(config_file)]
+                       "--data", str(ROOT / "examples/rl/prompts.jsonl"), "--config", str(config_file),
+                       "--rollout-engine", "native-pytorch"]
             environment = {**os.environ, "PYTHONPATH": str(ROOT)}
             result = subprocess.run(command, cwd=ROOT, env=environment, capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

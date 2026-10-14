@@ -43,8 +43,9 @@ python3 -m torch.distributed.run --standalone --nproc-per-node=8 \
 
 ### Asynchronous GRPO MVP
 
-`dsv41_train.rl` trains the native DSV4 model using one learner process and one
-rollout process. It uses the existing dependencies only. No Ray, Transformers,
+`dsv41_train.rl` trains native DeepSeek V4.1 and Qwen3 MoE models using the same
+learner, rollout manager, policy publication and checkpoint runtime. It uses
+the existing dependencies only. No Ray, Transformers,
 vLLM or separate RL repository is required.
 
 Model architecture comes from `<model-dir>/config.json` at startup: vocabulary,
@@ -56,6 +57,10 @@ Only the decoder backbone is built; MTP and vision modules are not trained.
 Missing architecture fields fail before model allocation. Older partial configs
 must supply their previously implicit fields explicitly.
 
+The RL CLI defaults to vLLM inference. Its current weight-update adapter supports
+Qwen3 MoE head training. DeepSeek vLLM RL requires an additional weight adapter;
+the following DeepSeek/CPU examples explicitly use native compatibility.
+
 For pretrained RL, point `--model-dir` at a downloaded checkpoint repository
 directory. Its config and weights must agree; missing weights are an error.
 `--config` continues to specify RL settings, not model dimensions:
@@ -63,6 +68,7 @@ directory. Its config and weights must agree; missing weights are an error.
 ```bash
 python3 -m dsv41_train.rl.train \
   --model-dir /path/to/DeepSeek-V4.1-Flash \
+  --rollout-engine native-pytorch \
   --data /path/to/tokenized-prompts.jsonl \
   --config examples/rl/cuda.json \
   --trainer-num-gpus 4 --rollout-num-gpus 2
@@ -251,8 +257,9 @@ not arithmetic learning. SFT is a separate objective, not implemented here.
 
 `--eval-data` enables a baseline before training, periodic evaluations at
 `eval_interval` (zero means `checkpoint_interval`), and a final evaluation.
-Evaluation uses the trainer policy without gradients and a separate fixed
-`eval_seed`; it does not advance rollout sampling RNG or add a model copy.
+Evaluation uses the same owned vLLM actor without gradients and independent
+evaluation seeds. The explicit native compatibility route evaluates the trainer
+policy with its separate fixed `eval_seed`; neither route adds a model copy.
 Training and validation tokenized prompts must be disjoint. Metrics append to
 `eval-metrics.jsonl`; decoded validation responses append to `eval-samples.jsonl`.
 `train-samples.jsonl` records up to `log_samples_per_step` training responses
@@ -277,17 +284,20 @@ sample logs append on resume; `phase` and `step` identify each evaluation.
 
 The runtime and synchronization rules are:
 
-- Rollout generates a complete group for one prompt with fixed weights,
+- `rollout_manager` owns the persistent rollout process and Coordinator admission.
+  Its default vLLM backend generates a complete group for one prompt with fixed weights,
   recording sampled tokens, actual behavior log probabilities, reward and
   policy version. It samples the full categorical distribution with temperature
   and stops at EOS or `max_new_tokens`; EOS contributes to the objective.
-- A bounded multiprocessing queue transfers complete groups. The learner
+- A bounded CPU mailbox transfers complete groups and retains uncommitted packets. The learner
   normalizes rewards within each group, computes response-only clipped GRPO
   against the recorded behavior probabilities, optionally adds an
   importance-weighted reference KL, and applies AdamW.
-- After each update the learner atomically replaces `policy-latest.pt`, then
-  publishes the version. Rollout checks for newer weights between groups and
-  may skip intermediate versions. Groups older than `max_policy_lag` are
+- Each update pauses admission and drains active groups. The learner stages an
+  immutable SHA256-bound policy artifact and durably commits the checkpoint before
+  activating weights. The backend acknowledges the exact version and digest before
+  admission resumes. Manager training requires `checkpoint_interval: 1`.
+  Groups older than `max_policy_lag` are
   discarded whole. `max_policy_lag: 0` accepts only the current version.
 - By default, Engram embedding tables and hash metadata stay on CPU. Tables are frozen
   buffers excluded from AdamW and policy/training snapshots; only selected rows
@@ -296,27 +306,44 @@ The runtime and synchronization rules are:
   sparse indexer enables stable tie ordering for RL to keep prefix probabilities
   consistent. Scoring uses Triton on supported CUDA shapes and a PyTorch reference
   on CPU or unsupported shapes.
-- Policy generation and response scoring both enter the public SFT model forward.
+- On the explicit native DeepSeek route, policy generation and response scoring
+  both enter the public SFT model forward.
   Response scoring projects only selected hidden states, returns FP32 token
   log probabilities, and checkpoints the LM head during training. It does not
   add the SFT router auxiliary loss. `gradient_checkpointing: true` in the RL
   JSON, or `--gradient-checkpointing`, also enables decoder recomputation during
   learner backward. This execution setting can change on resume; old checkpoints
   default to disabled. Evaluation and rollout do not recompute activations.
-- Training checkpoints include policy, optimizer, RNG state and data cursor;
+- Format-2 checkpoints include policy, optimizer, RNG state, issued/committed
+  cursors, retained complete groups and policy publication receipts;
   the original base tables are required to restore. Resume checks config/data,
-  mapping hashes and base-file size/mtime. Queued/in-flight groups are regenerated,
-  so resume is not a bitwise replay of asynchronous scheduling. Metrics include
+  mapping hashes and base-file size/mtime. Saved complete groups are restored;
+  unknown remote requests cannot be replayed automatically. Format-1 checkpoints
+  remain readable. Resume is not a bitwise replay of asynchronous scheduling. Metrics include
   policy lag, dropped groups and measured overlap with the preceding update.
 
-This is a correctness-first MVP: no KV cache, batched generation, distributed
-FSDP/EP/CP integration, multi-worker rollout or incremental weight transport.
-BF16 prefix and teacher-forced GEMMs can differ slightly by sequence shape.
+The Qwen vLLM actor uses decode CUDA graphs and a request KV cache; the native
+learner uses cached per-turn replay and trains only the head in this profile.
+Head activation preserves the actor's captured weight storage. Admission drains
+before each update; multi-actor overlap and distributed RL FSDP/EP/CP remain
+unqualified. Native and vLLM probabilities can differ by more than rounding;
+GRPO always retains the actual sampled vLLM probabilities as its denominator.
 CPU tests cover optimization, loading, storage shared across spawned processes,
 frozen tables, synchronization and train/resume/sample. Two-GPU tests compare
 logits/gradients and table placement when hardware is available; GPU and full
 released-checkpoint runs require validation on suitable hardware.
 See [the shared-forward interface and validation notes](docs/rl-shared-forward.md).
+
+See the [implementation report](docs/rollout-manager/implementation.md) for the
+producer, publication protocol and measured validation boundaries, and the
+[usage guide](docs/rollout-manager/guide.md) for setup and recovery.
+
+Training contracts also support multiple assistant/tool turns: each assistant
+action uses its actual context and behavior probabilities; tool observations are
+context only. See the [benchmark training guide](docs/rollout-manager/guide.md#terminal-bench-with-an-existing-cpu-executor)
+for capability requirements and preserved verifier/source-approval gates. A stock
+generation endpoint without exact token evidence and acknowledged weight activation
+cannot be used for benchmark RL.
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_rl_*.py' -v
@@ -329,6 +356,47 @@ The orchestration follows the actor/learner separation used in
 standard library.
 
 ## Qwen3-30B-A3B
+
+### RL through the shared rollout manager
+
+The generic `dsv41_train.rl.train` CLI uses Rollout Manager with the owned vLLM
+actor by default. Model dimensions come from `--model-dir/config.json`; the
+current vLLM activation adapter supports flat unquantized `qwen3_moe` in BF16
+with a frozen backbone and trainable head. DeepSeek vLLM activation fails clearly
+before learner allocation. Native inference is explicit compatibility via
+`--rollout-engine native-pytorch`.
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+python3 -m dsv41_train.rl.train \
+  --model-dir /mnt/fuse/Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --data examples/rl/qwen-diagnostic-train.jsonl \
+  --config examples/rl/qwen-head.json \
+  --output-dir /path/to/new-experiment/training
+```
+
+`trainable_scope` defaults to `all`. The vLLM Qwen profile requires `lm_head`;
+the explicit native route supports Qwen `all` or `lm_head`, while native
+DeepSeek requires `all`. The Qwen
+head example freezes the full pretrained backbone and updates its 311M output
+head parameters. Its policy/checkpoint files contain the head and optimizer,
+and inference/resume reconstructs the frozen backbone from the identified
+mounted assets. Checkpoints bind the training scope, tokenizer and base files.
+Full-model Qwen training has a substantially larger memory and snapshot budget
+and is not qualified by the head experiment.
+
+The Qwen head configuration uses one dedicated vLLM actor GPU and cached native
+learner replay. Actual engine token IDs, sampled-distribution logprobs, seeds and
+CUDA Graph replay evidence are retained. Learner/vLLM probabilities need not be
+identical; GRPO uses the actual vLLM behavior denominator and configured clipping.
+`--eval-data` evaluates through that same actor while training admission is paused.
+Standalone native checkpoint sampling/evaluation rejects vLLM checkpoints.
+
+The example token-ID reward tests RL plumbing, not answer quality.
+`examples.rl.qualify_qwen_manager` explicitly qualifies the legacy native route;
+its probability-parity claims do not apply across native and vLLM engines. The
+actual vLLM route and its supported activation/recovery boundaries are described
+in the [implementation report](docs/rollout-manager/implementation.md).
 
 ### One node, 8 GPUs
 
@@ -355,3 +423,11 @@ validation are documented in [`docs/mhc.md`](docs/mhc.md).
 
 DSV4 expert parallelism, expert FSDP, grouped GEMMs, Triton activation kernels,
 and four-node memory results are documented in [`docs/moe.md`](docs/moe.md).
+
+## Unified rollout manager
+
+The shared manager owns admission, execution, exact action evidence and policy
+activation for vLLM RL and Harbor/Pouch tasks. Read the
+[implementation report](docs/rollout-manager/implementation.md) and
+[usage guide](docs/rollout-manager/guide.md). Offline inspection, validation and
+planning remain available through `rollout-manager`.

@@ -2,8 +2,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from tokenizers import Tokenizer, models, pre_tokenizers, processors
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
 
 from dsv41_train.rl.tokenizer import ModelTokenizer, read_eos_token_ids
 
@@ -34,6 +35,21 @@ class ModelTokenizerTests(unittest.TestCase):
             template = "{{ bos_token }} {% for message in messages %}{{ message.role }} {{ message.content }} {{ eos_token }} {% endfor %}{% if add_generation_prompt %}assistant{% endif %}"
         (self.directory / "chat_template.jinja").write_text(template, encoding="utf-8")
 
+    def write_llama_tokenizer(self, *, add_bos, add_eos):
+        tokens = ["[UNK]", "[BOS]", "[EOS]", *sorted(set("▁hello worlduserassistant"))]
+        tokenizer = Tokenizer(models.BPE(dict(zip(tokens, range(len(tokens)))), [], unk_token="[UNK]"))
+        tokenizer.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁", prepend_scheme="always")
+        tokenizer.decoder = decoders.Metaspace(replacement="▁", prepend_scheme="always")
+        tokenizer.add_special_tokens(tokens[:3])
+        tokenizer.save(str(self.directory / "tokenizer.json"))
+        self.write_json("config.json", {"vocab_size": len(tokens), "bos_token_id": 1, "eos_token_id": 2})
+        self.write_json("tokenizer_config.json", {
+            "tokenizer_class": "LlamaTokenizerFast", "legacy": True,
+            "unk_token": "[UNK]", "bos_token": "[BOS]", "eos_token": "[EOS]",
+            "add_bos_token": add_bos, "add_eos_token": add_eos,
+        })
+        return tokenizer
+
     def test_chat_template_formats_roles_and_appends_generation_prefix_once(self):
         self.write_template()
         tokenizer = ModelTokenizer(self.directory)
@@ -45,32 +61,43 @@ class ModelTokenizerTests(unittest.TestCase):
         ]), [1, 4, 9, 2, 5, 7, 2, 6, 10, 2, 5, 8, 2, 6])
         self.assertEqual(tokenizer.encode_prompt(prompt="hello world"), [1, 5, 7, 8, 2, 6])
 
+    def test_template_requests_token_list_and_rejects_invalid_id_shapes(self):
+        self.write_template()
+        tokenizer = ModelTokenizer(self.directory)
+        with patch.object(tokenizer._tokenizer, "apply_chat_template", wraps=tokenizer._tokenizer.apply_chat_template) as render:
+            self.assertEqual(tokenizer.encode_prompt(prompt="hello"), [1, 5, 7, 2, 6])
+            self.assertIs(render.call_args.kwargs["return_dict"], False)
+        for ids in ({"input_ids": [7]}, [[7]], [True], [13], ["7"], []):
+            with self.subTest(ids=ids), patch.object(tokenizer._tokenizer, "apply_chat_template", return_value=ids):
+                with self.assertRaisesRegex(ValueError, "token IDs"):
+                    tokenizer.encode_prompt(prompt="hello")
+
     def test_plain_prompt_without_template_uses_tokenizer_postprocessor(self):
         tokenizer = ModelTokenizer(self.directory)
         self.assertEqual(tokenizer.encode_prompt(prompt="hello world"), [1, 7, 8])
         with self.assertRaisesRegex(ValueError, "chat template"):
             tokenizer.encode_prompt(messages=[{"role": "user", "content": "hello"}])
 
+    def test_qwen_bos_eos_flags_are_metadata_not_special_token_strings(self):
+        self.write_json("tokenizer_config.json", {"bos_token": "[BOS]", "eos_token": "[EOS]",
+                                                 "add_bos_token": False, "add_eos_token": True})
+        self.write_template()
+        tokenizer = ModelTokenizer(self.directory)
+        self.assertEqual(tokenizer.encode_prompt(prompt="hello"), [1, 5, 7, 2, 6])
+        self.assertEqual(tokenizer.eos_token_ids, (2,))
     def test_model_tokenizer_honors_bos_and_eos_switches(self):
         for add_bos in (False, True):
             for add_eos in (False, True):
                 with self.subTest(add_bos=add_bos, add_eos=add_eos):
-                    self.write_json("tokenizer_config.json", {
-                        "tokenizer_class": "LlamaTokenizerFast", "legacy": True,
-                        "unk_token": "[UNK]", "bos_token": "[BOS]", "eos_token": "[EOS]",
-                        "add_bos_token": add_bos, "add_eos_token": add_eos,
-                    })
-                    expected = ([1] if add_bos else []) + [7, 8] + ([2] if add_eos else [])
+                    native = self.write_llama_tokenizer(add_bos=add_bos, add_eos=add_eos)
+                    expected = ([1] if add_bos else []) + native.encode("hello world", add_special_tokens=False).ids + ([2] if add_eos else [])
                     self.assertEqual(ModelTokenizer(self.directory).encode_prompt(prompt="hello world"), expected)
 
     def test_chat_template_does_not_duplicate_automatic_bos_and_eos(self):
-        self.write_json("tokenizer_config.json", {
-            "tokenizer_class": "LlamaTokenizerFast", "legacy": True,
-            "unk_token": "[UNK]", "bos_token": "[BOS]", "eos_token": "[EOS]",
-            "add_bos_token": True, "add_eos_token": True,
-        })
+        native = self.write_llama_tokenizer(add_bos=True, add_eos=True)
         self.write_template()
-        self.assertEqual(ModelTokenizer(self.directory).encode_prompt(prompt="hello world"), [1, 5, 7, 8, 2, 6])
+        expected = native.encode("[BOS] user hello world [EOS] assistant", add_special_tokens=False).ids
+        self.assertEqual(ModelTokenizer(self.directory).encode_prompt(prompt="hello world"), expected)
 
     def test_saved_padding_and_truncation_do_not_change_prompt_tokens(self):
         path = self.directory / "tokenizer.json"

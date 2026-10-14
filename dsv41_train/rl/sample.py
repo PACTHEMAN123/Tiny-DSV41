@@ -12,7 +12,7 @@ import torch
 from .checkpoint import checkpoint_config, load_policy, run_identity, validate_identity
 from .data import PromptRecord
 from .evaluation import decoded_fields
-from .policy import DSV41Config
+from .family import load_model_config
 from .rollout import generate_group, generation_options
 from .runtime import make_model
 from .tokenizer import ModelTokenizer
@@ -35,15 +35,21 @@ def load_checkpoint_model(
     """
     model_dir = Path(model_dir).resolve()
     state = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
-    if not isinstance(state, dict) or state.get("format_version") != 1:
+    if not isinstance(state, dict) or state.get("format_version") not in (1, 2):
         raise ValueError("unsupported RL checkpoint format")
     if not all(key in state for key in ("config", "identity", "policy", "step")):
         raise ValueError("RL checkpoint is missing config, identity, policy or step")
     identity = state["identity"]
     if not isinstance(identity, dict) or type(identity.get("random_init")) is not bool:
         raise ValueError("checkpoint identity must contain a boolean random_init flag")
+    if identity.get("rollout_engine") == "vllm" or state["config"].get("rollout_engine") == "vllm":
+        raise ValueError("this checkpoint requires vLLM inference; standalone native sample/evaluate "
+                         "is disabled. Use the owned Rollout Manager evaluation during training/resume.")
     random_init = identity["random_init"]
+    model_config = load_model_config(model_dir)
     current_identity = run_identity(model_dir, model_dir / "config.json", random_init)
+    if getattr(model_config, "model_type", None) == "qwen3_moe":
+        current_identity["trainable_scope"] = state["config"].get("trainable_scope", "all")
     validate_identity(identity, current_identity, inference=True)
     version = state["step"]
     if type(version) is not int or version < 0:
@@ -56,7 +62,6 @@ def load_checkpoint_model(
         values["max_new_tokens"] = max_new_tokens
     if temperature is not None:
         values["temperature"] = temperature
-    model_config = DSV41Config.from_model_dir(model_dir)
     config = checkpoint_config(values, model_config)
     sampling_seed = config.seed if seed is None else seed
     if type(sampling_seed) is not int or not 0 <= sampling_seed < 2**63 - 1:
@@ -111,7 +116,7 @@ def sample_checkpoint(*, model_dir: str | Path, checkpoint: str | Path,
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sample text or token IDs from a DeepSeek-V4.1 RL policy")
+    parser = argparse.ArgumentParser(description="Sample text or token IDs from a native RL policy")
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--checkpoint", required=True, help="RL step-XXXXXXXX.pt checkpoint")
     inputs = parser.add_mutually_exclusive_group(required=True)
