@@ -4,6 +4,13 @@ Pure PyTorch training for DeepSeek V4.1 and Qwen3 MoE.
 
 Run all commands from the repository root.
 
+Start with the [SFT and LoRA guide](docs/sft.md) for a new checkout.
+The [4096-token validation report](docs/longseq_identity_results_20261014.md)
+separates identity adaptation, native Engram, and Qwen dummy-table efficiency.
+Raw experiment artifacts, adapters, and machine-specific evidence are not
+included in Git. The [original-environment replay guide](docs/longseq_identity_quickstart_20261014.md)
+requires those retained local artifacts.
+
 ## Engram support
 
 This branch supports trainable, row-sharded Engram tables with independent
@@ -28,8 +35,38 @@ the supported sparse SGD path. Prefetch and cache do not guarantee a speedup.
 
 ## Post-training and profiling
 
-DSV4 supports selective activation checkpointing and native PyTorch linear LoRA.
-No Transformers or PEFT runtime dependency is required.
+`train_sft.py` provides real JSONL answer-masked SFT for Qwen and DSV4, with
+token-weighted gradient accumulation and distributed checkpoint resume. See
+[SFT setup and commands](docs/sft.md) and [L20D real-checkpoint validation](docs/l20d_validation_20261013.md). The older `train_qwen.py` and
+`train_dsv4_checkpoint.py` commands below are random-token execution checks.
+
+`train_sft.py --lora` supports native PyTorch attention LoRA for the complete
+Qwen3 MoE backbone and a DSV4 layer window, including all 40 text layers. Qwen targets q/k/v/o projections;
+`--qwen-engram` cannot be combined with LoRA. DSV4 additionally supports selective
+activation checkpointing. No Transformers or PEFT runtime dependency is required.
+
+`--checkpoint-state full` remains the default. For LoRA,
+`--checkpoint-state lora` saves A/B adapters, persistent buffers, optimizer, RNG
+and step while reloading the frozen base from its mounted checkpoint on resume.
+This reduces checkpoint storage, not base-model GPU memory. Base identity hashes
+config/index files but not weight shards, so the mounted base must stay immutable.
+See [Qwen LoRA commands](docs/sft.md#qwen-attention-lora) and
+[checkpoint scope and resume restrictions](docs/sft.md#lora-adapters-and-checkpoint-scope).
+
+The [earlier real-weight LoRA validation](docs/lora_validation_20261013.md) covers
+a DSV4 one-layer prefix and split/resume checks. The [current 4096-token validation](docs/longseq_identity_results_20261014.md)
+records 20-step LoRA runs for all 48 Qwen layers and all 40 DSV4 text layers
+(`none` and `hf` cache-value modes), followed by fresh-process adapter reload
+and GPU process-exit/memory-recovery checks. This tests identity adaptation;
+it is not a general capability benchmark. Resume evidence from shorter runs
+is recorded separately.
+
+Native Engram preserves the mounted V4.1 token mapping, n-gram addressing and
+gate formula. Its trainable rows and row cache use decoded BF16 values, not the
+checkpoint's packed FP8 rows/scales. The separate `--cache-quantization hf` mode
+matches the tested attention KV/index quantize/dequantize value formats while
+retaining BF16 storage and identity STE gradients. See the
+[official-format scope and limitations](docs/longseq_identity_quickstart_20261014.md#deepseek-官方格式与-hf-模式的范围).
 
 ```bash
 python3 profile_dsv4.py --layers 3 --seq-len 1024 \

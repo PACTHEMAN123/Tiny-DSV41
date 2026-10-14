@@ -453,7 +453,8 @@ class Engram(nn.Module):
         hidden = streams.float()
         scale = torch.rsqrt(hidden.square().mean(-1) + self.eps)
         scale = scale * torch.rsqrt(key.square().mean(-1) + self.eps)
-        dot = (hidden * self.q_weight.float() * self.k_weight.float() * key).sum(-1)
+        weight = self.q_weight.float() * self.k_weight.float()
+        dot = (hidden * weight * key).sum(-1)
         dot = dot * scale * self.hidden_size**-0.5
         gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
         gate = gate.masked_fill(~mask.unsqueeze(-1), 0)

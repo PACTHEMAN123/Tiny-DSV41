@@ -1,0 +1,8 @@
+{"prompt":"What is 2 + 3?","response":"2 + 3 = 5."}
+{"prompt":"Translate hello into Chinese.","response":"你好。"}
+{"instruction":"Complete the sequence.","input":"2, 4, 6, 8","output":"10"}
+{"prompt":"Name the largest planet in the Solar System.","response":"Jupiter is the largest planet in the Solar System."}
+{"instruction":"Summarize in one short sentence.","input":"Plants use sunlight, water, and carbon dioxide to make sugars through photosynthesis.","output":"Photosynthesis lets plants turn sunlight, water, and carbon dioxide into sugars."}
+{"prompt":"Write a Python function that adds two numbers.","response":"def add(a, b):\n    return a + b"}
+{"prompt":"把这句话改成礼貌的请求：给我一杯水。","response":"请给我一杯水，谢谢。"}
+{"prompt":"Which number is even: 7 or 12?","response":"12 is even because it is divisible by 2."}

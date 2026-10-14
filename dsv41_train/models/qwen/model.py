@@ -330,6 +330,7 @@ class Qwen3MoeModel(nn.Module):
         self.config = config
         self.context_parallel = context_parallel or ContextParallel()
         token_dispatcher = token_dispatcher or TokenDispatcher()
+        self.layer_ids = list(range(config.num_hidden_layers))
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [

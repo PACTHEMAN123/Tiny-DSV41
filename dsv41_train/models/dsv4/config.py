@@ -178,7 +178,14 @@ class DeepSeekV41Config:
     def from_json(cls, path: str | Path) -> "DeepSeekV41Config":
         with Path(path).open(encoding="utf-8") as file:
             values = json.load(file)
-        values = values.get("text_config", values)
+        if "text_config" in values:
+            # Released multimodal configs store these IDs on the outer config.
+            # Preserve them unless the text config explicitly overrides them.
+            values = {
+                **{key: values[key] for key in ("bos_token_id", "eos_token_id", "pad_token_id")
+                   if key in values},
+                **values["text_config"],
+            }
         if "engram_pad_token_id" in values and "engram_pad_id" not in values:
             values["engram_pad_id"] = values["engram_pad_token_id"]
         known = {field.name for field in fields(cls)}

@@ -27,7 +27,8 @@ class QwenEngramConfig:
             raise ValueError("Engram dimensions must be positive and n-grams start at two")
 
 
-def attach_engram(model, config, policy=None, mesh=None, *, device="cpu", dtype=torch.bfloat16):
+def attach_engram(model, config, policy=None, mesh=None, *, device="cpu", dtype=torch.bfloat16,
+                  table_initializer=None):
     """Add tables before FSDP; initialize CPU/GPU variants from identical CPU RNG."""
     if hasattr(model.model, "engram_tables"):
         raise ValueError("Qwen already has Engram tables")
@@ -49,15 +50,20 @@ def attach_engram(model, config, policy=None, mesh=None, *, device="cpu", dtype=
         engram_layer_ids=list(config.layer_ids),
         engram_num_embeddings=[columns * (config.vocab_per_head + 10000)] * len(config.layer_ids),
     )
-    hashing = NgramHash(options)
+    with torch.device("cpu"):
+        hashing = NgramHash(options)
     sizes = (hashing.offsets[:, -1] + hashing.primes.flatten(1)[:, -1]).tolist()
     model.model.engram_hash = hashing.to(device)
     model.model.engram_layer_ids = list(config.layer_ids)
     model.model.engram_tables = nn.ModuleDict()
     model.engram_config = config
     for layer_id, count in zip(config.layer_ids, sizes):
-        with torch.random.fork_rng(devices=[]):
-            torch.manual_seed(config.seed + layer_id)
+        with torch.random.fork_rng(devices=[]), torch.device("cpu"):
+            # manual_seed also seeds every CUDA generator, which a CPU-only
+            # fork cannot restore. Seed only the CPU stream used by nn.Linear.
+            torch.random.set_rng_state(
+                torch.Generator(device="cpu").manual_seed(config.seed + layer_id).get_state()
+            )
             block = Engram(options)
             nn.init.normal_(block.proj.weight, std=model.config.initializer_range)
         model.model.layers[layer_id].engram = block.to(device=device, dtype=dtype)
@@ -66,14 +72,17 @@ def attach_engram(model, config, policy=None, mesh=None, *, device="cpu", dtype=
         target = torch.device("cpu") if policy.device == "cpu" else torch.device(device)
         table.weight = nn.Parameter(torch.empty(table.row_stop-table.row_start, config.head_dim,
                                                 dtype=dtype, device=target))
-        generator = torch.Generator(device="cpu").manual_seed(config.seed + layer_id * 100003 + table.row_start)
-        # Bounded initialization gives identical values regardless of table placement.
-        with torch.no_grad():
-            for start in range(0, table.weight.shape[0], 8192):
-                destination = table.weight[start:start+8192]
-                rows = torch.empty(destination.shape, dtype=dtype).normal_(
-                    std=model.config.initializer_range, generator=generator)
-                destination.copy_(rows)
+        if table_initializer is None:
+            generator = torch.Generator(device="cpu").manual_seed(config.seed + layer_id * 100003 + table.row_start)
+            # Bounded initialization gives identical values regardless of table placement.
+            with torch.no_grad():
+                for start in range(0, table.weight.shape[0], 8192):
+                    destination = table.weight[start:start+8192]
+                    rows = torch.empty(destination.shape, dtype=dtype, device="cpu").normal_(
+                        std=model.config.initializer_range, generator=generator)
+                    destination.copy_(rows)
+        else:
+            table_initializer(table, layer_id=layer_id)
         model.model.engram_tables[str(layer_id)] = table
 
 
@@ -83,7 +92,8 @@ def shard_qwen_component(name, module, meshes):
 
     if name.startswith("model.layers."):
         expert_mesh = meshes.expert_fsdp if meshes.ep is not None else meshes.fsdp
-        fully_shard(module.mlp.experts, mesh=expert_mesh, reshard_after_forward=True)
+        if hasattr(module.mlp, "experts"):
+            fully_shard(module.mlp.experts, mesh=expert_mesh, reshard_after_forward=True)
     if name != "model.norm":
         fully_shard(module, mesh=meshes.fsdp, reshard_after_forward=True)
 
@@ -91,7 +101,7 @@ def shard_qwen_component(name, module, meshes):
 def shard_qwen_root(model, meshes):
     from torch.distributed.fsdp import FSDPModule, fully_shard
 
-    ignored = {table.weight for table in model.model.engram_tables.values()}
+    ignored = {table.weight for table in getattr(model.model, "engram_tables", {}).values()}
     fully_shard(model, mesh=meshes.fsdp, ignored_params=ignored, reshard_after_forward=True)
     for module in model.modules():
         if isinstance(module, FSDPModule):

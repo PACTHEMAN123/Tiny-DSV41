@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -12,6 +13,7 @@ from ...dispatch import TokenDispatcher
 from ...parallel import ContextParallel
 from ...loading.reader import ShardedSafeTensorReader
 from ...loading.quantization import dequantize_blockwise_fp8
+from ...lora import LoRAConfig, inject_lora, load_adapter_state, read_adapter, validate_adapter_layout
 from .config import Qwen3MoeConfig
 from .model import Qwen3MoeExperts, Qwen3MoeForCausalLM
 
@@ -19,6 +21,8 @@ from .model import Qwen3MoeExperts, Qwen3MoeForCausalLM
 _EXPERT_WEIGHT = re.compile(
     r"^(model\.layers\.\d+\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
 )
+
+QWEN_LORA_TARGETS = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj")
 
 
 def _load_assigned(model: Qwen3MoeForCausalLM, state: dict[str, torch.Tensor]) -> set[str]:
@@ -89,6 +93,8 @@ def load_qwen3_moe(
     token_dispatcher: TokenDispatcher | None = None,
     setup_callback=None,
     module_callback=None,
+    lora_config: LoRAConfig | None = None,
+    adapter_path: str | Path | None = None,
 ) -> Qwen3MoeForCausalLM:
     """Load sharded HF weights without depending on Transformers."""
 
@@ -100,6 +106,10 @@ def load_qwen3_moe(
     if quantization and (quantization.get("quant_method") != "fp8" or not quantization.get("weight_block_size")):
         raise ValueError("only block-scaled FP8 Qwen checkpoints are supported")
     config = Qwen3MoeConfig.from_json(folder / "config.json")
+    if adapter_path is not None and lora_config is None:
+        raise ValueError("adapter_path requires lora_config")
+    if lora_config is not None and set(lora_config.targets) - set(QWEN_LORA_TARGETS):
+        raise ValueError("Qwen LoRA currently supports self_attn q_proj/k_proj/v_proj/o_proj targets only")
     index_path = folder / "model.safetensors.index.json"
     with index_path.open(encoding="utf-8") as file:
         index = json.load(file)
@@ -110,6 +120,22 @@ def load_qwen3_moe(
     expected = set(model.state_dict())
     if setup_callback is not None:
         setup_callback(model)
+    payload = read_adapter(adapter_path) if adapter_path is not None else None
+    if lora_config is not None:
+        if hasattr(model.model, "engram_tables"):
+            raise ValueError("Qwen LoRA with added Engram is not supported")
+        # assign=True preserves requires_grad from the meta parameters. Freeze
+        # root weights and every base layer before any checkpoint allocation.
+        model.requires_grad_(False)
+        if payload is not None:
+            validate_adapter_layout(model, payload)
+            modules = {f"model.layers.{layer}.{target}": asdict(lora_config)
+                       for layer in model.model.layer_ids for target in lora_config.targets}
+            if payload.get("modules") != modules:
+                raise ValueError("adapter configuration does not match the complete Qwen backbone")
+            expected_weights = {f"{name}.lora_{kind}" for name in modules for kind in ("a", "b")}
+            if set(payload.get("weights", {})) != expected_weights:
+                raise ValueError("adapter tensor names do not match the complete Qwen backbone")
     loaded = set()
     components = [("model.embed_tokens", model.model.embed_tokens)]
     components += [(f"model.layers.{index}", layer) for index, layer in enumerate(model.model.layers)]
@@ -155,6 +181,10 @@ def load_qwen3_moe(
             if result.unexpected_keys:
                 raise RuntimeError(f"unexpected checkpoint keys: {result.unexpected_keys[:5]}")
             del state
+            if lora_config is not None and prefix.startswith("model.layers."):
+                inject_lora(module, lora_config)
+                if payload is not None:
+                    load_adapter_state(module, payload, prefix=prefix)
             if module_callback is not None:
                 module_callback(prefix, module)
         model.load_bytes_read = reader.bytes_read
@@ -166,4 +196,4 @@ def load_qwen3_moe(
     return model
 
 
-__all__ = ["load_qwen3_moe"]
+__all__ = ["QWEN_LORA_TARGETS", "load_qwen3_moe"]

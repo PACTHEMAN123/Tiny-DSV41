@@ -3,6 +3,7 @@
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import time
+import weakref
 
 import torch
 from torch import nn
@@ -33,6 +34,9 @@ class RowShardedEmbedding(nn.Module):
         self.weight = nn.Parameter(torch.empty(self.row_stop - self.row_start, embedding_dim))
         self._executor = None
         self._pending = []
+        self._sparse_accumulation_parameter = None
+        self._sparse_accumulation_handle = None
+        self._sparse_accumulation_state = None
         self.metrics = {"lookup_rows": 0, "h2d_bytes": 0, "d2h_bytes": 0, "resolve_wait_seconds": 0.0}
         self.metrics.update({key: 0 for key in ("cache_hits", "cache_misses", "cache_fill_rows", "cache_evictions",
                                               "cache_invalidated_rows", "cache_metadata_h2d_bytes")})
@@ -62,6 +66,7 @@ class RowShardedEmbedding(nn.Module):
     def prefetch(self, indices):
         if self._pending:
             raise RuntimeError("resolve the pending Engram lookup before prefetching another")
+        self._ensure_sparse_accumulation_hook()
         request = self.router.prepare(indices, self.policy.deduplicate)
         device = indices.device
         self.metrics["lookup_rows"] += request.local_ids.numel()
@@ -91,6 +96,71 @@ class RowShardedEmbedding(nn.Module):
         self._pending.append(ticket)
         return ticket
 
+    def _ensure_sparse_accumulation_hook(self):
+        """Preserve raw CPU COO occurrences across separate backward calls.
+
+        CPU sparse addition can merge equal row IDs in BF16 before our optimizer
+        promotes/coalesces in FP32. CUDA sparse addition concatenates them. This
+        leaf hook gives separate microbatch backward calls the same occurrence
+        semantics without assigning an FP32 gradient to a BF16 parameter.
+
+        Multiple lookups in one backward are rejected: their gradients can merge
+        before this leaf hook. Decoder training performs one lookup per table per
+        microbatch; checkpointing the decoder does not repeat the lookup.
+        """
+        weight = self.weight
+        eligible = (self.sparse_gradients and weight.requires_grad and weight.device.type == "cpu"
+                    and weight.dtype in (torch.float16, torch.bfloat16))
+        previous = (self._sparse_accumulation_parameter()
+                    if self._sparse_accumulation_parameter is not None else None)
+        last_hook = next(reversed(weight._backward_hooks or {}), None)
+        if eligible and previous is weight:
+            if last_hook != self._sparse_accumulation_handle.id:
+                raise RuntimeError("register gradient-transform hooks before the first CPU Engram forward")
+            return
+        if self._sparse_accumulation_handle is not None:
+            self._sparse_accumulation_handle.remove()
+        self._sparse_accumulation_parameter = self._sparse_accumulation_handle = None
+        self._sparse_accumulation_state = None
+        if not eligible:
+            return
+        parameter_ref = weakref.ref(weight)
+        hook_id = [None]
+        state = {"lookup_backwards": 0}
+
+        def preserve_occurrences(incoming):
+            parameter = parameter_ref()
+            if parameter is None:
+                return incoming
+            lookups = state["lookup_backwards"]
+            state["lookup_backwards"] = 0
+            if lookups > 1:
+                raise RuntimeError("CPU low-precision Engram requires one lookup per table per backward call")
+            if torch.is_grad_enabled():
+                raise RuntimeError("CPU Engram microbatch accumulation supports first-order backward only")
+            existing = parameter.grad
+            if existing is None:
+                return incoming
+            if next(reversed(parameter._backward_hooks or {}), None) != hook_id[0]:
+                raise RuntimeError("register gradient-transform hooks before the CPU Engram forward")
+            if not incoming.is_sparse or not existing.is_sparse:
+                raise RuntimeError("CPU Engram accumulation requires sparse COO gradients")
+            # Allocate before clearing .grad so an allocation failure retains the
+            # previously accumulated gradient. Values remain in the leaf dtype.
+            combined = torch.sparse_coo_tensor(
+                torch.cat((existing._indices(), incoming._indices()), dim=1),
+                torch.cat((existing._values(), incoming._values()), dim=0),
+                incoming.shape, dtype=incoming.dtype, device=incoming.device,
+                is_coalesced=False,
+            )
+            parameter.grad = None
+            return combined
+
+        self._sparse_accumulation_parameter = parameter_ref
+        self._sparse_accumulation_state = state
+        self._sparse_accumulation_handle = weight.register_hook(preserve_occurrences)
+        hook_id[0] = self._sparse_accumulation_handle.id
+
     def resolve(self, ticket):
         if ticket.resolved:
             raise RuntimeError("Engram lookup ticket was already consumed")
@@ -102,6 +172,14 @@ class RowShardedEmbedding(nn.Module):
             if result.event is not None:
                 torch.cuda.current_stream(ticket.device).wait_event(result.event)
                 result.rows.record_stream(torch.cuda.current_stream(ticket.device))
+            if self._sparse_accumulation_state is not None and result.rows.requires_grad:
+                state = self._sparse_accumulation_state
+
+                def count_lookup_backward(gradient):
+                    state["lookup_backwards"] += 1
+                    return gradient
+
+                result.rows.register_hook(count_lookup_backward)
             return self.router.complete(result.rows, ticket.request)
         finally:
             self.metrics["resolve_wait_seconds"] += time.perf_counter() - started
@@ -137,3 +215,7 @@ class RowShardedEmbedding(nn.Module):
             ticket.resolved = True
         self._pending.clear()
         self.clear_cache()
+        if self._sparse_accumulation_handle is not None:
+            self._sparse_accumulation_handle.remove()
+        self._sparse_accumulation_parameter = self._sparse_accumulation_handle = None
+        self._sparse_accumulation_state = None

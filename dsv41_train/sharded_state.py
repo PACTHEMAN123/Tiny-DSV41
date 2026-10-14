@@ -85,7 +85,7 @@ class StateAdapter:
             logical = name
             if name.startswith(prefix):
                 index, tail = name[len(prefix):].split(".", 1)
-                logical = prefix + str(decoder.layers[int(index)].layer_id) + "." + tail
+                logical = prefix + str(getattr(decoder.layers[int(index)], "layer_id", int(index))) + "." + tail
             self.names[name] = logical
         self.inverse = {logical: name for name, logical in self.names.items()}
 
@@ -144,7 +144,13 @@ class StateAdapter:
 
     def _wrap(self, name, tensor):
         layout = self.layouts.get(name)
-        if (layout is not None and layout.role == "engram" and isinstance(tensor, torch.Tensor)
+        # Fused Qwen experts carry a rank-local expert axis, even when a DTensor
+        # also shards that axis over the expert-FSDP subgroup. DCP needs the
+        # offsets in the full expert axis, not just those of that subgroup.
+        explicit_shard = layout is not None and (
+            layout.role == "engram" or ".mlp.experts." in name
+        )
+        if (explicit_shard and isinstance(tensor, torch.Tensor)
                 and tensor.shape == self.model.get_parameter(name).shape):
             return TensorShard(tensor, layout.global_shape, layout.offsets)
         return tensor

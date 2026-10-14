@@ -42,6 +42,8 @@ class LoRALinear(nn.Linear):
             self.bias.requires_grad_(False)
         self.config = config
         self.scaling = config.alpha / config.rank
+        # Evaluation can bypass adapters without modifying weights or state_dict.
+        self.adapters_enabled = True
         self.lora_a = nn.Parameter(base.weight.new_empty(config.rank, self.in_features))
         self.lora_b = nn.Parameter(base.weight.new_zeros(self.out_features, config.rank))
         nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
@@ -55,7 +57,7 @@ class LoRALinear(nn.Linear):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         result = F.linear(x, self.weight, self.bias)
-        if not self.merged:
+        if self.adapters_enabled and not self.merged:
             update = F.linear(F.linear(self.dropout(x), self.lora_a), self.lora_b)
             result = result + update * self.scaling
         return result
