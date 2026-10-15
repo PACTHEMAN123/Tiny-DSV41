@@ -131,7 +131,21 @@ class RowShardedEmbedding(nn.Module):
             return self._cpu_lookup(self.weight, indices, device=indices.device)
         return F.embedding(indices, self.weight, sparse=self.sparse_gradients)
 
+    def configure_cache(self, budget_bytes: int, device) -> None:
+        if self._cpu_lookup is None:
+            raise ValueError("Engram row caching requires CPU offload")
+        self._cpu_lookup.configure_cache(budget_bytes, device)
+
+    def clear_cache(self) -> None:
+        if self._cpu_lookup is not None:
+            self._cpu_lookup.clear_cache()
+
+    def synchronize(self) -> None:
+        if self._cpu_lookup is not None:
+            self._cpu_lookup.synchronize()
+
     def _apply(self, fn, recurse=True):
+        self.clear_cache()
         if self.engram_offload and not self.weight.is_meta:
             if fn(torch.empty(0, dtype=self.weight.dtype, device="cpu")).device.type != "cpu":
                 raise ValueError("CPU Engram placement is explicit; load the table directly on CPU")

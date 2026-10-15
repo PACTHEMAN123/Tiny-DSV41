@@ -75,6 +75,15 @@ combination defaults to SGD and requires it explicitly when overriding the
 optimizer. Sparse row gradients are combined in FP32 before each update.
 Frozen CPU tables remain compatible with LoRA's AdamW optimizer.
 
+`--engram-cache-mib 128` optionally caches queried CPU rows on each rank's GPU.
+The per-rank budget is divided across selected tables and includes row values
+and CPU tags; request outputs and transfer staging are additional temporary
+memory. Every lookup occurrence still contributes a gradient, including cache
+hits. SGD updates and checkpoint restores invalidate cached rows; frozen tables
+retain them between steps. Per-step metrics report global hits/misses, rows
+transferred, hit rate and maximum per-rank resident bytes. The default budget is
+zero. This cache is synchronous; asynchronous prefetch is not yet implemented.
+
 Metrics record actual input lengths, loss, per-step time and GPU allocated and
 reserved peaks. Optional greedy evaluation uses prompt tokens only, before and
 after training. A reduced model's results do not establish full-model quality.

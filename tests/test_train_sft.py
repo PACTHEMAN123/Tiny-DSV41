@@ -162,6 +162,13 @@ class SFTTrainTests(unittest.TestCase):
                     validate_args(parse_args(base + options), 1)
             with self.assertRaisesRegex(ValueError, "require the DSV4"):
                 validate_args(parse_args(base + ["--family", "qwen", "--engram-offload"]), 1)
+            for options in (["--engram-cache-mib", "1"],
+                            ["--engram-offload", "--engram-cache-mib", "-1"]):
+                with self.assertRaisesRegex(ValueError, "engram-cache-mib"):
+                    validate_args(parse_args(base + options), 1)
+            cached = parse_args(base + ["--engram-offload", "--engram-cache-mib", "32"])
+            validate_args(cached, 1)
+            self.assertEqual(cached.engram_cache_mib, 32)
 
 
 if __name__ == "__main__":

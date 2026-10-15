@@ -45,6 +45,7 @@ def parse_args(argv=None):
     parser.add_argument("--lora-dropout", type=float, default=0.0)
     parser.add_argument("--lora-targets", help="Comma-separated layer-relative linear module suffixes")
     parser.add_argument("--engram-offload", action="store_true", help="Keep DSV4 Engram row shards on CPU")
+    parser.add_argument("--engram-cache-mib", type=int, default=0, help="Per-rank row cache budget including tags, split across offloaded tables")
     parser.add_argument("--train-engram", action="store_true", help="Also update Engram tables in LoRA mode (SGD)")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -69,6 +70,8 @@ def validate_args(args, world_size):
         raise ValueError("this topology requires cp-size == ep-size")
     if args.family != "dsv4" and (args.engram_offload or args.train_engram):
         raise ValueError("Engram options require the DSV4 model family")
+    if args.engram_cache_mib < 0 or (args.engram_cache_mib and not args.engram_offload):
+        raise ValueError("engram-cache-mib must be nonnegative and requires engram-offload")
     if args.seq_len % args.cp_size:
         raise ValueError("seq-len must divide evenly across cp-size")
     for name in ("config.json", "model.safetensors.index.json"):
@@ -80,6 +83,8 @@ def validate_args(args, world_size):
         args.num_layers = config.num_hidden_layers if args.num_layers is None else args.num_layers
         if not 1 <= args.num_layers <= config.num_hidden_layers:
             raise ValueError("num-layers must select a nonempty DSV4 backbone prefix")
+        if args.engram_cache_mib and not any(layer < args.num_layers for layer in config.engram_layer_ids):
+            raise ValueError("the selected backbone has no Engram table to cache")
         experts = config.n_routed_experts
     else:
         from dsv41_train.models.qwen import Qwen3MoeConfig
@@ -130,6 +135,11 @@ def load_model(args, runtime):
                     parameter.requires_grad_(False)
             model.model.engram_tables.requires_grad_(args.train_engram)
         apply_fsdp2_root(model, meshes)
+        if args.engram_cache_mib:
+            tables = list(model.model.engram_tables.values())
+            budget, remainder = divmod(args.engram_cache_mib * 2**20, len(tables))
+            for index, table in enumerate(tables):
+                table.configure_cache(budget + (index < remainder), runtime.device)
         synchronize = lambda: synchronize_cp_gradients(model, cp)
     else:
         from dsv41_train.models.qwen import load_qwen3_moe
@@ -242,6 +252,13 @@ def _max_metrics(runtime, **values):
     return dict(zip(values, _reduce(tensor, runtime, dist.ReduceOp.MAX).tolist()))
 
 
+def _cache_counts(model):
+    counters = [table._cpu_lookup.cache_metrics for table in model.model.engram_tables.values()
+                if table._cpu_lookup is not None]
+    return {key: sum(item[key] for item in counters)
+            for key in ("hits", "misses", "transferred_rows", "resident_bytes")}
+
+
 def train(args, runtime):
     from dsv41_train.sft_checkpoint import load_checkpoint, save_checkpoint
     validate_args(args, runtime.world_size)
@@ -318,12 +335,22 @@ def train(args, runtime):
         torch.cuda.synchronize(runtime.device)
         torch.cuda.reset_peak_memory_stats(runtime.device)
         step_started = time.perf_counter()
+        cache_before = _cache_counts(model) if args.engram_cache_mib else None
         metrics = train_update(model, optimizer, batches, family=args.family, runtime=runtime,
                                cp_size=args.cp_size, synchronize=synchronize)
         torch.cuda.synchronize(runtime.device)
         metrics.update(_max_metrics(runtime, seconds=time.perf_counter() - step_started,
                                     peak_allocated_gib=torch.cuda.max_memory_allocated(runtime.device) / 2**30,
                                     peak_reserved_gib=torch.cuda.max_memory_reserved(runtime.device) / 2**30))
+        if cache_before is not None:
+            cache_after = _cache_counts(model)
+            keys = ("hits", "misses", "transferred_rows")
+            counts = torch.tensor([cache_after[key] - cache_before[key] for key in keys],
+                                  device=runtime.device, dtype=torch.int64)
+            counters = dict(zip(keys, _reduce(counts, runtime).tolist()))
+            counters["hit_rate"] = counters["hits"] / max(1, counters["hits"] + counters["misses"])
+            counters.update(_max_metrics(runtime, max_rank_resident_bytes=cache_after["resident_bytes"]))
+            metrics["engram_cache"] = counters
         train_step_seconds_total += metrics["seconds"]
         cursor = next_cursor
         emit({"event": "train", "step": step, "data_position": cursor, **metrics})
