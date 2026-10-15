@@ -109,7 +109,9 @@ class AttentionSinks(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(num_heads))
 
-    def forward(self) -> torch.Tensor:
+    def forward(self, reference: torch.Tensor | None = None) -> torch.Tensor:
+        # Frozen sinks may re-enter FSDP from checkpoint recomputation. PyTorch
+        # 2.11's root input-move hook requires a nonempty argument tuple.
         # Materialize the parameter before nested FSDP releases its storage.
         return self.weight.clone()
 
@@ -476,7 +478,7 @@ class CSA2Attention(nn.Module):
         compressed_kv: torch.Tensor | None,
         compressed_indices: torch.Tensor | None,
     ) -> torch.Tensor:
-        sinks = self.sinks()
+        sinks = self.sinks(query)
         if triton_attention_available(query) and not (self.training and self.dropout):
             return sparse_attention(
                 query,
