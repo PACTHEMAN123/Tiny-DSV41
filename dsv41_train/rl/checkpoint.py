@@ -45,13 +45,25 @@ def atomic_save(payload: dict, destination: str | Path) -> None:
 
 
 def policy_state(model) -> dict:
-    return {
+    state = {
         "trainable": model.trainable_state_dict(),
         "frozen": model.frozen_state_dict(include_engram=False),
     }
+    if getattr(model, "lora_metadata", None) is not None:
+        state.update(adapter_format=1, adapter=model.lora_metadata)
+    return state
 
 
 def load_policy(model, state: dict) -> None:
+    metadata = getattr(model, "lora_metadata", None)
+    if metadata is not None or "adapter_format" in state:
+        required = {"trainable", "frozen", "adapter_format", "adapter"}
+        if (not required.issubset(state)
+                or state.keys() - required - {"version", "lineage", "identity", "sampling"}
+                or state["adapter_format"] != 1 or metadata is None or state["adapter"] != metadata):
+            raise ValueError("LoRA policy configuration or initial adapter identity differs")
+        if state["frozen"]:
+            raise ValueError("LoRA policy artifacts must not include frozen base weights")
     model.load_trainable_state_dict(state["trainable"])
     model.load_frozen_state_dict(state["frozen"], include_engram=False)
     model.assert_engram_invariants()
@@ -66,6 +78,8 @@ def publish_policy_artifact(model, version: int, directory: str | Path, *,
     """Stage immutable weights; a consumer must explicitly activate this artifact."""
     if type(version) is not int or version < 0 or not isinstance(lineage, str) or not lineage:
         raise ValueError("policy artifact requires a nonnegative version and run lineage")
+    if getattr(model, "lora_metadata", None) is not None and identity.get("lora") != model.lora_metadata:
+        raise ValueError("policy publication LoRA identity differs from loaded model")
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     payload = {"version": version, "lineage": lineage, "identity": identity,
@@ -126,6 +140,15 @@ def run_identity(model_dir: str | Path, data_path: str | Path, random_init: bool
         identity["text_assets_sha256"] = assets
     if eval_data_path is not None:
         identity["eval_data_sha256"] = hashlib.sha256(Path(eval_data_path).read_bytes()).hexdigest()
+    return identity
+
+
+def add_lora_identity(identity, config, model_config):
+    """Bind the initial SFT adapter and random-base seed to every policy version."""
+    if config.trainable_scope == "lora":
+        from .family import lora_metadata, policy_lora_config
+        identity.update(trainable_scope="lora", initialization_seed=config.seed,
+                        lora=lora_metadata(policy_lora_config(config, model_config), config.initial_adapter))
     return identity
 
 

@@ -37,16 +37,19 @@ class QwenPolicy(nn.Module):
     def __init__(self, backend, *, trainable_scope="all"):
         super().__init__()
         validate_qwen_config(backend.config)
-        if trainable_scope not in {"all", "lm_head"}:
-            raise ValueError("Qwen trainable_scope must be all or lm_head")
+        if trainable_scope not in {"all", "lm_head", "lora"}:
+            raise ValueError("Qwen trainable_scope must be all, lm_head or lora")
         if backend.context_parallel.enabled:
             raise ValueError("RL layer placement requires a local Qwen policy without context parallelism")
         self.backend, self.config = backend, backend.config
         self.trainable_scope = trainable_scope
         self.qwen_last_position_only = False
         self.qwen_kv_cache = False
-        for name, parameter in self.named_parameters():
-            parameter.requires_grad_(trainable_scope == "all" or name == "backend.lm_head.weight")
+        if trainable_scope != "lora":
+            for name, parameter in self.named_parameters():
+                parameter.requires_grad_(trainable_scope == "all" or name == "backend.lm_head.weight")
+        elif not any(name.endswith(".lora_a") and p.requires_grad for name, p in self.named_parameters()):
+            raise ValueError("inject LoRA before constructing a Qwen LoRA policy")
         self._capture_frozen()
 
     def _capture_frozen(self):
@@ -213,11 +216,17 @@ class QwenPolicy(nn.Module):
         return self.backend.lm_head(hidden)
 
 
-def build_qwen_policy(model_dir, config, *, random_init, devices, dtype, trainable_scope="all"):
+def build_qwen_policy(model_dir, config, *, random_init, devices, dtype, trainable_scope="all",
+                      lora_config=None, initial_adapter=None):
     validate_qwen_config(config)
     layer_device_map(config.num_hidden_layers, devices)
     validate_available_devices(devices)
     backend = Qwen3MoeForCausalLM(config) if random_init else load_qwen3_moe(model_dir, dtype=dtype)
     if backend.config.to_dict() != config.to_dict():
         raise ValueError("Qwen mounted checkpoint configuration differs from requested architecture")
+    if lora_config is not None:
+        from dsv41_train.lora import inject_lora, load_adapter
+        inject_lora(backend, lora_config)
+        if initial_adapter is not None:
+            load_adapter(backend, initial_adapter)
     return QwenPolicy(backend, trainable_scope=trainable_scope).to_training_devices(devices, dtype)

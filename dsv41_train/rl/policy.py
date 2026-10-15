@@ -100,10 +100,11 @@ class _FrozenEmbedding(nn.Module):
 class DSV41Policy(nn.Module):
     supports_token_log_probs = True
 
-    def __init__(self, backend, *, engram_offload=True):
+    def __init__(self, backend, *, engram_offload=True, trainable_scope="all"):
         super().__init__()
         self.backend = backend
         self.config = backend.config
+        self.trainable_scope = trainable_scope
         self.engram_offload = engram_offload
         self.cpu_engram = {}
         for name, table in list(backend.model.engram_tables.items()):
@@ -120,6 +121,11 @@ class DSV41Policy(nn.Module):
                 layer.attention.indexer.stable_topk = True
                 layer.attention.indexer.requires_grad_(False)
         self.assert_engram_invariants()
+
+    def _capture_frozen(self):
+        if self.trainable_scope == "lora":
+            self._frozen_base = {name: (p, p._version) for name, p in self.named_parameters()
+                                 if not p.requires_grad}
 
     @property
     def engram_device(self):
@@ -138,6 +144,11 @@ class DSV41Policy(nn.Module):
                                     for table in tables.values())
 
     def assert_engram_invariants(self):
+        if hasattr(self, "_frozen_base"):
+            current = dict(self.named_parameters())
+            for name, (parameter, version) in self._frozen_base.items():
+                if current.get(name) is not parameter or parameter._version != version or parameter.requires_grad:
+                    raise RuntimeError(f"immutable DeepSeek base parameter changed: {name}")
         for table in self.backend.model.engram_tables.values():
             if table.weight.requires_grad or list(table.parameters()):
                 raise RuntimeError("Engram tables must remain frozen buffers")
@@ -150,6 +161,7 @@ class DSV41Policy(nn.Module):
 
     def _apply(self, fn, recurse=True):
         # Preserve upstream FP32 precision islands before any lossy dtype cast.
+        self.assert_engram_invariants()
         parameters = [(p, p.data, p.grad) for module in self.backend.modules()
                       if isinstance(module, (HyperConnection, AttentionSinks))
                       for p in module.parameters(recurse=False)]
@@ -166,6 +178,7 @@ class DSV41Policy(nn.Module):
         rotary.compressed = frequencies[1].to(device=rotary.compressed.device, dtype=torch.float32)
         for router, value in routing_biases:
             router.selection_bias = value.to(device=router.selection_bias.device, dtype=torch.float32)
+        self._capture_frozen()
         self.assert_engram_invariants()
         return self
 
@@ -181,6 +194,7 @@ class DSV41Policy(nn.Module):
                 model.engram_tables[str(layer.layer_id)].to(device)
         model.norm.to(placement[-1])
         self.backend.lm_head.to(placement[-1])
+        self._capture_frozen()
         self.assert_engram_invariants()
         return self
 
@@ -192,9 +206,13 @@ class DSV41Policy(nn.Module):
         return state
 
     def trainable_state_dict(self):
+        self.assert_engram_invariants()
         return {name: value.detach().cpu().clone() for name, value in self._partition(True).items()}
 
     def frozen_state_dict(self, *, include_engram=False):
+        self.assert_engram_invariants()
+        if self.trainable_scope == "lora":
+            return {}
         return {name: value.detach().cpu().clone()
                 for name, value in self._partition(False, include_engram).items()}
 
@@ -213,6 +231,11 @@ class DSV41Policy(nn.Module):
         self._load_partition(state, self._partition(True))
 
     def load_frozen_state_dict(self, state, *, include_engram=False):
+        if self.trainable_scope == "lora":
+            if state:
+                raise ValueError("LoRA frozen weights reconstruct from the identified base")
+            self.assert_engram_invariants()
+            return
         self._load_partition(state, self._partition(False, include_engram))
 
     def forward(self, input_ids, attention_mask=None, *, target_ids=None, target_mask=None,
@@ -325,7 +348,7 @@ def _load_native(root, config, engram_weights=None):
 
 
 def build_dsv41_policy(model_dir, config, *, random_init, devices, dtype,
-                       engram_weights=None, engram_offload=True):
+                       engram_weights=None, engram_offload=True, lora_config=None, initial_adapter=None):
     layer_device_map(config.num_hidden_layers, devices)
     validate_available_devices(devices)
     _validate_engram_weights(config, engram_weights)
@@ -343,4 +366,10 @@ def build_dsv41_policy(model_dir, config, *, random_init, devices, dtype,
         backend.config = config
     else:
         backend = _load_native(Path(model_dir), config, engram_weights)
-    return DSV41Policy(backend, engram_offload=engram_offload).to_training_devices(devices, dtype)
+    if lora_config is not None:
+        from dsv41_train.lora import inject_lora, load_adapter
+        inject_lora(backend, lora_config)
+        if initial_adapter is not None:
+            load_adapter(backend, initial_adapter)
+    return DSV41Policy(backend, engram_offload=engram_offload,
+                       trainable_scope="lora" if lora_config is not None else "all").to_training_devices(devices, dtype)

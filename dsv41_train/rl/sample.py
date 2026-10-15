@@ -9,7 +9,7 @@ from typing import Optional, Sequence
 
 import torch
 
-from .checkpoint import checkpoint_config, load_policy, run_identity, validate_identity
+from .checkpoint import add_lora_identity, checkpoint_config, load_policy, run_identity, validate_identity
 from .data import PromptRecord
 from .evaluation import decoded_fields
 from .family import load_model_config
@@ -48,6 +48,9 @@ def load_checkpoint_model(
     random_init = identity["random_init"]
     model_config = load_model_config(model_dir)
     current_identity = run_identity(model_dir, model_dir / "config.json", random_init)
+    initial_config = checkpoint_config(state["config"], model_config,
+                                       rollout_engine=identity.get("rollout_engine"))
+    add_lora_identity(current_identity, initial_config, model_config)
     if getattr(model_config, "model_type", None) == "qwen3_moe":
         current_identity["trainable_scope"] = state["config"].get("trainable_scope", "all")
     validate_identity(identity, current_identity, inference=True)

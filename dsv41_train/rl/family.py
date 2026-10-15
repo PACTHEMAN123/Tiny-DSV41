@@ -2,9 +2,27 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 from .policy import DSV41Config, build_dsv41_policy
+
+
+def policy_lora_config(config, model_config):
+    if config.trainable_scope != "lora":
+        return None
+    from dsv41_train.lora import LoRAConfig
+    targets = config.lora_targets
+    if targets is None:
+        targets = (("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj")
+                   if getattr(model_config, "model_type", None) == "qwen3_moe" else LoRAConfig().targets)
+    return LoRAConfig(config.lora_rank, config.lora_alpha, config.lora_dropout, targets)
+
+
+def lora_metadata(config, initial_adapter):
+    from .checkpoint import file_sha256
+    return json.loads(json.dumps({"config": asdict(config),
+        "initial_adapter_sha256": file_sha256(initial_adapter) if initial_adapter is not None else None}))
 
 
 def load_model_config(model_dir):
@@ -36,16 +54,29 @@ def load_model_config(model_dir):
 
 
 def build_policy(model_dir, model_config, *, random_init, devices, dtype,
-                 engram_weights=None, engram_offload=True, trainable_scope="all"):
+                 engram_weights=None, engram_offload=True, trainable_scope="all",
+                 lora_config=None, initial_adapter=None):
+    if (trainable_scope == "lora") != (lora_config is not None):
+        raise ValueError("LoRA scope requires an explicit adapter configuration")
+    if initial_adapter is not None and lora_config is None:
+        raise ValueError("initial_adapter requires LoRA")
+    if lora_config is not None and lora_config.dropout != 0:
+        raise ValueError("LoRA RL requires dropout=0")
     if getattr(model_config, "model_type", None) == "qwen3_moe":
         if engram_weights:
             raise ValueError("Qwen policies do not have Engram tables")
         from .qwen_policy import build_qwen_policy
 
-        return build_qwen_policy(model_dir, model_config, random_init=random_init,
-                                 devices=devices, dtype=dtype, trainable_scope=trainable_scope)
-    if trainable_scope != "all":
-        raise ValueError("DeepSeek RL currently requires trainable_scope=all")
-    return build_dsv41_policy(model_dir, model_config, random_init=random_init,
-                              devices=devices, dtype=dtype, engram_weights=engram_weights,
-                              engram_offload=engram_offload)
+        model = build_qwen_policy(model_dir, model_config, random_init=random_init,
+                                 devices=devices, dtype=dtype, trainable_scope=trainable_scope,
+                                 lora_config=lora_config, initial_adapter=initial_adapter)
+    else:
+        if trainable_scope not in {"all", "lora"}:
+            raise ValueError("DeepSeek RL requires trainable_scope=all or lora")
+        model = build_dsv41_policy(model_dir, model_config, random_init=random_init,
+                                  devices=devices, dtype=dtype, engram_weights=engram_weights,
+                                  engram_offload=engram_offload,
+                                  lora_config=lora_config, initial_adapter=initial_adapter)
+    if lora_config is not None:
+        model.lora_metadata = lora_metadata(lora_config, initial_adapter)
+    return model

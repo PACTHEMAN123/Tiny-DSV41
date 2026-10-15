@@ -23,8 +23,9 @@ def main():
     parser.add_argument("--rollout-num-gpus", type=int, help="rollout GPU count; allocated after trainer GPUs")
     parser.add_argument("--rollout-engine", choices=("vllm", "native-pytorch"),
                         help="vllm by default; native-pytorch explicitly selects legacy sampling")
-    parser.add_argument("--trainable-scope", choices=("all", "lm_head"),
-                        help="all for DeepSeek; all or lm_head for Qwen3 MoE")
+    parser.add_argument("--trainable-scope", choices=("all", "lm_head", "lora"),
+                        help="LoRA requires the native-pytorch rollout engine")
+    parser.add_argument("--initial-adapter", help="portable SFT adapter; requires trainable-scope=lora")
     parser.add_argument("--engram-offload", action=argparse.BooleanOptionalAction, default=None,
                         help="keep frozen Engram in shared CPU memory (default: enabled)")
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=None,
@@ -39,6 +40,8 @@ def main():
         values["output_dir"] = args.output_dir
     if args.trainable_scope is not None:
         values["trainable_scope"] = args.trainable_scope
+    if args.initial_adapter is not None:
+        values["initial_adapter"] = args.initial_adapter
     if args.trainer_num_gpus is not None or args.rollout_num_gpus is not None:
         if args.trainer_num_gpus is None or args.rollout_num_gpus is None:
             parser.error("specify both --trainer-num-gpus and --rollout-num-gpus")

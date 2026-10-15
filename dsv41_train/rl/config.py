@@ -26,6 +26,11 @@ class RLConfig:
     rollout_engine: str = "vllm"
     engram_offload: bool = True
     trainable_scope: str = "all"
+    lora_rank: int = 8
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.0
+    lora_targets: tuple[str, ...] | None = None
+    initial_adapter: str | None = None
     qwen_last_position_only: bool = False
     qwen_kv_cache: bool = False
     backprop_chunk_tokens: int = 0
@@ -63,6 +68,8 @@ class RLConfig:
         for name in ("learner_devices", "rollout_devices"):
             if name in values:
                 values[name] = tuple(values[name])
+        if values.get("lora_targets") is not None:
+            values["lora_targets"] = tuple(values["lora_targets"])
         if "stop_token_sequences" in values:
             values["stop_token_sequences"] = tuple(tuple(ids) for ids in values["stop_token_sequences"])
         if values.get("eos_token_ids") is not None:
@@ -119,8 +126,18 @@ class RLConfig:
             raise ValueError("clip_eps must be in (0, 1)")
         if self.dtype not in ("float32", "bfloat16"):
             raise ValueError("dtype must be float32 or bfloat16")
-        if self.trainable_scope not in {"all", "lm_head"}:
-            raise ValueError("trainable_scope must be all or lm_head")
+        if self.trainable_scope not in {"all", "lm_head", "lora"}:
+            raise ValueError("trainable_scope must be all, lm_head or lora")
+        if self.trainable_scope == "lora":
+            from dsv41_train.lora import LoRAConfig
+            LoRAConfig(self.lora_rank, self.lora_alpha, self.lora_dropout,
+                       self.lora_targets if self.lora_targets is not None else LoRAConfig().targets)
+            if self.rollout_engine != "native-pytorch" or self.lora_dropout != 0:
+                raise ValueError("LoRA RL requires native-pytorch and lora_dropout=0")
+        elif self.initial_adapter is not None:
+            raise ValueError("initial_adapter requires trainable_scope=lora")
+        if self.initial_adapter is not None and (not isinstance(self.initial_adapter, str) or not self.initial_adapter):
+            raise ValueError("initial_adapter must be a nonempty path or null")
         if type(self.qwen_last_position_only) is not bool:
             raise ValueError("qwen_last_position_only must be a boolean")
         if type(self.qwen_kv_cache) is not bool:

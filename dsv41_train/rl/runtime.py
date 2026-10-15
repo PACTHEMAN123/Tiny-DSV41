@@ -13,11 +13,12 @@ import torch
 
 from .algorithm import group_advantages, grpo_loss, response_log_probs
 from .checkpoint import (load_training_checkpoint, publish_policy_artifact,
-                         run_identity, save_training_checkpoint, load_policy_artifact, validate_identity)
+                         run_identity, save_training_checkpoint, load_policy_artifact, validate_identity,
+                         add_lora_identity)
 from .config import RLConfig
 from .data import build_reward, load_jsonl
 from .evaluation import append_jsonl, evaluate_policy, sample_record
-from .family import build_policy, load_model_config
+from .family import build_policy, load_model_config, policy_lora_config
 from .parallel import layer_device_map, validate_available_devices
 from .rollout import generation_options
 from .tokenizer import ModelTokenizer
@@ -35,7 +36,9 @@ def make_model(model_dir, model_config, config, devices, random_init, *, engram_
     model = build_policy(model_dir, model_config, random_init=random_init,
                               devices=devices, dtype=getattr(torch, config.dtype),
                               engram_weights=engram_weights, engram_offload=config.engram_offload,
-                              trainable_scope=config.trainable_scope)
+                              trainable_scope=config.trainable_scope,
+                              lora_config=policy_lora_config(config, model_config),
+                              initial_adapter=config.initial_adapter)
     if qwen:
         model.qwen_last_position_only = last_position
         model.qwen_kv_cache = config.qwen_kv_cache
@@ -281,6 +284,7 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
     reward_fn = build_reward(config.reward, tokenizer=tokenizer)
     validate_reward_records(records + eval_records, reward_fn, config.reward)
     identity = run_identity(model_dir, data_path, random_init, eval_data_path=eval_data_path)
+    add_lora_identity(identity, config, model_config)
     if getattr(model_config, "model_type", None) == "qwen3_moe":
         identity["trainable_scope"] = config.trainable_scope
         if config.qwen_last_position_only:
