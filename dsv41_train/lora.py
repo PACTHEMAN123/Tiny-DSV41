@@ -157,14 +157,16 @@ def _layer_ids(model):
 def save_adapter(model: nn.Module, path: str | Path):
     """All FSDP ranks participate; rank zero writes A/B only, without base weights."""
     modules = _adapter_modules(model)
+    writer = not dist.is_initialized() or dist.get_rank() == 0
     weights = {}
     for name, module in modules.items():
         for key in ("lora_a", "lora_b"):
             value = getattr(module, key).detach()
             if hasattr(value, "full_tensor"):
                 value = value.full_tensor()
-            weights[_key(name, key)] = value.cpu()
-    if not dist.is_initialized() or dist.get_rank() == 0:
+            if writer:
+                weights[_key(name, key)] = value.cpu()
+    if writer:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"format_version": 1, "layer_ids": _layer_ids(model),
