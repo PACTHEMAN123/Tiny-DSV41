@@ -115,7 +115,8 @@ def export_sft_bundle(model, checkpoint, model_path, output):
         error = f"rank {rank}: {exc}"
     _collect({"error": error})
     try:
-        save_adapter(model, output / "adapter.pt")  # Existing live FSDP collectives; no shard reconstruction.
+        # Existing live FSDP collectives; no shard reconstruction.
+        save_adapter(model, output / "adapter.pt", base_identity=base["source"])
     except Exception as exc:
         error = f"rank {rank}: {exc}"
     _collect({"error": error})

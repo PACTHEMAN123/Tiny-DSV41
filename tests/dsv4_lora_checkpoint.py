@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 
 from dsv41_train.lora import (
-    LoRAConfig, adapter_parameters, inject_lora, load_adapter_state,
+    LoRAConfig, adapter_base_identity, adapter_parameters, inject_lora, load_adapter_state,
     read_adapter, save_adapter, validate_adapter_layout,
 )
 from dsv41_train.models.dsv4 import load_dsv41_backbone_window
@@ -44,14 +44,15 @@ def main():
     started = time.perf_counter()
     meshes, cp, dispatcher = build_parallelism(args.cp_size, args.ep_size)
     config = LoRAConfig(rank=args.rank, alpha=2.0 * args.rank)
-    payload = read_adapter(args.load_adapter) if args.load_adapter else None
+    base_identity = adapter_base_identity(args.model_path)
+    payload = read_adapter(args.load_adapter, base_identity=base_identity) if args.load_adapter else None
     loaded = 0
 
     def layer_loaded(layer):
         nonlocal loaded
         inject_lora(layer, config)
         if payload is not None:
-            load_adapter_state(layer, payload, prefix=f"model.layers.{loaded}")
+            load_adapter_state(layer, payload, prefix=f"model.layers.{loaded}", base_identity=base_identity)
         apply_fsdp2_layer(layer, meshes)
         loaded += 1
         if runtime.is_main:
@@ -118,7 +119,7 @@ def main():
     if runtime.is_main:
         output.mkdir(parents=True, exist_ok=True)
     dist.barrier()
-    save_adapter(model, output / "adapter.pt")
+    save_adapter(model, output / "adapter.pt", base_identity=base_identity)
     torch.cuda.synchronize(runtime.device)
     peak = torch.tensor(torch.cuda.max_memory_allocated(runtime.device), device=runtime.device)
     dist.all_reduce(peak, op=dist.ReduceOp.MAX)

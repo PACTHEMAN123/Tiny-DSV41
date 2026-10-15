@@ -1,6 +1,9 @@
 import copy
+import os
+import shutil
 import tempfile
 import unittest
+import warnings
 from dataclasses import replace
 from pathlib import Path
 
@@ -8,7 +11,7 @@ import torch
 from torch import nn
 
 from dsv41_train.lora import (
-    LoRAConfig, LoRALinear, adapter_parameters, inject_lora, load_adapter,
+    LoRAConfig, LoRALinear, adapter_base_identity, adapter_parameters, inject_lora, load_adapter,
     load_adapter_state, merge_adapters, read_adapter, save_adapter, unmerge_adapters,
 )
 
@@ -113,7 +116,13 @@ class LoRATest(unittest.TestCase):
             self.assertEqual(payload["layer_ids"], [2, 3])
             self.assertEqual(len(payload["weights"]), 4)
             self.assertTrue(all(name.endswith(("lora_a", "lora_b")) for name in payload["weights"]))
-            load_adapter(restored, path)
+            self.assertEqual(payload["format_version"], 1)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", RuntimeWarning)
+                load_adapter(restored, path)
+            self.assertTrue(any(issubclass(item.category, RuntimeWarning)
+                                and "base weights and tokenizer cannot be verified" in str(item.message)
+                                for item in caught))
             inputs = torch.randn(2, 4)
             torch.testing.assert_close(restored(inputs), model(inputs), rtol=0, atol=0)
             for index, layer in enumerate(restored.model.layers):
@@ -125,6 +134,55 @@ class LoRATest(unittest.TestCase):
             restored.model.layer_ids = [0, 1]
             with self.assertRaisesRegex(ValueError, "layer window"):
                 load_adapter(restored, path)
+
+    def test_bound_adapter_rejects_source_changes_before_mutation(self):
+        model, restored = TinyModel(), TinyModel()
+        for item in (model, restored):
+            inject_lora(item, self.config)
+        before = copy.deepcopy(restored.state_dict())
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "base"
+            folder.mkdir()
+            (folder / "config.json").write_text('{"hidden_size":4}')
+            (folder / "tokenizer.json").write_text('{"vocab":["a"]}')
+            torch.save(TinyModel().state_dict(), folder / "pytorch_model.bin")
+            identity = adapter_base_identity(folder)
+            path = folder / "adapter.pt"
+            save_adapter(model, path, base_identity=identity)
+            payload = read_adapter(path)
+            self.assertEqual(payload["format_version"], 2)
+            self.assertEqual(payload["base_identity"], identity)
+            for changed in (None, "config.json", "tokenizer.json", "pytorch_model.bin"):
+                wrong = None
+                if changed:
+                    other = Path(directory) / changed
+                    shutil.copytree(folder, other)
+                    self.assertEqual(adapter_base_identity(other), identity)
+                    if changed == "pytorch_model.bin":
+                        state = torch.load(other / changed, weights_only=True)
+                        state["head.weight"].add_(1)  # Same architecture, different frozen base weights.
+                        torch.save(state, other / changed)
+                        stat = (folder / changed).stat()
+                        os.utime(other / changed, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
+                    else:
+                        (other / changed).write_text('{"hidden_size":4,"revision":2}' if changed == "config.json"
+                                                    else '{"vocab":["b"]}')
+                    wrong = adapter_base_identity(other)
+                with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, "base identity"):
+                    load_adapter(restored, path, base_identity=wrong)
+                for name, parameter in restored.state_dict().items():
+                    torch.testing.assert_close(parameter, before[name], rtol=0, atol=0)
+            # Inspecting a payload is allowed; applying it directly or one layer
+            # at a time must enforce the same binding as the file loader.
+            with self.assertRaisesRegex(ValueError, "base identity"):
+                load_adapter_state(restored, payload)
+            for index, layer in enumerate(restored.model.layers):
+                load_adapter_state(layer, payload, prefix=f"model.layers.{index}", base_identity=identity)
+            load_adapter(restored, path, base_identity=identity)
+            for name, value in payload["weights"].items():
+                torch.testing.assert_close(restored.get_parameter(name), value, rtol=0, atol=0)
+            self.assertNotEqual(adapter_base_identity(folder, random_init=True, seed=1),
+                                adapter_base_identity(folder, random_init=True, seed=2))
 
     def test_adapter_validation_is_atomic(self):
         model = TinyModel()

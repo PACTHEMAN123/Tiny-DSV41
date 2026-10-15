@@ -384,8 +384,15 @@ def build_dsv41_policy(model_dir, config, *, random_init, devices, dtype,
     layer_device_map(config.num_hidden_layers, devices)
     validate_available_devices(devices)
     from .engram_state import EngramBaseline, EngramState, baseline_identity
+    private_engram = train_engram or initial_engram_delta is not None or isinstance(engram_weights, EngramBaseline)
+    adapter, binding = None, None
+    if lora_config is not None and initial_adapter is not None:
+        from dsv41_train.lora import adapter_base_identity, read_adapter
+        binding = adapter_base_identity(model_dir, random_init=random_init, seed=torch.initial_seed(),
+                                        private_engram=private_engram)
+        adapter = read_adapter(initial_adapter, base_identity=binding)
     state = None
-    if train_engram or initial_engram_delta is not None or isinstance(engram_weights, EngramBaseline):
+    if private_engram:
         if not engram_offload:
             raise ValueError("private Engram state requires CPU offload")
         expected = baseline_identity(model_dir, config, dtype, random_init, torch.initial_seed())
@@ -435,10 +442,11 @@ def build_dsv41_policy(model_dir, config, *, random_init, devices, dtype,
     else:
         backend = _load_native(Path(model_dir), config, engram_weights)
     if lora_config is not None:
-        from dsv41_train.lora import inject_lora, load_adapter
+        from dsv41_train.lora import inject_lora, load_adapter_state, validate_adapter_layout
         inject_lora(backend, lora_config)
-        if initial_adapter is not None:
-            load_adapter(backend, initial_adapter)
+        if adapter is not None:
+            validate_adapter_layout(backend, adapter)
+            load_adapter_state(backend, adapter, base_identity=binding)
     if state is not None:
         for table in state.tables.values():
             table.requires_grad_(train_engram and role == "learner")

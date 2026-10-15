@@ -121,6 +121,12 @@ the adapter alone does not contain optimizer or resume state. With
 table rows; an adapter-only export is omitted. Generation metrics are separate
 from the teacher-forced loss and require checking the decoded answers.
 
+New SFT adapters embed the base-model identity, checked before loading into RL.
+This hashes configuration/tokenizer assets and records weight-file names, sizes
+and modification times; it does not hash all base-weight contents. Legacy v1
+adapters remain readable with an explicit warning that their base and tokenizer
+cannot be verified.
+
 Trainable CPU Engram snapshots store cumulative SGD-touched rows with their
 rank-local ownership, rather than copying each complete table. Fresh restore
 applies these rows to the verified original base. Rolling back an already

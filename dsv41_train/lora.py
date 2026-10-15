@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -153,9 +155,53 @@ def _layer_ids(model):
     return None
 
 
+def adapter_base_identity(model_dir, *, random_init=False, seed=None, private_engram=False):
+    """Reuse the checkpoint source contract, without data or training settings.
+
+    Weight files use the existing name/size/mtime inventory, not a full content
+    hash of the potentially terabyte-sized checkpoint. Text assets are hashed.
+    Random bases additionally bind the initialization path, since private
+    Engram construction consumes a different backbone RNG sequence.
+    """
+    from .rl.checkpoint import run_identity
+    identity = run_identity(model_dir, Path(model_dir) / "config.json", random_init)
+    identity.pop("data_sha256")
+    if random_init:
+        if type(seed) is not int or not 0 <= seed < 2**63 - 1:
+            raise ValueError("a random adapter base requires its initialization seed")
+        if type(private_engram) is not bool:
+            raise ValueError("private_engram must describe the random initialization path")
+        identity["initialization_seed"] = seed
+        identity["initialization_layout"] = "private-engram-v1" if private_engram else "direct-v1"
+    return identity
+
+
+def _base_identity(identity):
+    if not isinstance(identity, dict) or not identity:
+        raise ValueError("adapter base identity must be a nonempty object")
+    try:
+        return json.loads(json.dumps(identity, sort_keys=True, allow_nan=False))
+    except (TypeError, ValueError) as error:
+        raise ValueError("adapter base identity must contain JSON metadata") from error
+
+
+def _validate_adapter_base(payload, expected):
+    if payload["format_version"] == 1:
+        warnings.warn("Legacy adapter v1 has no base identity: base weights and tokenizer cannot be verified; "
+                      "loading with architecture-only validation.", RuntimeWarning, stacklevel=3)
+    elif payload["format_version"] != 2:
+        raise ValueError("unsupported adapter format")
+    elif expected is None or _base_identity(payload["base_identity"]) != _base_identity(expected):
+        raise ValueError("adapter base identity differs or was not provided")
+
+
 @torch.no_grad()
-def save_adapter(model: nn.Module, path: str | Path):
-    """All FSDP ranks participate; rank zero writes A/B only, without base weights."""
+def save_adapter(model: nn.Module, path: str | Path, *, base_identity=None):
+    """All FSDP ranks participate; rank zero writes A/B without base weights.
+
+    Pass base_identity for a bound v2 export; omission retains unbound v1.
+    """
+    binding = {} if base_identity is None else {"base_identity": _base_identity(base_identity)}
     modules = _adapter_modules(model)
     writer = not dist.is_initialized() or dist.get_rank() == 0
     weights = {}
@@ -169,19 +215,26 @@ def save_adapter(model: nn.Module, path: str | Path):
     if writer:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"format_version": 1, "layer_ids": _layer_ids(model),
+        torch.save({"format_version": 2 if binding else 1, "layer_ids": _layer_ids(model), **binding,
                     "modules": {name: asdict(module.config) for name, module in modules.items()},
                     "weights": weights}, path)
 
 
-def read_adapter(path: str | Path) -> dict:
+def read_adapter(path: str | Path, *, base_identity=None) -> dict:
     payload = torch.load(path, map_location="cpu", weights_only=True)
-    if not isinstance(payload, dict) or payload.get("format_version") != 1:
+    if not isinstance(payload, dict) or payload.get("format_version") not in (1, 2):
         raise ValueError("unsupported adapter format")
-    if (set(payload) != {"format_version", "layer_ids", "modules", "weights"}
+    fields = {"format_version", "layer_ids", "modules", "weights"}
+    if payload["format_version"] == 2:
+        fields.add("base_identity")
+    if (set(payload) != fields
             or not isinstance(payload["modules"], dict) or not isinstance(payload["weights"], dict)
             or any(not isinstance(name, str) for name in (*payload["modules"], *payload["weights"]))):
         raise ValueError("invalid adapter payload")
+    if payload["format_version"] == 2:
+        _base_identity(payload["base_identity"])
+        if base_identity is not None:
+            _validate_adapter_base(payload, base_identity)
     return payload
 
 
@@ -191,8 +244,9 @@ def validate_adapter_layout(model: nn.Module, payload: dict):
 
 
 @torch.no_grad()
-def load_adapter_state(model: nn.Module, payload: dict, *, prefix: str = ""):
+def load_adapter_state(model: nn.Module, payload: dict, *, prefix: str = "", base_identity=None):
     """Load a full adapter or one layer's subset before FSDP, validating before copying."""
+    _validate_adapter_base(payload, base_identity)
     modules = {_key(prefix, name): module for name, module in _adapter_modules(model).items()}
     namespace = prefix + "." if prefix else ""
     expected = {name: asdict(module.config) for name, module in modules.items()}
@@ -219,10 +273,10 @@ def load_adapter_state(model: nn.Module, payload: dict, *, prefix: str = ""):
         target.copy_(weights[name])
 
 
-def load_adapter(model: nn.Module, path: str | Path):
-    payload = read_adapter(path)
+def load_adapter(model: nn.Module, path: str | Path, *, base_identity=None):
+    payload = read_adapter(path, base_identity=base_identity)
     validate_adapter_layout(model, payload)
-    load_adapter_state(model, payload)
+    load_adapter_state(model, payload, base_identity=base_identity)
 
 
 def merge_adapters(model: nn.Module):

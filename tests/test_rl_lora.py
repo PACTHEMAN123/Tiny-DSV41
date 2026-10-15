@@ -7,10 +7,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import torch
 
-from dsv41_train.lora import save_adapter
+from dsv41_train.lora import adapter_base_identity, save_adapter
 from dsv41_train.models.dsv4 import DeepSeekV41ForCausalLM
 from dsv41_train.models.qwen import Qwen3MoeForCausalLM
 from dsv41_train.rl.checkpoint import (add_lora_identity, load_policy, policy_state,
@@ -66,14 +67,51 @@ class LoRARLTests(unittest.TestCase):
                 if name.endswith(".lora_b"):
                     parameter.normal_(std=.02)
         path = folder / "initial-adapter.pt"
-        save_adapter(initial.backend, path)
+        save_adapter(initial.backend, path, base_identity=adapter_base_identity(folder))
         return replace(config, initial_adapter=str(path)), initial
+
+    def test_initial_adapter_rejects_changed_base_before_loading_for_both_families(self):
+        for family in ("dsv4", "qwen"):
+            with self.subTest(family=family):
+                folder, model_config, config = self.fixture(family)
+                config, _ = self.initial_adapter(folder, model_config, config)
+                (folder / "tokenizer.json").write_text('{"changed":true}')
+                loader = "qwen_policy.load_qwen3_moe" if family == "qwen" else "policy._load_native"
+                with patch("dsv41_train.rl." + loader) as load:
+                    with self.assertRaisesRegex(ValueError, "base identity"):
+                        self.policy(folder, model_config, config)
+                    load.assert_not_called()
 
     def test_validation(self):
         for override in ({"rollout_engine": "vllm"}, {"lora_dropout": .1}, {"lora_targets": []},
                          {"lora_rank": 0}, {"trainable_scope": "all", "initial_adapter": "a.pt"}):
             with self.subTest(override=override), self.assertRaises(ValueError):
                 RLConfig.from_dict(dict(rollout_engine="native-pytorch", trainable_scope="lora") | override)
+
+    def test_random_adapter_binds_actual_engram_initialization_path(self):
+        folder, model_config, config = self.fixture("dsv4")
+        bases = {}
+        for private in (False, True):
+            config = replace(config, train_engram=private, optimizer="sgd")
+            initial = make_model(folder, model_config, config, ("cpu",), True)
+            bases[private] = {name: value.detach().clone() for name, value in initial.backend.named_parameters()
+                              if not name.endswith((".lora_a", ".lora_b"))}
+            path = folder / f"random-{private}.pt"
+            save_adapter(initial.backend, path, base_identity=adapter_base_identity(
+                folder, random_init=True, seed=config.seed, private_engram=private))
+            configured = replace(config, initial_adapter=str(path))
+            restored = make_model(folder, model_config, configured, ("cpu",), True)
+            for name, value in bases[private].items():
+                torch.testing.assert_close(restored.backend.get_parameter(name), value, rtol=0, atol=0)
+            with self.assertRaisesRegex(ValueError, "base identity"):
+                make_model(folder, model_config, replace(configured, train_engram=not private), ("cpu",), True)
+            if private:
+                # Shared baseline takes the private path even for a frozen role.
+                reference = make_model(folder, model_config, replace(configured, train_engram=False),
+                    ("cpu",), True, engram_weights=initial.engram_state.baseline, role="reference")
+                for name, value in bases[private].items():
+                    torch.testing.assert_close(reference.backend.get_parameter(name), value, rtol=0, atol=0)
+        self.assertTrue(any(not torch.equal(value, bases[True][name]) for name, value in bases[False].items()))
 
     def test_adapter_activation_reference_and_identity_for_both_families(self):
         async def exercise(folder, model_config, config):

@@ -20,7 +20,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from dsv41_train.engram_offload import install_engram_sgd_hooks
-from dsv41_train.lora import LoRAConfig, inject_lora
+from dsv41_train.lora import LoRAConfig, adapter_base_identity, inject_lora, read_adapter
 from dsv41_train.models.dsv4 import DeepSeekV41ForCausalLM
 from dsv41_train.models.dsv4.attention import AttentionSinks
 from dsv41_train.models.dsv4.mhc import HyperConnection
@@ -128,8 +128,8 @@ def distributed_export_worker(rank, directory, cuda):
         export_sft_bundle(model, checkpoint, folder, folder / "distributed-bundle")
         import dsv41_train.sft_export as exporter
         original = exporter.save_adapter
-        def failing_write(*args):
-            original(*args)  # Both ranks first execute the actual adapter collectives.
+        def failing_write(*args, **kwargs):
+            original(*args, **kwargs)  # Both ranks first execute the actual adapter collectives.
             if rank == 0:
                 raise OSError("injected rank-zero adapter write failure")
         with patch.object(exporter, "save_adapter", failing_write):
@@ -162,6 +162,8 @@ class SFTBundleTests(unittest.TestCase):
 
     def test_sft_checkpoint_bundle_three_roles_and_rl_update(self):
         export_sft_bundle(self.model, self.checkpoint, self.folder, self.bundle)
+        payload = read_adapter(self.bundle / "adapter.pt", base_identity=adapter_base_identity(self.folder))
+        self.assertEqual(payload["format_version"], 2)
         config = self.config()
         model_config = load_model_config(self.folder)
         learner = make_model(self.folder, model_config, config, ("cpu",), False)
@@ -281,7 +283,7 @@ class SFTBundleTests(unittest.TestCase):
             resolve_initial_bundle(replace(self.config(), initial_engram_delta="other.pt"))
         config_path = self.folder / "config.json"
         config_path.write_text(config_path.read_text() + "\n")
-        with self.assertRaisesRegex(ValueError, "baseline identity"):
+        with self.assertRaisesRegex(ValueError, "adapter base identity"):
             make_model(self.folder, load_model_config(self.folder), self.config(), ("cpu",), False)
 
     def test_global_uneven_empty_owners_missing_overlap_and_partial_files(self):

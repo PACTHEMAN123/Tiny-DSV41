@@ -221,12 +221,19 @@ def build_qwen_policy(model_dir, config, *, random_init, devices, dtype, trainab
     validate_qwen_config(config)
     layer_device_map(config.num_hidden_layers, devices)
     validate_available_devices(devices)
+    adapter, binding = None, None
+    if lora_config is not None and initial_adapter is not None:
+        from dsv41_train.lora import adapter_base_identity, read_adapter
+        binding = adapter_base_identity(model_dir, random_init=random_init, seed=torch.initial_seed(),
+                                        private_engram=False)
+        adapter = read_adapter(initial_adapter, base_identity=binding)
     backend = Qwen3MoeForCausalLM(config) if random_init else load_qwen3_moe(model_dir, dtype=dtype)
     if backend.config.to_dict() != config.to_dict():
         raise ValueError("Qwen mounted checkpoint configuration differs from requested architecture")
     if lora_config is not None:
-        from dsv41_train.lora import inject_lora, load_adapter
+        from dsv41_train.lora import inject_lora, load_adapter_state, validate_adapter_layout
         inject_lora(backend, lora_config)
-        if initial_adapter is not None:
-            load_adapter(backend, initial_adapter)
+        if adapter is not None:
+            validate_adapter_layout(backend, adapter)
+            load_adapter_state(backend, adapter, base_identity=binding)
     return QwenPolicy(backend, trainable_scope=trainable_scope).to_training_devices(devices, dtype)

@@ -398,7 +398,9 @@ def train(args, runtime):
             else:
                 emit({"event": "sft_bundle_unavailable", "reason": "requires complete layers, dropout=0 and CPU Engram offload"})
         else:
-            save_adapter(model, output_dir / "adapter.pt")
+            base_identity = {key: value for key, value in identity.items()
+                             if key not in {"training_config", "data_sha256", "eval_data_sha256"}}
+            save_adapter(model, output_dir / "adapter.pt", base_identity=base_identity)
             if runtime.is_main:
                 (output_dir / "adapter_metadata.json").write_text(json.dumps({"identity": identity, "step": step}, indent=2) + "\n")
     summary = {"event": "summary", "step": step, "initial_step": initial_step, "data_position": cursor,
