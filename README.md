@@ -78,6 +78,13 @@ the last checkpoint. This reduces gradient storage, but does not establish that
 the full released model fits: activations, collective buffers and checkpoint
 storage still need separate measurement.
 
+On CUDA, a reduced full-parameter BF16 model with FP32 precision islands,
+CPU Engram and real FSDP2 passed ordinary versus in-backward SGD comparison
+at CP1/EP2 and CP2/EP2. With deterministic Torch reference kernels, parameter
+updates and sparse-checkpoint continuation were exact; a non-finite gradient
+on one rank aborted both ranks before the final SGD step. This validates the
+distributed update contract, not the released full model's memory footprint.
+
 For DSV4, `--engram-offload` keeps each rank's Engram row shard on CPU while
 preserving the native hash and distributed lookup. Full SFT updates these rows
 with SGD; LoRA freezes them unless `--train-engram` is also supplied. That
@@ -285,7 +292,11 @@ includes it in that reference baseline; the file identity is bound to recovery.
 Row payloads can grow toward full-table size, and full backbone/optimizer states
 still require their own memory and storage. CPU tests cover 20 steps, a fresh
 process continuing at step 21, actor publication and reference isolation;
-Linux/CUDA and released-model validation of this path remain separate gates.
+the same tests also passed on Linux, exercising sealed memfd and spawned actors.
+The Linux/CUDA gate passed 13 RL tests, including CPU-sparse/two-GPU-dense
+clipping and warm-cache update/restore across streams. Nine SFT Engram tests
+also passed, including GPU-cache continuation and all-rank rejection before
+mutation. Released-model trainable-Engram validation remains a separate gate.
 
 For pretrained training, replace `--model-dir` with a checkpoint directory,
 provide tokenized task data and a task reward in the RL config, and omit
