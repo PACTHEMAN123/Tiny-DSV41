@@ -39,6 +39,21 @@ PYTHONPATH=.:tests python3 -m torch.distributed.run \
 
 ## GPU distributed checks
 
+Four-rank SFT checks cover full training and LoRA with trainable CPU Engram,
+CP2/EP2, two-rank expert FSDP groups, and unequal supervised token counts:
+
+```bash
+PYTHONPATH=.:tests CUDA_VISIBLE_DEVICES=0,1,2,3 \
+python3 -m torch.distributed.run --standalone --nproc-per-node=4 \
+  tests/dsv4_sft_dp_parity.py --device cuda --output runs/sft-dp4-cuda.json
+```
+
+CUDA uses deterministic Torch reference kernels with BF16/FP32 parameters.
+Each step starts from bit-exact matching state and checks gradients and one
+SGD update. This does not assert equality of independently rounded BF16
+training trajectories. Use `--device cpu` for two independent FP32 steps.
+The output path must be new; reports include the precision and error bounds.
+
 Two-GPU Qwen output and gradient parity:
 
 ```bash

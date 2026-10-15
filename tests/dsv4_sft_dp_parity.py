@@ -2,8 +2,10 @@
 
 Unlike EP=world tests, each expert FSDP subgroup contains two ranks. Two
 accumulated microbatches have unequal answer counts across both data groups.
-CPU uses FP32. CUDA uses deterministic Torch references with native BF16/FP32
-islands on both sides; gradient gates distinguish rounding from wrong scaling.
+CPU checks two independent FP32 update trajectories. CUDA uses deterministic
+Torch references with native BF16/FP32 islands and aligns the complete state
+before each step: it checks same-state gradients and single updates, not long
+term agreement between independently rounded BF16 trajectories.
 """
 
 import argparse
@@ -15,7 +17,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, distribute_tensor
 
 from dsv41_train.engram_offload import install_engram_sgd_hooks
 from dsv41_train.lora import LoRAConfig, inject_lora
@@ -113,16 +115,16 @@ def compare(model, reference, *, gradients=False, device=torch.device("cpu"), be
             if parameter.grad is None:
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=name)
             else:
-                old_actual, old_expected = before[name]
+                old = before[name]
                 gradient = materialized(parameter.grad)
                 target = owner_slice(model, name, materialized(reference.get_parameter(name).grad))
-                # SGD error is bounded by prior trajectory error, LR times
-                # gradient error, and rounding of multiply/add on either side.
+                # Same-state SGD error is bounded by LR times gradient error
+                # and rounding of multiply/add on either side.
                 # This uses each parameter's BF16 or FP32 epsilon, not a loose
                 # relative tolerance against the much larger base weight.
                 rounding = 2 * torch.finfo(parameter.dtype).eps * (
-                    old_actual.abs() + old_expected.abs() + .05 * (gradient.abs() + target.abs()))
-                budget = (old_actual - old_expected).abs() + .05 * (gradient - target).abs() + rounding
+                    2 * old.abs() + .05 * (gradient.abs() + target.abs()))
+                budget = .05 * (gradient - target).abs() + rounding
                 assert bool((difference <= budget).all()), f"{name}: SGD update exceeds rounding budget"
                 budget_fractions[key] = max(budget_fractions.get(key, 0.),
                     (difference / budget.clamp_min(torch.finfo(torch.float32).tiny)).max().item())
@@ -153,8 +155,39 @@ def compare(model, reference, *, gradients=False, device=torch.device("cpu"), be
                 maximum_update_budget_fraction=budget_fractions)
 
 
+@torch.no_grad()
+def align_state(model, reference, device):
+    """Compare the distributed and unsharded updates at one identical state."""
+    for table in model.model.engram_tables.values():
+        table.clear_cache()
+    for name, parameter in model.named_parameters():
+        source = owner_slice(model, name, reference.get_parameter(name).detach())
+        assert parameter.dtype == source.dtype and parameter.shape == source.shape, name
+        if isinstance(parameter, DTensor):
+            source = distribute_tensor(source, parameter.device_mesh, parameter.placements)
+        parameter.copy_(source)
+    assert dict(model.named_buffers()).keys() == dict(reference.named_buffers()).keys()
+    for name, buffer in model.named_buffers():
+        source = reference.get_buffer(name)
+        assert buffer.dtype == source.dtype and buffer.shape == source.shape, name
+        buffer.copy_(source)
+    exact = True
+    for name, parameter in model.named_parameters():
+        # Do not short-circuit collective full_tensor calls after a mismatch.
+        same = torch.equal(materialized(parameter.detach()),
+                           owner_slice(model, name, reference.get_parameter(name).detach()).float())
+        exact = same and exact
+    exact = all(torch.equal(buffer, reference.get_buffer(name)) for name, buffer in model.named_buffers()) and exact
+    valid = torch.tensor(int(exact), device=device)
+    dist.all_reduce(valid, op=dist.ReduceOp.MIN)
+    assert valid.item(), "parameters and buffers must be bit-exact before comparing CUDA gradients"
+    return dict(all_parameters_bit_exact=True, all_buffers_bit_exact=True,
+                parameter_tensors=len(dict(model.named_parameters())), buffer_tensors=len(dict(model.named_buffers())))
+
+
 def parity(lora, meshes, cp, dispatcher, runtime):
     cuda = runtime.device.type == "cuda"
+    mode = "lora_and_trainable_engram" if lora else "full"
     config = replace(config_for(runtime.device.type), num_hidden_layers=2, compress_ratios=[0, 2],
                      kv_source_layer_ids=[1], index_source_layer_ids=[1], candidate_source_layer_id=1,
                      engram_num_embeddings=[4097])
@@ -180,9 +213,9 @@ def parity(lora, meshes, cp, dispatcher, runtime):
     optimizer.register_step_pre_hook(lambda *_: gradient_report.update(
         compare(model, reference, gradients=True, device=runtime.device)))
     for step in (1, 2):
-        before = {name: (materialized(parameter.detach()).clone(),
-                        owner_slice(model, name, reference.get_parameter(name).detach()).float().clone())
-                  for name, parameter in model.named_parameters()} if cuda else None
+        alignment = align_state(model, reference, runtime.device) if cuda else None
+        before = {name: owner_slice(model, name, reference.get_parameter(name).detach()).float().clone()
+                  for name, _ in model.named_parameters()} if cuda else None
         expected = train_update(reference, reference_optimizer, oracle_batches,
                                 family="dsv4", runtime=Runtime(runtime.device))
         actual = train_update(model, optimizer, local_batches, family="dsv4", runtime=runtime,
@@ -195,12 +228,15 @@ def parity(lora, meshes, cp, dispatcher, runtime):
         if step == 2:
             assert all(gradient_report["oracle_maximum_magnitudes"][name] > 1e-10 for name in required)
         reports.append(dict(step=step, loss=actual["loss"], loss_error=abs(actual["loss"] - expected["loss"]),
-                            gradients=dict(gradient_report), parameters=updates))
-    return dict(mode="lora_and_trainable_engram" if lora else "full", cp=2, ep=2, world=4,
+                            gradients=dict(gradient_report), parameters=updates,
+                            alignment=alignment))
+    return dict(mode=mode, cp=2, ep=2, world=4,
+                validation_scope=("same_state_gradient_and_single_update" if cuda
+                                  else "independent_two_step_trajectories"),
                 device=runtime.device.type, precision="bf16_with_fp32_islands" if cuda else "fp32",
                 backend="torch_reference_nccl" if cuda else "torch_gloo", oracle="same_precision_unsharded",
                 tolerances=(dict(gradient_relative_l2=4 / 128, gradient_relative_max=8 / 128,
-                                 update="prior_error + lr*gradient_error + 2*dtype_eps*(old_weights + lr*gradients)",
+                                 update="lr*gradient_error + 2*dtype_eps*(2*old_weight + lr*gradients)",
                                  loss="bf16_eps * max(1, oracle_loss)") if cuda else dict(rtol=4e-4, atol=2e-7, loss=1e-6)),
                 expert_fsdp_size=2, actual_fsdp=True, accumulation_steps=2,
                 supervised_tokens_by_microbatch_and_data_group=counts, steps=reports)
@@ -208,24 +244,10 @@ def parity(lora, meshes, cp, dispatcher, runtime):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", help="New JSON report path")
+    parser.add_argument("--output", required=True, help="New JSON report path")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
-    parser.add_argument("--check-setup", action="store_true", help="Check the selected fixture precision without distributed startup")
     args = parser.parse_args()
     torch.set_num_threads(1)
-    if args.check_setup:
-        for lora in (False, True):
-            model, _ = native(config_for(args.device), lora, bf16=args.device == "cuda")
-            counts = {}
-            for parameter in model.parameters():
-                assert bool(torch.isfinite(parameter).all())
-                counts[str(parameter.dtype)] = counts.get(str(parameter.dtype), 0) + parameter.numel()
-            if args.device == "cuda":
-                assert counts.keys() == {"torch.float32", "torch.bfloat16"}
-            print(json.dumps(dict(event="setup_passed", lora=lora, parameter_count_by_dtype=counts)), flush=True)
-        return
-    if not args.output:
-        parser.error("--output is required unless --check-setup is used")
     device = torch.device("cpu")
     if args.device == "cuda":
         reference_torch()
@@ -234,15 +256,22 @@ def main():
     dist.init_process_group("nccl" if args.device == "cuda" else "gloo", timeout=timedelta(seconds=180))
     try:
         assert dist.get_world_size() == 4, "launch with torchrun --nproc-per-node=4"
+        path = Path(args.output)
+        if dist.get_rank() == 0:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            assert not path.exists(), path
+        dist.barrier()
         meshes, cp, dispatcher = build_parallelism(2, 2, args.device)
         runtime = Runtime(device, rank=dist.get_rank(), world_size=4)
-        reports = [parity(lora, meshes, cp, dispatcher, runtime) for lora in (False, True)]
+        reports = []
+        for lora in (False, True):
+            report = parity(lora, meshes, cp, dispatcher, runtime)
+            reports.append(report)
+            if runtime.is_main:
+                print(json.dumps(report), flush=True)
         if runtime.is_main:
-            path = Path(args.output)
-            path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("x") as destination:
                 json.dump(reports, destination, indent=2)
-            print(json.dumps(reports, indent=2), flush=True)
     finally:
         dist.destroy_process_group()
 
