@@ -7,6 +7,7 @@ is performed explicitly so this regression needs only Gloo, not CUDA.
 import argparse
 import json
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -135,18 +136,70 @@ def sgd_in_backward_parity(mesh):
     return dict(optimizer_in_backward="sgd", ep=2, expert_divisor=2, gradients_cleared=True)
 
 
+def zero_owner_parity(mesh, frozen_experts):
+    """An owner receiving no tokens must participate in both dispatch backwards."""
+    rank = dist.get_rank()
+    config = replace(DeepSeekV41Config.tiny(), hidden_size=4,
+                     moe_intermediate_size=3, n_routed_experts=2, num_experts_per_tok=1)
+    reference = RoutedExperts(config, TokenDispatcher())
+    actual = RoutedExperts(config, AllToAllTokenDispatcher(mesh))
+    generator = torch.Generator().manual_seed(293)
+    with torch.no_grad():
+        for parameter in reference.parameters():
+            parameter.copy_(torch.randn(parameter.shape, generator=generator) * 0.2)
+        for name, parameter in actual.named_parameters():
+            parameter.copy_(dict(reference.named_parameters())[name][rank:rank + 1])
+    reference.requires_grad_(not frozen_experts)
+    actual.requires_grad_(not frozen_experts)
+    sizes = [2, 3]
+    offset = sum(sizes[:rank])
+    inputs = torch.randn(sum(sizes), 4, generator=generator).requires_grad_()
+    weights = torch.rand(sum(sizes), 1, generator=generator).requires_grad_()
+    # Both source ranks have tokens, all routed to rank 0. Rank 1 receives none.
+    indices = torch.zeros(sum(sizes), 1, dtype=torch.long)
+    local_inputs = inputs.detach()[offset:offset + sizes[rank]].clone().requires_grad_()
+    local_weights = weights.detach()[offset:offset + sizes[rank]].clone().requires_grad_()
+    expected = reference(inputs, indices, weights)
+    expected.square().sum().backward()
+    output = actual(local_inputs, indices[offset:offset + sizes[rank]], local_weights)
+    torch.testing.assert_close(output, expected.detach()[offset:offset + sizes[rank]])
+    output.square().sum().backward()
+    errors = {}
+    for name, gradient, target in (
+        ("hidden", local_inputs.grad, inputs.grad[offset:offset + sizes[rank]]),
+        ("router_weights", local_weights.grad, weights.grad[offset:offset + sizes[rank]]),
+    ):
+        assert gradient is not None, name
+        torch.testing.assert_close(gradient, target, rtol=2e-4, atol=2e-7)
+        error = (gradient - target).abs().max()
+        dist.all_reduce(error, op=dist.ReduceOp.MAX)
+        errors[name] = error.item()
+    for name, parameter in actual.named_parameters():
+        if frozen_experts:
+            assert parameter.grad is None, name
+        else:
+            assert parameter.grad is not None, name
+            target = dict(reference.named_parameters())[name].grad[rank:rank + 1]
+            torch.testing.assert_close(parameter.grad, target, rtol=2e-4, atol=2e-7)
+            if rank == 1:
+                assert torch.count_nonzero(parameter.grad).item() == 0, name
+    return dict(empty_owner_rank=1, frozen_experts=frozen_experts,
+                maximum_gradient_errors=errors, expert_gradient_check=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output")
     args = parser.parse_args()
     torch.set_num_threads(1)
-    dist.init_process_group("gloo")
+    dist.init_process_group("gloo", timeout=timedelta(seconds=60))
     try:
         if dist.get_world_size() != 2:
             raise RuntimeError("this parity test requires exactly two ranks")
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("ep",))
         results = [parity(mesh, size) for size in (1, 2)]
         results.append(sgd_in_backward_parity(mesh))
+        results.extend(zero_owner_parity(mesh, frozen) for frozen in (False, True))
         if dist.get_rank() == 0:
             report = json.dumps(results, indent=2) + "\n"
             if args.output:

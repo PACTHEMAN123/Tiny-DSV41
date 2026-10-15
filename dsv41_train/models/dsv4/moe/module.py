@@ -68,7 +68,9 @@ class RoutedExperts(nn.Module):
         x, counts, weights, metadata = self.dispatcher.dispatch(x, indices, weights)
         if x.shape[0] == 0:
             anchor = self.gate_up.flatten()[0] + self.down.flatten()[0]
-            output = x.new_empty((0, self.hidden_size)) + anchor.to(x.dtype) * 0
+            # Empty owners must still run both dispatch backwards, even when
+            # experts are frozen, and produce zero gradients for local experts.
+            output = x + weights.sum().to(x.dtype) * 0 + anchor.to(x.dtype) * 0
         else:
             gate_up_weight = self.gate_up.reshape(
                 self.num_experts, 2 * self.intermediate, self.hidden_size
