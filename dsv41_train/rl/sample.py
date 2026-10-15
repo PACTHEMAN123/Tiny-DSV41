@@ -50,6 +50,8 @@ def load_checkpoint_model(
     current_identity = run_identity(model_dir, model_dir / "config.json", random_init)
     initial_config = checkpoint_config(state["config"], model_config,
                                        rollout_engine=identity.get("rollout_engine"))
+    from dsv41_train.sft_export import resolve_initial_bundle
+    initial_config = resolve_initial_bundle(initial_config)
     add_lora_identity(current_identity, initial_config, model_config)
     add_engram_identity(current_identity, initial_config)
     if getattr(model_config, "model_type", None) == "qwen3_moe":
@@ -66,7 +68,7 @@ def load_checkpoint_model(
         values["max_new_tokens"] = max_new_tokens
     if temperature is not None:
         values["temperature"] = temperature
-    config = checkpoint_config(values, model_config)
+    config = resolve_initial_bundle(checkpoint_config(values, model_config))
     sampling_seed = config.seed if seed is None else seed
     if type(sampling_seed) is not int or not 0 <= sampling_seed < 2**63 - 1:
         raise ValueError("sampling seed must be an integer in [0, 2**63 - 1)")

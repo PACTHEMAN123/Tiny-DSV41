@@ -82,6 +82,7 @@ def validate_args(args, world_size):
         from dsv41_train.models.dsv4 import DeepSeekV41Config
         config = DeepSeekV41Config.from_json(Path(args.model_path) / "config.json")
         args.num_layers = config.num_hidden_layers if args.num_layers is None else args.num_layers
+        args.complete_backbone = args.num_layers == config.num_hidden_layers
         if not 1 <= args.num_layers <= config.num_hidden_layers:
             raise ValueError("num-layers must select a nonempty DSV4 backbone prefix")
         if args.engram_cache_mib and not any(layer < args.num_layers for layer in config.engram_layer_ids):
@@ -386,10 +387,20 @@ def train(args, runtime):
     after = evaluate(model, eval_batches, family=args.family, runtime=runtime, cp_size=args.cp_size)
     generation_after = generation_eval()
     eval_after_metrics = _max_metrics(runtime, eval_after_peak_allocated_gib=torch.cuda.max_memory_allocated(runtime.device) / 2**30)
-    if args.mode == "lora" and not args.train_engram and step > initial_step:
-        save_adapter(model, output_dir / "adapter.pt")
-        if runtime.is_main:
-            (output_dir / "adapter_metadata.json").write_text(json.dumps({"identity": identity, "step": step}, indent=2) + "\n")
+    if args.mode == "lora" and step > 0 and (step > initial_step or args.resume):
+        if args.train_engram:
+            if (args.engram_offload and args.lora_dropout == 0
+                    and args.complete_backbone):
+                from dsv41_train.sft_export import export_sft_bundle
+                checkpoint = Path(args.resume) if step == initial_step else output_dir / f"checkpoint-{step:08d}"
+                bundle = export_sft_bundle(model, checkpoint, args.model_path, output_dir / f"sft-bundle-{step:08d}")
+                emit({"event": "sft_bundle_exported", "step": step, "path": str(bundle)})
+            else:
+                emit({"event": "sft_bundle_unavailable", "reason": "requires complete layers, dropout=0 and CPU Engram offload"})
+        else:
+            save_adapter(model, output_dir / "adapter.pt")
+            if runtime.is_main:
+                (output_dir / "adapter_metadata.json").write_text(json.dumps({"identity": identity, "step": step}, indent=2) + "\n")
     summary = {"event": "summary", "step": step, "initial_step": initial_step, "data_position": cursor,
                "eval_loss_before": before, "eval_loss_after": after, **load_metrics, **train_seconds,
                "generation_before": generation_before, "generation_after": generation_after,

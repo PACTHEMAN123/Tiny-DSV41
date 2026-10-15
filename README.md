@@ -289,6 +289,16 @@ actors can skip versions and checkpoint recovery can restore earlier rows.
 The reference keeps the initial policy throughout learner updates and resume.
 `--initial-engram-delta PATH` accepts a validated initial SFT row payload and
 includes it in that reference baseline; the file identity is bound to recovery.
+Complete-layer LoRA SFT with `--train-engram --engram-offload` and zero LoRA
+dropout exports `sft-bundle-STEP/`: the adapter, cumulative global Engram rows,
+and a manifest binding their hashes, base and training step. Pass that directory
+as RL `--initial-adapter` with matching LoRA/dtype settings (without a separate
+`--initial-engram-delta`) to load
+the pair into learner, actor and the initial frozen reference. Existing adapter
+file paths remain supported. An SFT resume at the already-completed step can
+export into a new output directory without another update. Partial-layer and
+nonzero-dropout SFT still train normally but do not export this bundle; full SFT
+requires a separate backbone export and is not represented by this LoRA format.
 Row payloads can grow toward full-table size, and full backbone/optimizer states
 still require their own memory and storage. CPU tests cover 20 steps, a fresh
 process continuing at step 21, actor publication and reference isolation;

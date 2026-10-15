@@ -26,6 +26,8 @@ from .trajectory import trajectory_log_probs
 
 
 def make_model(model_dir, model_config, config, devices, random_init, *, engram_weights=None, role="learner"):
+    from dsv41_train.sft_export import resolve_initial_bundle
+    config = resolve_initial_bundle(config)
     qwen = getattr(model_config, "model_type", None) == "qwen3_moe"
     last_position = getattr(config, "qwen_last_position_only", False)
     if config.qwen_kv_cache and not qwen:
@@ -294,6 +296,8 @@ def validate_reward_records(records, reward, spec):
 def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, resume=None,
                  eval_data_path=None, rollout_factory=None, rollout_identity=None,
                  initial_policy=None, initial_policy_consumer=None):
+    from dsv41_train.sft_export import resolve_initial_bundle
+    config = resolve_initial_bundle(config)
     config.validate()
     if initial_policy is not None and (resume is not None or random_init or rollout_factory is None):
         raise ValueError("original initial policy recovery requires a pretrained external provider and no checkpoint resume")
