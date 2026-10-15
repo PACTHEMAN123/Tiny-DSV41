@@ -165,7 +165,9 @@ def native_probe(args, runtime, cp_size):
             if runtime.is_main:
                 print(json.dumps(dict(event="native_update", cp=cp_size, step=step)), flush=True)
             metrics, control = update(actual, optimizer), update(resident, control_optimizer)
-            assert abs(metrics["loss"] - control["loss"]) < 5e-4
+            assert abs(metrics["loss"] - control["loss"]) < 5e-4, dict(
+                cp=cp_size, step=step, offload_loss=metrics["loss"], resident_loss=control["loss"],
+                previous_errors=errors)
             errors.append(dict(parameters=compare(values(actual), values(resident)),
                                gradients=compare(values(actual, True), values(resident, True))))
             assert table.weight.device.type == "cpu" and table.weight.grad.device.type == "cpu"
