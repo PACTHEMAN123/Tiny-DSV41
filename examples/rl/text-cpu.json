@@ -1,0 +1,22 @@
+{
+  "rollout_engine": "native-pytorch",
+  "max_steps": 3,
+  "group_size": 4,
+  "max_new_tokens": 16,
+  "max_prompt_tokens": 96,
+  "length_policy": "error",
+  "temperature": 1.0,
+  "learning_rate": 0.0001,
+  "kl_beta": 0.02,
+  "reward": "numeric_answer",
+  "truncated_reward": 0.0,
+  "eval_interval": 1,
+  "eval_samples_per_prompt": 1,
+  "eval_seed": 1234,
+  "log_samples_per_step": 2,
+  "learner_devices": ["cpu"],
+  "rollout_devices": ["cpu"],
+  "engram_offload": true,
+  "dtype": "float32",
+  "output_dir": "runs/tiny_dsv41_text"
+}

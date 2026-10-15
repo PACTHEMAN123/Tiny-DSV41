@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a tiny DeepSeek V4.1 causal LM")
+    parser.add_argument("--model-config", default=str(ROOT / "dsv41_train/models/dsv4/tiny_config.json"))
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=32)
@@ -41,14 +42,15 @@ def make_batch(
     seq_len: int,
     device: torch.device,
     *,
+    config: DeepSeekV41Config,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Generate short, learnable token sequences without a dataset dependency."""
 
-    starts = torch.randint(0, 10, (batch_size, 1), device=device, generator=generator)
+    starts = torch.randint(config.vocab_size, (batch_size, 1), device=device, generator=generator)
     offsets = torch.arange(seq_len - 1, device=device).unsqueeze(0)
-    body = 3 + (starts + offsets) % 10
-    bos = torch.ones((batch_size, 1), dtype=torch.long, device=device)
+    body = (starts + offsets) % config.vocab_size
+    bos = torch.full((batch_size, 1), config.bos_token_id, dtype=torch.long, device=device)
     return torch.cat((bos, body), dim=1)
 
 
@@ -64,14 +66,15 @@ def clip_grad_norm(parameters: Iterable[torch.Tensor], max_norm: float) -> torch
 def validate_args(args: argparse.Namespace) -> None:
     if args.steps < 1 or args.batch_size < 1 or args.log_every < 1:
         raise ValueError("steps, batch-size, and log-every must be positive")
-    if not 2 <= args.seq_len <= 128:
-        raise ValueError("seq-len must be between 2 and 128")
+    config = DeepSeekV41Config.from_json(args.model_config)
+    if not 2 <= args.seq_len <= config.max_position_embeddings:
+        raise ValueError("seq-len must be between 2 and the configured max_position_embeddings")
 
 
 def train(args: argparse.Namespace, runtime: Runtime) -> None:
     # All ranks initialize identical parameters; the per-rank generator below varies the data.
     torch.manual_seed(args.seed)
-    config = DeepSeekV41Config.tiny()
+    config = DeepSeekV41Config.from_json(args.model_config)
     model = DeepSeekV41ForCausalLM(config)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     model = model.to(runtime.device)
@@ -112,6 +115,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> None:
             args.batch_size,
             args.seq_len,
             runtime.device,
+            config=config,
             generator=batch_generator,
         )
         attention_mask = torch.ones_like(input_ids)

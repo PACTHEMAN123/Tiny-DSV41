@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "release": "harbor-ubuntu-merge-sparql-20261009-v2",
+  "parent_archive_sha256": "aba3e0aa7fcd0e29693b5bac6eadc8dc0817d4ede3a7d3d9dab0fa2f81640e1c",
+  "allowed_tasks": [
+    "merge-diff-arc-agi-task",
+    "sparql-university"
+  ],
+  "required_harbor_version": "0.23.0",
+  "unchanged_members": {
+    "bootstrap_payload.py": "83483e776af666b8bced1bfe43f2a2e095c0a58d05abcc06bd1d29de8c03df40",
+    "harbor-pouch-image-id-map-69671f.json": "558ff7f5447cc723622eeda85091969aa04351aa71d291db5c0eda56187c8ab7",
+    "harbor_bootstrap_environment.py": "bf52833a88cadbfa3b1f9a6195e1e3c8ed939eb1d9168f495616fb20c9163646",
+    "harbor_bootstrap_ubuntu.py": "3a69d41243519e336ec6a8ed50d909ed5ab7479d401b3973940890ac5dfae27f",
+    "harbor_filerelay_agent.py": "7a1959810c2dcba2a39c2e0960e1d16cfbfe66e58f42f036bc79573462b9d24c",
+    "harbor_pouch_cleanup.py": "017403ab4459e5e24110fa05408913636983d85d5af331c6db4bdf1e28f86788",
+    "harbor_pouch_environment.py": "cfd43c234cc078ca2b8536410f88ef7c46cfcb4a14a20a6e6e9e29ca563c34c8",
+    "harbor_rollout_environment.py": "517ef48bb0539ae255066228c5203d1ff79f46a3fb55d2fecc46ebea729debde",
+    "qualify_bootstrap.py": "46170e6337ccc586b5515246a36df34d78c52a05f3652bbaea30f7f5574fbfdc",
+    "qualify_ubuntu_merge_sparql.py": "560519227e31ce92b5985797835713eee1a0ec356266ef8246e517f34b628927",
+    "review_baseline_fields.py": "916bff6144cbe10ddd3fd7e8e4e57edf7f369395656a4b7c58b944a6ae3cd853",
+    "run_harbor_rollouts.py": "cec3731d95d358e9b6e2a2d695258464827c2656eacc9425520c86215dd5ba85",
+    "test_review_baseline_fields.py": "1465a04de1f0ebf134242b4dcb7f3214f02138a430a666c4fbbea20d4b0bcb3c",
+    "test_ubuntu_pair.py": "2dcb16059491787f54058c494f23d09595de2106da9c7a207d1d22e2a90821db",
+    "ubuntu_profile.py": "8a0cffbd6f98a7e6454704681b2760827cb3950e1b9c1f17c9d1ca5fc83329c6"
+  },
+  "guard_ast_sha256": "eba19bb617732ca07e13f97d0728e79b4dd97641bfb7f90ea22a387a5bbe0027",
+  "timing_mixin_ast_sha256": "be6348a4f2b51245e54a2bbe216d4db1393d900def210a6a8189302ec48f2af8",
+  "task_budgets_changed": false,
+  "attempts": 1,
+  "retries": 0,
+  "runtime_qualified": false,
+  "files": [
+    {
+      "path": "README_UBUNTU_PAIR.md",
+      "bytes": 4797,
+      "sha256": "76f4d57ce4a1a5cc7a1145244b5f8b2f1fb1e0124da849ff46a2c90fed5d2bf9"
+    },
+    {
+      "path": "bootstrap_payload.py",
+      "bytes": 10226,
+      "sha256": "83483e776af666b8bced1bfe43f2a2e095c0a58d05abcc06bd1d29de8c03df40"
+    },
+    {
+      "path": "harbor-pouch-image-id-map-69671f.json",
+      "bytes": 10462,
+      "sha256": "558ff7f5447cc723622eeda85091969aa04351aa71d291db5c0eda56187c8ab7"
+    },
+    {
+      "path": "harbor_bootstrap_environment.py",
+      "bytes": 6772,
+      "sha256": "bf52833a88cadbfa3b1f9a6195e1e3c8ed939eb1d9168f495616fb20c9163646"
+    },
+    {
+      "path": "harbor_bootstrap_ubuntu.py",
+      "bytes": 4783,
+      "sha256": "3a69d41243519e336ec6a8ed50d909ed5ab7479d401b3973940890ac5dfae27f"
+    },
+    {
+      "path": "harbor_bootstrap_ubuntu_merge_sparql.py",
+      "bytes": 9488,
+      "sha256": "41d7d0375fdd5c667c230f53e8f5477ed6ba08cb24034546ee4103144e584a1e"
+    },
+    {
+      "path": "harbor_filerelay_agent.py",
+      "bytes": 16825,
+      "sha256": "7a1959810c2dcba2a39c2e0960e1d16cfbfe66e58f42f036bc79573462b9d24c"
+    },
+    {
+      "path": "harbor_pouch_cleanup.py",
+      "bytes": 3564,
+      "sha256": "017403ab4459e5e24110fa05408913636983d85d5af331c6db4bdf1e28f86788"
+    },
+    {
+      "path": "harbor_pouch_environment.py",
+      "bytes": 29778,
+      "sha256": "cfd43c234cc078ca2b8536410f88ef7c46cfcb4a14a20a6e6e9e29ca563c34c8"
+    },
+    {
+      "path": "harbor_rollout_environment.py",
+      "bytes": 3094,
+      "sha256": "517ef48bb0539ae255066228c5203d1ff79f46a3fb55d2fecc46ebea729debde"
+    },
+    {
+      "path": "qualify_bootstrap.py",
+      "bytes": 8085,
+      "sha256": "46170e6337ccc586b5515246a36df34d78c52a05f3652bbaea30f7f5574fbfdc"
+    },
+    {
+      "path": "qualify_ubuntu_merge_sparql.py",
+      "bytes": 1882,
+      "sha256": "560519227e31ce92b5985797835713eee1a0ec356266ef8246e517f34b628927"
+    },
+    {
+      "path": "review_baseline_fields.py",
+      "bytes": 6795,
+      "sha256": "916bff6144cbe10ddd3fd7e8e4e57edf7f369395656a4b7c58b944a6ae3cd853"
+    },
+    {
+      "path": "run_harbor_rollouts.py",
+      "bytes": 24509,
+      "sha256": "cec3731d95d358e9b6e2a2d695258464827c2656eacc9425520c86215dd5ba85"
+    },
+    {
+      "path": "test_review_baseline_fields.py",
+      "bytes": 4287,
+      "sha256": "1465a04de1f0ebf134242b4dcb7f3214f02138a430a666c4fbbea20d4b0bcb3c"
+    },
+    {
+      "path": "test_sparql_prerequisite_v2.py",
+      "bytes": 2389,
+      "sha256": "badf3cc04adc85221557038f449ee96ee214d9d63170cb08b2682f6b6556a37d"
+    },
+    {
+      "path": "test_ubuntu_pair.py",
+      "bytes": 10341,
+      "sha256": "2dcb16059491787f54058c494f23d09595de2106da9c7a207d1d22e2a90821db"
+    },
+    {
+      "path": "ubuntu_profile.py",
+      "bytes": 468,
+      "sha256": "8a0cffbd6f98a7e6454704681b2760827cb3950e1b9c1f17c9d1ca5fc83329c6"
+    }
+  ],
+  "correction": "uvx Python tool prerequisite plus bounded non-sensitive diagnostics",
+  "v1_observed_failure_cause": "unconfirmed because prerequisite stdout/stderr were not retained",
+  "original_verifier_changed": false,
+  "task_payload_changed": false,
+  "remote_actions_performed": false
+}

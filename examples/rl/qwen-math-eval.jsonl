@@ -1,0 +1,4 @@
+{"messages":[{"role":"system","content":"Answer with only the numerical result."},{"role":"user","content":"What is 17 + 25?"}],"answer":42,"metadata":{"case_id":"math-add"}}
+{"messages":[{"role":"system","content":"Answer with only the numerical result."},{"role":"user","content":"What is 19 - 7?"}],"answer":12,"metadata":{"case_id":"math-subtract"}}
+{"messages":[{"role":"system","content":"Answer with only the numerical result."},{"role":"user","content":"What is 6 times 7?"}],"answer":42,"metadata":{"case_id":"math-multiply"}}
+{"messages":[{"role":"system","content":"Answer with only the numerical result."},{"role":"user","content":"What is 81 divided by 9?"}],"answer":9,"metadata":{"case_id":"math-divide"}}

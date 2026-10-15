@@ -298,6 +298,7 @@ def load_dsv41_backbone_window(
     engram_mesh: DeviceMesh | None = None,
     sparse_engram_gradients: bool = False,
     layer_loaded: Callable[[DecoderLayer], None] | None = None,
+    engram_weights: dict[str, torch.Tensor] | None = None,
 ) -> DeepSeekV41ForCausalLM:
     """Load a trainable prefix or source-anchored layer window."""
 
@@ -327,6 +328,14 @@ def load_dsv41_backbone_window(
         )
 
     target_device = torch.device(device)
+    if engram_weights is not None:
+        if engram_mesh is not None or engram_weights.keys() != model.model.engram_tables.keys():
+            raise ValueError("preloaded Engram requires unsharded tables matching the selected layers")
+        for name, value in engram_weights.items():
+            if (value.shape != model.model.engram_tables[name].weight.shape
+                    or value.device.type != "cpu" or value.requires_grad
+                    or value.dtype not in {torch.float32, torch.bfloat16}):
+                raise ValueError(f"invalid preloaded CPU Engram table: {name}")
     rotary = model.model.rotary
     _materialize_rotary(rotary, config, target_device)
     with ShardedSafeTensorReader(folder) as checkpoint:
@@ -448,27 +457,30 @@ def load_dsv41_backbone_window(
 
             if layer.engram is not None:
                 table = model.model.engram_tables[str(layer_id)]
-                table_weight = torch.empty(
-                    table.weight.shape, device=target_device, dtype=dtype
-                )
-                chunk_rows = 131072
-                for chunk_start in range(table.row_start, table.row_stop, chunk_rows):
-                    chunk_stop = min(chunk_start + chunk_rows, table.row_stop)
-                    weight = checkpoint.tensor_rows(
-                        f"{source}.engram.embed.weight",
-                        chunk_start,
-                        chunk_stop,
-                        target_device,
+                if engram_weights is not None:
+                    table_weight = engram_weights[str(layer_id)]
+                else:
+                    table_weight = torch.empty(
+                        table.weight.shape, device=target_device, dtype=dtype
                     )
-                    scale = checkpoint.tensor_rows(
-                        f"{source}.engram.embed.scale",
-                        chunk_start,
-                        chunk_stop,
-                        target_device,
-                    )
-                    table_weight[chunk_start - table.row_start : chunk_stop - table.row_start].copy_(
-                        dequantize_fp8_rows(weight, scale, dtype=dtype)
-                    )
+                    chunk_rows = 131072
+                    for chunk_start in range(table.row_start, table.row_stop, chunk_rows):
+                        chunk_stop = min(chunk_start + chunk_rows, table.row_stop)
+                        weight = checkpoint.tensor_rows(
+                            f"{source}.engram.embed.weight",
+                            chunk_start,
+                            chunk_stop,
+                            target_device,
+                        )
+                        scale = checkpoint.tensor_rows(
+                            f"{source}.engram.embed.scale",
+                            chunk_start,
+                            chunk_stop,
+                            target_device,
+                        )
+                        table_weight[chunk_start - table.row_start : chunk_stop - table.row_start].copy_(
+                            dequantize_fp8_rows(weight, scale, dtype=dtype)
+                        )
                 assign(table, {"weight": table_weight})
                 state["engram.q_weight"] = read(f"{source}.engram.q_weight").to(dtype)
                 state["engram.k_weight"] = read(f"{source}.engram.k_weight").to(dtype)
@@ -509,6 +521,7 @@ def load_dsv41_backbone_prefix(
     engram_mesh: DeviceMesh | None = None,
     sparse_engram_gradients: bool = False,
     layer_loaded: Callable[[DecoderLayer], None] | None = None,
+    engram_weights: dict[str, torch.Tensor] | None = None,
 ) -> DeepSeekV41ForCausalLM:
     """Load a trainable prefix directly from the released checkpoint."""
 
@@ -523,6 +536,7 @@ def load_dsv41_backbone_prefix(
         engram_mesh=engram_mesh,
         sparse_engram_gradients=sparse_engram_gradients,
         layer_loaded=layer_loaded,
+        engram_weights=engram_weights,
     )
 
 

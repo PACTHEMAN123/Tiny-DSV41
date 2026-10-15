@@ -109,9 +109,10 @@ class RoutedExperts(nn.Module):
 class SharedExpert(nn.Module):
     def __init__(self, config: DeepSeekV41Config) -> None:
         super().__init__()
-        self.gate = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False)
-        self.up = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False)
-        self.down = nn.Linear(config.moe_intermediate_size, config.hidden_size, bias=False)
+        intermediate = config.moe_intermediate_size * config.n_shared_experts
+        self.gate = nn.Linear(config.hidden_size, intermediate, bias=False)
+        self.up = nn.Linear(config.hidden_size, intermediate, bias=False)
+        self.down = nn.Linear(intermediate, config.hidden_size, bias=False)
         self.limit = config.swiglu_limit
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

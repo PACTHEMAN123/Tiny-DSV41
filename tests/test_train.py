@@ -1,6 +1,10 @@
 import argparse
+import json
 import os
+import tempfile
 import unittest
+from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
 import torch
@@ -29,18 +33,48 @@ class TrainTest(unittest.TestCase):
         self.assertEqual(actual.item(), 0.5)
 
     def test_make_batch_is_reproducible_with_an_explicit_generator(self):
+        from dsv41_train.models.dsv4 import DeepSeekV41Config
+
         first = torch.Generator().manual_seed(123)
         second = torch.Generator().manual_seed(123)
+        config = replace(DeepSeekV41Config.tiny(), vocab_size=5, bos_token_id=4,
+                         engram_compressed_vocab_size=5)
 
-        first_batch = train.make_batch(3, 8, torch.device("cpu"), generator=first)
-        second_batch = train.make_batch(3, 8, torch.device("cpu"), generator=second)
+        first_batch = train.make_batch(3, 8, torch.device("cpu"), config=config, generator=first)
+        second_batch = train.make_batch(3, 8, torch.device("cpu"), config=config, generator=second)
 
         self.assertTrue(torch.equal(first_batch, second_batch))
+        self.assertTrue((first_batch[:, 0] == config.bos_token_id).all())
+        self.assertTrue(((first_batch >= 0) & (first_batch < config.vocab_size)).all())
 
     def test_validate_args_rejects_invalid_values(self):
         args = argparse.Namespace(steps=0, batch_size=1, log_every=1, seq_len=8)
         with self.assertRaisesRegex(ValueError, "must be positive"):
             train.validate_args(args)
+
+    def test_context_limit_and_expert_parallelism_follow_model_config(self):
+        from dsv41_train.models.dsv4 import DeepSeekV41Config
+
+        values = DeepSeekV41Config.tiny().to_dict()
+        values.update(max_position_embeddings=256, n_routed_experts=5)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "config.json"
+            path.write_text(json.dumps(values))
+            (root / "model.safetensors.index.json").write_text("{}")
+            args = argparse.Namespace(steps=1, batch_size=1, log_every=1,
+                                      seq_len=192, model_config=path)
+            train.validate_args(args)
+            args.seq_len = 257
+            with self.assertRaisesRegex(ValueError, "max_position_embeddings"):
+                train.validate_args(args)
+            args = argparse.Namespace(model_path=root, steps=1, batch_size=1, num_layers=1,
+                                      seq_len=4, start_layer=0, learning_rate=0.01, cp_size=1,
+                                      ep_size=5, sequence_packing=False, optimizer_in_backward=False)
+            train_dsv4_checkpoint.validate_args(args, world_size=5)
+            args.ep_size = 2
+            with self.assertRaisesRegex(ValueError, "n_routed_experts"):
+                train_dsv4_checkpoint.validate_args(args, world_size=2)
 
     @patch("dsv41_train.runtime.dist.get_world_size", return_value=4)
     @patch("dsv41_train.runtime.dist.get_rank", return_value=2)

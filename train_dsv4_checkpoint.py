@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from dsv41_train.models.dsv4 import load_dsv41_backbone_window
+from dsv41_train.models.dsv4 import DeepSeekV41Config, load_dsv41_backbone_window
 from dsv41_train.cp import pack_sequences
 from dsv41_train.models.dsv4.parallel import (
     apply_fsdp2_layer,
@@ -111,8 +111,9 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
     length = args.seq_len * args.batch_size if args.sequence_packing else args.seq_len
     if length % args.cp_size:
         raise ValueError("sequence length after packing must divide evenly across cp-size")
-    if 384 % args.ep_size:
-        raise ValueError("the checkpoint's 384 experts must divide evenly across ep-size")
+    config = DeepSeekV41Config.from_json(model_path / "config.json")
+    if config.n_routed_experts % args.ep_size:
+        raise ValueError("the configured n_routed_experts must divide evenly across ep-size")
     if args.optimizer_in_backward and args.optimizer != "sgd":
         raise ValueError("optimizer-in-backward requires SGD")
 
