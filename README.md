@@ -174,7 +174,12 @@ the native rollout manager's version/digest/ACK protocol. RL Engram tables
 are frozen unless explicitly enabled below. This option does not add vLLM LoRA
 or distributed RL CP.
 CPU tests cover both model families through training, actor activation and
-fresh-process recovery; large-model GPU RL validation is still pending.
+fresh-process recovery. The released Qwen3-30B-A3B completed 20 native LoRA
+RL updates and a fresh-process update 21 on four GPUs (two learner/reference,
+two actor), using 513–528-token prompts. All 21 updates had nonzero advantages
+and gradients; adapter/optimizer restoration was exact, the reference stayed
+fixed, and every actor version/digest ACK matched. This uses a synthetic token
+reward to validate training and synchronization, not downstream task quality.
 
 For pretrained RL, point `--model-dir` at a downloaded checkpoint repository
 directory. Its config and weights must agree; missing weights are an error.
