@@ -31,19 +31,21 @@ class PyTorchRLBackend:
 
     async def start(self):
         import torch
-        from dsv41_train.rl.family import build_policy, policy_lora_config
+        from dsv41_train.rl.family import build_policy, policy_lora_config, initial_sft_source
         from dsv41_train.rl.data import build_reward
         from dsv41_train.rl.rollout import generation_options
         from dsv41_train.rl.tokenizer import ModelTokenizer
 
         torch.set_num_threads(self.config.num_threads)
         torch.manual_seed(self.config.seed)
-        if self.config.trainable_scope == "lora" or self.config.train_engram or self.config.initial_engram_delta:
-            from dsv41_train.rl.checkpoint import add_engram_identity, add_lora_identity, run_identity, validate_identity
+        source = initial_sft_source(self.model_dir, self.model_config, self.config, self.random_init)
+        if self.config.trainable_scope == "lora" or self.config.train_engram or self.config.initial_engram_delta or source is not None:
+            from dsv41_train.rl.checkpoint import add_engram_identity, add_lora_identity, add_sft_identity, run_identity, validate_identity
             actual = add_lora_identity(run_identity(self.model_dir,
                 Path(self.model_dir) / "config.json", self.random_init), self.config, self.model_config)
             actual.pop("data_sha256")
             add_engram_identity(actual, self.config)
+            add_sft_identity(actual, source)
             validate_identity({key: self.initial_policy["identity"].get(key) for key in actual}, actual)
         self.model = build_policy(self.model_dir, self.model_config,
             random_init=self.random_init, devices=self.config.rollout_devices,
@@ -52,7 +54,7 @@ class PyTorchRLBackend:
             lora_config=policy_lora_config(self.config, self.model_config),
             initial_adapter=self.config.initial_adapter, train_engram=self.config.train_engram,
             engram_cache_mib=self.config.engram_cache_mib, initial_engram_delta=self.config.initial_engram_delta,
-            role="actor")
+            role="actor", sft_source=source)
         if self.config.qwen_last_position_only:
             if getattr(self.model_config, "model_type", None) != "qwen3_moe":
                 raise ValueError("last-position logits require native Qwen")

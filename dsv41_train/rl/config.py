@@ -29,6 +29,7 @@ class RLConfig:
     engram_cache_mib: int = 0
     optimizer: str = "adamw"
     initial_engram_delta: str | None = None
+    initial_sft_checkpoint: str | None = None
     trainable_scope: str = "all"
     lora_rank: int = 8
     lora_alpha: float = 16.0
@@ -150,6 +151,14 @@ class RLConfig:
                 raise ValueError("initial_engram_delta must be a nonempty path or null")
             if not self.engram_offload or self.rollout_engine != "native-pytorch":
                 raise ValueError("initial_engram_delta requires Engram offload and native-pytorch")
+        if self.initial_sft_checkpoint is not None:
+            if not isinstance(self.initial_sft_checkpoint, str) or not self.initial_sft_checkpoint:
+                raise ValueError("initial_sft_checkpoint must be a nonempty path or null")
+            if (self.rollout_engine != "native-pytorch" or self.trainable_scope != "all"
+                    or not self.engram_offload or self.initial_adapter is not None
+                    or self.initial_engram_delta is not None):
+                raise ValueError("initial_sft_checkpoint requires native-pytorch, trainable_scope=all, "
+                                 "CPU Engram offload and no initial adapter or Engram delta")
         if self.trainable_scope == "lora":
             from dsv41_train.lora import LoRAConfig
             LoRAConfig(self.lora_rank, self.lora_alpha, self.lora_dropout,

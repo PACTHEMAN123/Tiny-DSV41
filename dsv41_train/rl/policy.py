@@ -380,11 +380,13 @@ def _load_native(root, config, engram_weights=None):
 
 def build_dsv41_policy(model_dir, config, *, random_init, devices, dtype,
                        engram_weights=None, engram_offload=True, lora_config=None, initial_adapter=None,
-                       train_engram=False, engram_cache_mib=0, initial_engram_delta=None, role="learner"):
+                       train_engram=False, engram_cache_mib=0, initial_engram_delta=None, role="learner",
+                       sft_source=None):
     layer_device_map(config.num_hidden_layers, devices)
     validate_available_devices(devices)
     from .engram_state import EngramBaseline, EngramState, baseline_identity
-    private_engram = train_engram or initial_engram_delta is not None or isinstance(engram_weights, EngramBaseline)
+    private_engram = (train_engram or initial_engram_delta is not None or isinstance(engram_weights, EngramBaseline)
+                      or sft_source is not None and bool(config.engram_layer_ids))
     adapter, binding = None, None
     if lora_config is not None and initial_adapter is not None:
         from dsv41_train.lora import adapter_base_identity, read_adapter
@@ -395,7 +397,7 @@ def build_dsv41_policy(model_dir, config, *, random_init, devices, dtype,
     if private_engram:
         if not engram_offload:
             raise ValueError("private Engram state requires CPU offload")
-        expected = baseline_identity(model_dir, config, dtype, random_init, torch.initial_seed())
+        expected = baseline_identity(model_dir, config, dtype, random_init, torch.initial_seed(), sft_source)
         if initial_engram_delta is not None:
             from .checkpoint import file_sha256
             expected["initial_delta_sha256"] = file_sha256(initial_engram_delta)
@@ -404,11 +406,23 @@ def build_dsv41_policy(model_dir, config, *, random_init, devices, dtype,
                 raise ValueError("shared Engram baseline identity differs")
             baseline = engram_weights
         else:
-            baseline = EngramBaseline.create(model_dir, config, dtype, random_init, torch.initial_seed(), initial_engram_delta)
+            baseline = EngramBaseline.create(model_dir, config, dtype, random_init, torch.initial_seed(),
+                                             initial_engram_delta, sft_source)
         state = EngramState(baseline, role, train_engram)
         engram_weights = {name: table.weight.detach() for name, table in state.tables.items()}
     _validate_engram_weights(config, engram_weights)
-    if random_init:
+    if sft_source is not None:
+        # The source owns all backbone tensors. Do not read original dense
+        # weights or allocate another full Engram table during reconstruction.
+        with torch.device("meta"):
+            backend = DeepSeekV41ForCausalLM(config)
+        backend.model.engram_tables = nn.ModuleDict()
+        backend.to_empty(device="cpu")
+        backend.model.rotary = RotaryEmbedding(config)
+        if config.engram_layer_ids:
+            backend.model.hash = NgramHash(config, token_map=_load_token_map(Path(model_dir), config))
+            backend.model.engram_tables = nn.ModuleDict(state.tables)
+    elif random_init:
         if state is not None:
             # Materialize only the backbone. Baseline rows are initialized
             # directly in their mapping with a separate deterministic generator.
@@ -450,6 +464,20 @@ def build_dsv41_policy(model_dir, config, *, random_init, devices, dtype,
     if state is not None:
         for table in state.tables.values():
             table.requires_grad_(train_engram and role == "learner")
-    return DSV41Policy(backend, engram_offload=engram_offload,
-                       trainable_scope="lora" if lora_config is not None else "all",
-                       engram_state=state, engram_cache_mib=engram_cache_mib).to_training_devices(devices, dtype)
+    model = DSV41Policy(backend, engram_offload=engram_offload,
+                        trainable_scope="lora" if lora_config is not None else "all",
+                        engram_state=state, engram_cache_mib=engram_cache_mib).to_training_devices(devices, dtype)
+    if sft_source is not None:
+        # Use native placement/FP32 islands first; preflight all persistent
+        # tensors (including frozen indexers and routing bias) before copying.
+        targets = {name: value for name, value in backend.state_dict().items() if ".engram_tables." not in name}
+        names = {name for name in sft_source.tensor_names if ".engram_tables." not in name}
+        if targets.keys() != names:
+            raise ValueError("SFT backbone tensor coverage differs")
+        for name, value in targets.items():
+            if tuple(value.shape) != sft_source.shapes[name] or value.dtype != sft_source.dtypes[name]:
+                raise ValueError(f"SFT backbone target shape/dtype differs: {name}; use the snapshot training dtype")
+        for name, value in targets.items():
+            sft_source.copy_tensor(name, value)
+        model.initial_sft_identity = dict(sft_source.identity)
+    return model

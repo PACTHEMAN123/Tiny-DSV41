@@ -14,20 +14,23 @@ import torch
 from .algorithm import group_advantages, grpo_loss, response_log_probs
 from .checkpoint import (load_training_checkpoint, publish_policy_artifact,
                          run_identity, save_training_checkpoint, load_policy_artifact, validate_identity,
-                         add_lora_identity, add_engram_identity)
+                         add_lora_identity, add_engram_identity, add_sft_identity)
 from .config import RLConfig
 from .data import build_reward, load_jsonl
 from .evaluation import append_jsonl, evaluate_policy, sample_record
-from .family import build_policy, load_model_config, policy_lora_config
+from .family import build_policy, load_model_config, policy_lora_config, initial_sft_source
 from .parallel import layer_device_map, validate_available_devices
 from .rollout import generation_options
 from .tokenizer import ModelTokenizer
 from .trajectory import trajectory_log_probs
 
 
-def make_model(model_dir, model_config, config, devices, random_init, *, engram_weights=None, role="learner"):
+def make_model(model_dir, model_config, config, devices, random_init, *, engram_weights=None, role="learner",
+               sft_source=None):
     from dsv41_train.sft_export import resolve_initial_bundle
     config = resolve_initial_bundle(config)
+    if sft_source is None:
+        sft_source = initial_sft_source(model_dir, model_config, config, random_init)
     qwen = getattr(model_config, "model_type", None) == "qwen3_moe"
     last_position = getattr(config, "qwen_last_position_only", False)
     if config.qwen_kv_cache and not qwen:
@@ -42,7 +45,7 @@ def make_model(model_dir, model_config, config, devices, random_init, *, engram_
                               lora_config=policy_lora_config(config, model_config),
                               initial_adapter=config.initial_adapter, train_engram=config.train_engram,
                               engram_cache_mib=config.engram_cache_mib,
-                              initial_engram_delta=config.initial_engram_delta, role=role)
+                              initial_engram_delta=config.initial_engram_delta, role=role, sft_source=sft_source)
     if qwen:
         model.qwen_last_position_only = last_position
         model.qwen_kv_cache = config.qwen_kv_cache
@@ -308,6 +311,7 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
     torch.set_num_threads(config.num_threads)
     model_dir, data_path = str(Path(model_dir).resolve()), str(Path(data_path).resolve())
     model_config = load_model_config(model_dir)
+    sft_source = initial_sft_source(model_dir, model_config, config, random_init)
     generic_vllm = rollout_factory is None and config.rollout_engine == "vllm"
     if generic_vllm:
         from rollout_manager.backends.vllm_rl import require_vllm_rollout
@@ -331,6 +335,7 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
     identity = run_identity(model_dir, data_path, random_init, eval_data_path=eval_data_path)
     add_lora_identity(identity, config, model_config)
     add_engram_identity(identity, config)
+    add_sft_identity(identity, sft_source)
     if getattr(model_config, "model_type", None) == "qwen3_moe":
         identity["trainable_scope"] = config.trainable_scope
         if config.qwen_last_position_only:
@@ -377,7 +382,7 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
                            clock_domain="learner_process_monotonic")
     try:
         model = timings.call("model_startup", make_model, model_dir, model_config, config,
-                             config.learner_devices, random_init,
+                             config.learner_devices, random_init, sft_source=sft_source,
                              details={"devices": config.learner_devices})
         model.behavior_engine = identity.get("rollout_engine", "native-pytorch")
         engram_weights = (model.export_engram_baseline() if getattr(model, "engram_state", None) is not None
@@ -386,8 +391,9 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
         if config.kl_beta:
             reference = timings.call("reference_model_startup", make_model, model_dir, model_config,
                                      config, config.learner_devices, random_init, engram_weights=engram_weights,
-                                     role="reference")
+                                     role="reference", sft_source=sft_source)
             reference.eval().requires_grad_(False)
+        del sft_source  # Drop mapped snapshot tensors after both initial roles are reconstructed.
         optimizer_type = torch.optim.SGD if config.optimizer == "sgd" else torch.optim.AdamW
         optimizer = optimizer_type([p for p in model.parameters() if p.requires_grad],
                                    lr=config.learning_rate, weight_decay=config.weight_decay, foreach=False)

@@ -9,10 +9,10 @@ from typing import Optional, Sequence
 
 import torch
 
-from .checkpoint import add_engram_identity, add_lora_identity, checkpoint_config, load_policy, run_identity, validate_identity
+from .checkpoint import add_engram_identity, add_lora_identity, add_sft_identity, checkpoint_config, load_policy, run_identity, validate_identity
 from .data import PromptRecord
 from .evaluation import decoded_fields
-from .family import load_model_config
+from .family import load_model_config, initial_sft_source
 from .rollout import generate_group, generation_options
 from .runtime import make_model
 from .tokenizer import ModelTokenizer
@@ -52,8 +52,10 @@ def load_checkpoint_model(
                                        rollout_engine=identity.get("rollout_engine"))
     from dsv41_train.sft_export import resolve_initial_bundle
     initial_config = resolve_initial_bundle(initial_config)
+    source = initial_sft_source(model_dir, model_config, initial_config, random_init)
     add_lora_identity(current_identity, initial_config, model_config)
     add_engram_identity(current_identity, initial_config)
+    add_sft_identity(current_identity, source)
     if getattr(model_config, "model_type", None) == "qwen3_moe":
         current_identity["trainable_scope"] = state["config"].get("trainable_scope", "all")
     validate_identity(identity, current_identity, inference=True)
@@ -73,7 +75,7 @@ def load_checkpoint_model(
     if type(sampling_seed) is not int or not 0 <= sampling_seed < 2**63 - 1:
         raise ValueError("sampling seed must be an integer in [0, 2**63 - 1)")
     torch.set_num_threads(config.num_threads)
-    model = make_model(model_dir, model_config, config, devices, random_init, role="actor")
+    model = make_model(model_dir, model_config, config, devices, random_init, role="actor", sft_source=source)
     load_policy(model, policy)
     del policy
     model.eval()

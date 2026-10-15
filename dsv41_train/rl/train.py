@@ -31,6 +31,7 @@ def main():
                         help="update offloaded Engram rows; requires native-pytorch and SGD with zero weight decay")
     parser.add_argument("--engram-cache-mib", type=int, help="per-process GPU row cache budget across Engram tables")
     parser.add_argument("--initial-engram-delta", help="initial SFT Engram row state, also used by the frozen reference")
+    parser.add_argument("--initial-sft-checkpoint", help="complete full DSV4 SFT snapshot; native-pytorch/all only")
     parser.add_argument("--engram-offload", action=argparse.BooleanOptionalAction, default=None,
                         help="keep Engram tables on CPU (default: enabled)")
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=None,
@@ -46,7 +47,7 @@ def main():
         values["trainable_scope"] = args.trainable_scope
     if args.initial_adapter is not None:
         values["initial_adapter"] = args.initial_adapter
-    for name in ("optimizer", "train_engram", "engram_cache_mib", "initial_engram_delta"):
+    for name in ("optimizer", "train_engram", "engram_cache_mib", "initial_engram_delta", "initial_sft_checkpoint"):
         if getattr(args, name) is not None:
             values[name] = getattr(args, name)
     if args.trainer_num_gpus is not None or args.rollout_num_gpus is not None:

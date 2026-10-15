@@ -36,6 +36,12 @@ def add_engram_identity(identity, config):
     return identity
 
 
+def add_sft_identity(identity, source):
+    if source is not None:
+        identity["initial_sft_checkpoint"] = dict(source.identity)
+    return identity
+
+
 def atomic_save(payload: dict, destination: str | Path) -> None:
     """Readers see a complete old or new file, never a partially written snapshot."""
     destination = Path(destination)
@@ -62,10 +68,14 @@ def policy_state(model) -> dict:
         state.update(adapter_format=1, adapter=model.lora_metadata)
     if getattr(model, "engram_state", None) is not None:
         state["engram_delta"] = model.engram_state.state_dict()
+    if getattr(model, "initial_sft_identity", None) is not None:
+        state["initial_sft_checkpoint"] = model.initial_sft_identity
     return state
 
 
 def load_policy(model, state: dict) -> None:
+    if state.get("initial_sft_checkpoint") != getattr(model, "initial_sft_identity", None):
+        raise ValueError("policy initial SFT checkpoint identity differs")
     engram = getattr(model, "engram_state", None)
     if (engram is not None) != ("engram_delta" in state):
         raise ValueError("policy Engram delta presence differs from the configured baseline")
@@ -98,6 +108,8 @@ def publish_policy_artifact(model, version: int, directory: str | Path, *,
         raise ValueError("policy artifact requires a nonnegative version and run lineage")
     if getattr(model, "lora_metadata", None) is not None and identity.get("lora") != model.lora_metadata:
         raise ValueError("policy publication LoRA identity differs from loaded model")
+    if identity.get("initial_sft_checkpoint") != getattr(model, "initial_sft_identity", None):
+        raise ValueError("policy publication initial SFT checkpoint identity differs")
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     payload = {"version": version, "lineage": lineage, "identity": identity,

@@ -308,8 +308,8 @@ as RL `--initial-adapter` with matching LoRA/dtype settings (without a separate
 the pair into learner, actor and the initial frozen reference. Existing adapter
 file paths remain supported. An SFT resume at the already-completed step can
 export into a new output directory without another update. Partial-layer and
-nonzero-dropout SFT still train normally but do not export this bundle; full SFT
-requires a separate backbone export and is not represented by this LoRA format.
+nonzero-dropout SFT still train normally but do not export this bundle. Full SFT
+uses the rank checkpoint directly through the separate initialization option below.
 The six bundle regressions pass on Linux/CUDA, including real two-rank
 NCCL/FSDP adapter export and propagation of a writer-rank IO failure. The
 SFT-to-RL learner/reference/actor equality and continuation checks use a tiny
@@ -318,7 +318,29 @@ Row payloads can grow toward full-table size, and full backbone/optimizer states
 still require their own memory and storage. CPU tests cover 20 steps, a fresh
 process continuing at step 21, actor publication and reference isolation;
 the same tests also passed on Linux, exercising sealed memfd and spawned actors.
-The Linux/CUDA gate passed 13 RL tests, including CPU-sparse/two-GPU-dense
+
+For complete-layer full DSV4 SFT, RL `--initial-sft-checkpoint DIR` reads the
+saved rank checkpoint with the original `--model-dir`. This requires
+`native-pytorch`, `trainable_scope=all`, CPU Engram offload and the same training
+dtype; separate initial adapters/deltas and random initialization are rejected.
+It starts a new RL optimizer, rather than resuming the SFT optimizer. All rank
+file hashes, tensor coverage, FSDP/expert ownership and replicated values are
+validated before reconstruction. Bounded copies restore the backbone, including
+frozen indexers and FP32 routing buffers, without another weight export.
+Full Engram rows populate the sealed baseline directly; sparse snapshots apply
+their rows over the original base. Learner, reference and actors start from
+that SFT baseline, with empty RL dirty-row sets. `train_engram` controls later
+RL row updates. Publications and recovery bind the SFT snapshot identity.
+Keep the original model and immutable snapshot accessible to every role;
+independent actors reread and validate the snapshot. Existing full-policy
+publication and memory requirements remain unchanged.
+
+CPU regressions reconstruct real four-rank full SFT snapshots at CP1/EP2 and
+CP2/EP2, including uneven and empty shards. Tiny native DSV4 checks cover full
+and sparse Engram, BF16 with FP32 islands, exact three-role initialization,
+reference isolation, 20 RL steps and fresh-process step-21 recovery. These
+checks do not establish that original 40-layer full RL fits or runs on this host.
+The Engram Linux/CUDA gate passed 13 RL tests, including CPU-sparse/two-GPU-dense
 clipping and warm-cache update/restore across streams. Nine SFT Engram tests
 also passed, including GPU-cache continuation and all-rank rejection before
 mutation. Released-model trainable-Engram validation remains a separate gate.

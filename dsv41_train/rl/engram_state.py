@@ -43,14 +43,19 @@ def validate_delta(payload, identity, shapes, dtype):
             raise ValueError(f"invalid Engram delta indices, dtype, shape or values: {name}")
 
 
-def baseline_identity(model_dir, config, dtype, random_init, seed):
+def baseline_identity(model_dir, config, dtype, random_init, seed, source=None):
     """Identity used by portable SFT initial-row payloads; does not allocate rows."""
     from .checkpoint import run_identity
     identity = run_identity(model_dir, Path(model_dir) / "config.json", random_init)
     identity.pop("data_sha256")
-    return {"source": identity, "dtype": str(dtype), "seed": seed if random_init else None,
-            "tables": {str(layer): [rows, config.engram_head_dim]
-                       for layer, rows in zip(config.engram_layer_ids, config.engram_num_embeddings)}}
+    result = {"source": identity, "dtype": str(dtype), "seed": seed if random_init else None,
+              "tables": {str(layer): [rows, config.engram_head_dim]
+                         for layer, rows in zip(config.engram_layer_ids, config.engram_num_embeddings)}}
+    if source is not None:
+        if random_init or source.base_identity != identity:
+            raise ValueError("SFT Engram source base identity differs")
+        result["initial_sft_checkpoint"] = source.identity
+    return result
 
 
 class EngramBaseline:
@@ -88,12 +93,15 @@ class EngramBaseline:
         return torch.frombuffer(mapping, dtype=self.dtype).reshape(rows, width)
 
     @classmethod
-    def create(cls, model_dir, config, dtype, random_init, seed, initial_delta=None):
+    def create(cls, model_dir, config, dtype, random_init, seed, initial_delta=None, source=None):
         from .checkpoint import file_sha256
         from .policy import _layout, _SafeTensorShard
         root = Path(model_dir)
-        identity = baseline_identity(root, config, dtype, random_init, seed)
+        identity = baseline_identity(root, config, dtype, random_init, seed, source)
         shapes = {name: tuple(shape) for name, shape in identity["tables"].items()}
+        if source is not None and (initial_delta is not None or source.engram_shapes != shapes
+                or any(value != dtype for value in source.engram_dtypes.values())):
+            raise ValueError("SFT Engram shape/dtype differs or initial delta was also supplied")
         if not shapes or dtype not in (torch.float32, torch.bfloat16):
             raise ValueError("trainable Engram requires nonempty FP32 or BF16 CPU tables")
         payload = None
@@ -106,8 +114,9 @@ class EngramBaseline:
             raise RuntimeError("large Engram baselines require Linux memfd; tempfile CPU fallback is limited to 64 MiB")
         fds = {}
         result = cls(identity, shapes, dtype, fds)
-        released = ShardedSafeTensorReader(root) if not random_init and config.checkpoint_format == "released" else None
-        native = _layout(root) if not random_init and released is None else None
+        needs_base = source is None or "sparse" in source.engram_modes.values()
+        released = ShardedSafeTensorReader(root) if needs_base and not random_init and config.checkpoint_format == "released" else None
+        native = _layout(root) if needs_base and not random_init and released is None else None
         try:
             for name, (rows, width) in shapes.items():
                 size = rows * width * torch.empty((), dtype=dtype).element_size()
@@ -122,14 +131,15 @@ class EngramBaseline:
                 destination = torch.frombuffer(mapping, dtype=dtype).reshape(rows, width)
                 reader = state = None
                 try:
-                    if released is not None:
+                    full_source = source is not None and source.engram_modes[name] == "full"
+                    if not full_source and released is not None:
                         prefix = f"layers.{name}.engram.embed"
                         for suffix, shape, storage in (("weight", [rows, width], "F8_E4M3"),
                                                        ("scale", [rows, width // 32], "F8_E8M0")):
                             meta = released.metadata(f"{prefix}.{suffix}")
                             if width % 32 or meta["shape"] != shape or meta["dtype"] != storage:
                                 raise ValueError(f"invalid released Engram layout for {prefix}.{suffix}")
-                    elif native is not None:
+                    elif not full_source and native is not None:
                         keys, safetensors = native
                         key = f"model.engram_tables.{name}.weight"
                         from .policy import _checkpoint_file
@@ -143,7 +153,7 @@ class EngramBaseline:
                             if tuple(state[key].shape) != (rows, width):
                                 raise ValueError(f"native Engram shape differs: {name}")
                     generator = torch.Generator().manual_seed((seed + int(name)) % (2**63 - 1))
-                    for start in range(0, rows, cls.chunk_rows):
+                    for start in range(0, 0 if full_source else rows, cls.chunk_rows):
                         stop = min(rows, start + cls.chunk_rows)
                         if random_init:
                             destination[start:stop].normal_(std=config.initializer_range, generator=generator)
@@ -156,6 +166,9 @@ class EngramBaseline:
                             if values.dtype not in (torch.float32, torch.bfloat16):
                                 raise ValueError(f"invalid native Engram dtype: {name}")
                             destination[start:stop].copy_(values)
+                    if source is not None:
+                        for indices, values in source.iter_engram_rows(name):
+                            destination.index_copy_(0, indices, values)
                     if payload is not None:
                         record = payload["tables"][name]
                         destination.index_copy_(0, record["indices"], record["values"])
