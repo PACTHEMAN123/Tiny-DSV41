@@ -124,23 +124,26 @@ def apply_fsdp2_layer(
 
 
 def synchronize_cp_gradients(model: nn.Module, cp: ContextParallel) -> None:
-    """Normalize gradients excluded from global dense FSDP reduction."""
+    """Normalize non-dense gradients once after all accumulated backwards."""
 
-    if not cp.enabled:
-        return
     experts = {
-        id(parameter)
+        id(parameter): module.global_num_experts // module.num_experts
         for module in model.modules()
         if isinstance(module, RoutedExperts) and module.num_experts < module.global_num_experts
         for parameter in module.parameters()
     }
-    replicated = {id(parameter) for parameter in _replicated_fp32_parameters(model)}
+    replicated = (
+        {id(parameter) for parameter in _replicated_fp32_parameters(model)}
+        if cp.enabled else set()
+    )
     for parameter in model.parameters():
         if parameter.grad is None:
             continue
         gradient = local_tensor(parameter.grad)
         if id(parameter) in experts:
-            gradient.div_(cp.size)
+            # EP sums token contributions; expert FSDP averages over W / EP,
+            # while dense FSDP averages over W, including when CP is disabled.
+            gradient.div_(experts[id(parameter)])
         elif id(parameter) in replicated:
             dist.all_reduce(gradient)
             gradient.div_(dist.get_world_size())
@@ -176,7 +179,7 @@ def apply_fsdp2_root(
     if ignored_params:
         root_options["ignored_params"] = ignored_params
     fully_shard(model, **root_options)
-    if meshes.ep is not None and meshes._dense is not None:
+    if meshes.ep is not None:
         _disable_backward_prefetch(model)
 
 

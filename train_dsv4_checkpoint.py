@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 
 from dsv41_train.models.dsv4 import DeepSeekV41Config, load_dsv41_backbone_window
+from dsv41_train.models.dsv4.moe import RoutedExperts
 from dsv41_train.cp import pack_sequences
 from dsv41_train.models.dsv4.parallel import (
     apply_fsdp2_layer,
@@ -39,12 +40,13 @@ def maximum_parameter_delta(before: torch.Tensor, after: torch.Tensor) -> torch.
 
 
 def install_sgd_in_backward(
-    model: torch.nn.Module, learning_rate: float, cp_size: int
+    model: torch.nn.Module, learning_rate: float
 ) -> set[int]:
-    expert_ids = {
-        id(parameter)
-        for layer in model.model.layers
-        for parameter in layer.moe.routed.parameters()
+    expert_divisors = {
+        id(parameter): module.global_num_experts // module.num_experts
+        for module in model.modules()
+        if isinstance(module, RoutedExperts)
+        for parameter in module.parameters()
     }
     installed = set()
     for parameter in model.parameters():
@@ -52,7 +54,7 @@ def install_sgd_in_backward(
             continue
         installed.add(id(parameter))
 
-        scale = cp_size if id(parameter) in expert_ids else 1
+        scale = expert_divisors.get(id(parameter), 1)
 
         def step(value: torch.nn.Parameter, divisor: int = scale) -> None:
             if value.grad is not None:
@@ -175,7 +177,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
     backward_scale = _IN_BACKWARD_SCALE if args.optimizer_in_backward else 1.0
     effective_learning_rate = args.learning_rate / backward_scale
     stepped = (
-        install_sgd_in_backward(model, effective_learning_rate, args.cp_size)
+        install_sgd_in_backward(model, effective_learning_rate)
         if args.optimizer_in_backward
         else set()
     )
