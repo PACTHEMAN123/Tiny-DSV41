@@ -159,7 +159,7 @@ def assert_exact(actual, expected, name="restored"):
         assert actual == expected, (name, actual, expected)
 
 
-def row_probe(meshes, runtime):
+def row_probe(meshes, runtime, cache_bytes=0):
     reports = []
     for frozen in (False, True):
         models, optimizers = [], []
@@ -169,6 +169,8 @@ def row_probe(meshes, runtime):
                                              engram_offload=offload).bfloat16()
             if not offload:
                 model.table.to(runtime.device)
+            elif cache_bytes:
+                model.table.configure_cache(cache_bytes, runtime.device)
             with torch.no_grad():
                 initial = torch.arange(11 * 32).reshape(11, 32).float() / 1024
                 model.table.weight.copy_(initial[model.table.row_start:model.table.row_stop])
@@ -215,6 +217,8 @@ def native_probe(args, runtime, cp_size):
     actual, optimizer = native(config, True, runtime.device, meshes, cp, dispatcher, actual_raw)
     data = batches(runtime, cp_size, args.seq_len)
     table = actual.model.engram_tables["1"]
+    if args.cache_bytes:
+        table.configure_cache(args.cache_bytes, runtime.device)
     hashes = actual.model.hash(data[0]["input_ids"].to(runtime.device), data[0]["attention_mask"].bool().to(runtime.device))
     assert hashes.max().item() < (4097 + 1) // 2, "fixture must leave owner rank 1 empty"
     directory = args.output / f"cp{cp_size}"
@@ -278,11 +282,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--seq-len", type=int, default=64)
+    parser.add_argument("--cache-bytes", type=int, default=0)
     parser.add_argument("--resume-check", action="store_true")
     parser.add_argument("--check-setup", action="store_true")
     args = parser.parse_args()
     if args.seq_len < 8 or args.seq_len % 2:
         parser.error("seq-len must be even and at least 8")
+    if args.cache_bytes < 0:
+        parser.error("cache-bytes must be nonnegative")
     torch.set_num_threads(1)
     if args.check_setup:
         model, _ = native(configuration(args.seq_len), True, torch.device("cpu"))
@@ -307,7 +314,7 @@ def main():
         reports = {}
         if not args.resume_check:
             meshes, _, _ = build_parallelism(1, 2)
-            reports["row_probes"] = row_probe(meshes, runtime)
+            reports["row_probes"] = row_probe(meshes, runtime, args.cache_bytes)
         reports["native"] = [native_probe(args, runtime, cp) for cp in (1, 2)]
         gathered = [None] * 2
         dist.all_gather_object(gathered, reports)
