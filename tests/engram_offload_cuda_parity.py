@@ -1,9 +1,9 @@
-"""Two-GPU NCCL gate for synchronous CPU Engram; random tiny weights only.
+"""Two-GPU NCCL gate for CPU Engram and its row cache; random tiny weights only.
 
 Run once with --output DIR, then independently with the same DIR --resume-check.
 --check-setup validates tiny configuration/model construction on CPU only.
---repeat-baseline diagnoses U,C,U,C,U,C restores at CP1/EP2; --reference-torch
-uses strict deterministic Torch references and requires exact repeatability.
+--repeat-baseline diagnoses U,C,U,C,U,C restores at CP1/EP2. --reference-torch
+uses strict deterministic Torch references for exact repeat, parity and resume.
 """
 
 import argparse
@@ -226,6 +226,8 @@ def native_probe(args, runtime, cp_size):
     assert hashes.max().item() < (4097 + 1) // 2, "fixture must leave owner rank 1 empty"
     directory = args.output / f"cp{cp_size}"
     identity = dict(probe="native-lora-trainable-engram", cp=cp_size, ep=2, seq_len=args.seq_len)
+    if args.reference_torch:
+        identity["reference_backend"] = "torch"
     options = dict(family="dsv4", runtime=runtime, cp_size=cp_size)
     update = lambda model, opt: train_update(model, opt, data, synchronize=lambda: synchronize_cp_gradients(model, cp), **options)
     if args.resume_check:
@@ -257,11 +259,14 @@ def native_probe(args, runtime, cp_size):
                               offload_nnz=actual_raw["nnz"], oracle_nnz=oracle_raw["nnz"])
             print(json.dumps(dict(event="native_comparison", cp=cp_size, step=step, rank=runtime.rank,
                                   offload_loss=metrics["loss"], oracle_loss=control["loss"], **diagnostic)), flush=True)
-            assert abs(metrics["loss"] - control["loss"]) < 5e-4, dict(
+            loss_matches = (metrics["loss"] == control["loss"] if args.reference_torch else
+                            abs(metrics["loss"] - control["loss"]) < 5e-4)
+            assert loss_matches, dict(
                 cp=cp_size, step=step, offload_loss=metrics["loss"], oracle_loss=control["loss"],
                 diagnostic=diagnostic, previous_errors=errors)
-            errors.append(dict(parameter_max=compare(actual_values, oracle_values),
-                               gradient_max=compare(actual_gradients, oracle_gradients), **diagnostic))
+            errors.append(dict(parameter_max=compare(actual_values, oracle_values, exact=args.reference_torch),
+                               gradient_max=compare(actual_gradients, oracle_gradients, exact=args.reference_torch),
+                               **diagnostic))
             assert table.weight.device.type == "cpu" and table.weight.grad.device.type == "cpu"
             if runtime.rank == 1:
                 assert table.weight.grad._nnz() == 0
@@ -367,8 +372,6 @@ def main():
         parser.error("cache-bytes must be nonnegative")
     if args.repeat_baseline and (args.resume_check or args.cache_bytes <= 0):
         parser.error("repeat-baseline requires positive cache-bytes and cannot use resume-check")
-    if args.reference_torch and not args.repeat_baseline:
-        parser.error("reference-torch requires repeat-baseline")
     torch.set_num_threads(1)
     if args.reference_torch:
         reference_torch()
