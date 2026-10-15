@@ -100,6 +100,16 @@ the adapter alone does not contain optimizer or resume state. With
 table rows; an adapter-only export is omitted. Generation metrics are separate
 from the teacher-forced loss and require checking the decoded answers.
 
+Validation on the released 40-layer DeepSeek model completed 20 LoRA SFT steps
+with 4113–4116 actual tokens per example on eight GPUs (EP=8, CP=1).
+Five identity prompts changed from DeepSeek answers to `RTP大模型`; this is
+an authored identity-task check, not a general quality benchmark. The final
+step took 4.35 seconds and peaked at 191.50 GiB allocated per GPU. A fresh
+process restored parameters, buffers, AdamW state and RNG exactly, and retained
+all five answers after another update. Repeated native GPU computations show
+small numerical differences, so bitwise continuation is not guaranteed.
+These results cover LoRA with resident frozen Engram, not full-parameter SFT.
+
 ### Asynchronous GRPO MVP
 
 `dsv41_train.rl` trains native DeepSeek V4.1 and Qwen3 MoE models using the same
@@ -119,6 +129,19 @@ must supply their previously implicit fields explicitly.
 The RL CLI defaults to vLLM inference. Its current weight-update adapter supports
 Qwen3 MoE head training. DeepSeek vLLM RL requires an additional weight adapter;
 the following DeepSeek/CPU examples explicitly use native compatibility.
+
+Native LoRA RL uses `--rollout-engine native-pytorch --trainable-scope lora`.
+Set `lora_rank`, `lora_alpha` and optional `lora_targets` in the RL JSON;
+`lora_dropout` must be zero. `--initial-adapter /path/to/adapter.pt` starts
+learner, reference and actors from the same portable SFT adapter, whose
+configuration must match. The reference stays at that initial policy while
+learner updates are published as versioned A/B tensors. Resume and standalone
+sampling require the same base and initial adapter file; checkpoint identity
+also binds their configuration and the initialization seed. This path retains
+the native rollout manager's version/digest/ACK protocol. RL Engram tables
+remain frozen, and this option does not add vLLM LoRA or distributed RL CP.
+CPU tests cover both model families through training, actor activation and
+fresh-process recovery; large-model GPU RL validation is still pending.
 
 For pretrained RL, point `--model-dir` at a downloaded checkpoint repository
 directory. Its config and weights must agree; missing weights are an error.
