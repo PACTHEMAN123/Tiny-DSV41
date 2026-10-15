@@ -299,6 +299,10 @@ file paths remain supported. An SFT resume at the already-completed step can
 export into a new output directory without another update. Partial-layer and
 nonzero-dropout SFT still train normally but do not export this bundle; full SFT
 requires a separate backbone export and is not represented by this LoRA format.
+The six bundle regressions pass on Linux/CUDA, including real two-rank
+NCCL/FSDP adapter export and propagation of a writer-rank IO failure. The
+SFT-to-RL learner/reference/actor equality and continuation checks use a tiny
+CPU model; released-model joint SFT/RL validation remains separate.
 Row payloads can grow toward full-table size, and full backbone/optimizer states
 still require their own memory and storage. CPU tests cover 20 steps, a fresh
 process continuing at step 21, actor publication and reference isolation;
