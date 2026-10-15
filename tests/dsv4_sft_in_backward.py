@@ -24,6 +24,7 @@ from dsv41_train.models.dsv4.parallel import apply_fsdp2, build_parallelism, syn
 from dsv41_train.optim import install_sgd_in_backward
 from dsv41_train.runtime import Runtime, local_tensor
 from dsv41_train.sft_checkpoint import load_checkpoint, save_checkpoint
+from dsv41_train.sft_engram import EngramCheckpoint
 from dsv41_train.sft_data import collate_examples
 from train_sft import train_update
 from engram_offload_cuda_parity import assert_exact, configuration, reference_torch
@@ -62,6 +63,14 @@ def native(config, device, *, bf16=False, meshes=None, cp=None, dispatcher=None)
         assert table.weight.device.type == "cpu" and not isinstance(table.weight, DTensor)
     optimizer = torch.optim.SGD(model.parameters(), lr=.05, foreach=False)
     install_engram_sgd_hooks(model, optimizer)
+    # This tiny random fixture has no mounted base checkpoint. Keep its small
+    # owner shards only for the same row-reader contract used by released SFT.
+    originals = {f"model.engram_tables.{name}.weight": table.weight.detach().clone()
+                 for name, table in model.model.engram_tables.items()}
+    starts = {f"model.engram_tables.{name}.weight": table.row_start
+              for name, table in model.model.engram_tables.items()}
+    model._sft_engram_checkpoint = EngramCheckpoint(model, optimizer,
+        lambda name, ids: originals[name].index_select(0, ids - starts[name]))
     return model, optimizer
 
 
@@ -114,6 +123,10 @@ def parity(cp_size, output, runtime, exact=False):
                 max_error = max(max_error, (actual.float() - expected.float()).abs().max().item())
         if step == 1:
             save_checkpoint(checkpoint, models[1], optimizers[1], step=1, identity=identity, data_position=2)
+            payload = torch.load(checkpoint / f"rank-{runtime.rank}.pt", map_location="cpu", weights_only=True, mmap=True)
+            assert not models[1]._sft_engram_checkpoint.parameter_names.intersection(payload["parameters"])
+            assert payload["engram_rows"]["schema"] == models[1]._sft_engram_checkpoint.schema
+            del payload
             saved = snapshot(models[1], optimizers[1], runtime.device)
     final = {name: local_tensor(value).detach().clone() for name, value in models[1].named_parameters()}
     assert load_checkpoint(checkpoint, models[1], optimizers[1], identity=identity) == (1, 2)
@@ -165,7 +178,7 @@ def parity(cp_size, output, runtime, exact=False):
                 actual_cpu_fsdp=runtime.device.type == "cpu", full_parameter=True,
                 reference_torch=exact, steps=2, restored_exact=True, resume_exact=True,
                 maximum_update_difference=maximum_error.item(), hooked_parameters=len(state.parameter_ids),
-                global_nonfinite_abort=True, sparse_engram_and_fp32_updated=True)
+                global_nonfinite_abort=True, sparse_engram_and_fp32_updated=True, sparse_engram_checkpoint=True)
 
 
 def main():
@@ -180,6 +193,7 @@ def main():
         reference_torch()
     if args.check_setup:
         model, _ = native(config_for(args.device), torch.device("cpu"), bf16=args.device == "cuda")
+        assert model._sft_engram_checkpoint.parameter_names
         counts = {}
         for parameter in model.parameters():
             assert bool(torch.isfinite(parameter).all())
@@ -187,7 +201,7 @@ def main():
         if args.device == "cuda":
             assert counts.keys() == {"torch.bfloat16", "torch.float32"}
         print(json.dumps(dict(event="setup_passed", device_fixture=args.device, full_parameter=True,
-                              parameter_count_by_dtype=counts)), flush=True)
+                              parameter_count_by_dtype=counts, sparse_engram_checkpoint=True)), flush=True)
         return
     if not args.output:
         parser.error("--output is required unless --check-setup is used")

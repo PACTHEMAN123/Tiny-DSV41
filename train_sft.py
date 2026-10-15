@@ -306,7 +306,9 @@ def train(args, runtime):
         in_backward = install_sgd_in_backward(model, optimizer, gradient_accumulation_steps=args.gradient_accumulation_steps)
     if args.train_engram or (args.engram_offload and args.mode == "full"):
         from dsv41_train.engram_offload import install_engram_sgd_hooks
+        from dsv41_train.sft_engram import build_engram_checkpoint
         install_engram_sgd_hooks(model, optimizer)
+        model._sft_engram_checkpoint = build_engram_checkpoint(model, args.model_path, optimizer)
     step, cursor = load_checkpoint(args.resume, model, optimizer, identity=identity) if args.resume else (0, 0)
     expected_cursor = step * args.gradient_accumulation_steps * args.batch_size * (runtime.world_size // args.cp_size)
     if type(cursor) is not int or cursor != expected_cursor:

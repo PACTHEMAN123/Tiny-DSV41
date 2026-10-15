@@ -114,6 +114,17 @@ the adapter alone does not contain optimizer or resume state. With
 table rows; an adapter-only export is omitted. Generation metrics are separate
 from the teacher-forced loss and require checking the decoded answers.
 
+Trainable CPU Engram snapshots store cumulative SGD-touched rows with their
+rank-local ownership, rather than copying each complete table. Fresh restore
+applies these rows to the verified original base. Rolling back an already
+trained model rereads only dirty rows absent from the older snapshot, using
+the original V4.1 E4M3/E8M0 layout, then invalidates the GPU cache. All ranks
+validate payloads before restoring; a base-storage I/O failure aborts restore.
+Dense trainable backbone weights still require full shard storage, and row
+snapshots grow with the number of distinct rows touched. Snapshots require the
+same storage schema; older full-table snapshots for trainable offload are not
+converted automatically. Frozen-Engram LoRA snapshots remain compatible.
+
 Validation on the released 40-layer DeepSeek model completed 20 LoRA SFT steps
 with 4113–4116 actual tokens per example on eight GPUs (EP=8, CP=1).
 Five identity prompts changed from DeepSeek answers to `RTP大模型`; this is

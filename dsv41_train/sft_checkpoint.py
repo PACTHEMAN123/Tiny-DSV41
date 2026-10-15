@@ -92,10 +92,16 @@ def _schema(model, optimizer):
     parameters, buffers = _tensors(model)
     devices = sorted({t.device.index for t in map(_local, (*model.parameters(), *model.buffers()))
                       if t.device.type == "cuda"})
-    return {"parameters": {name: _layout(p) for name, p in parameters.items()},
+    schema = {"parameters": {name: _layout(p) for name, p in parameters.items()},
             "buffers": {name: _layout(b) for name, b in buffers.items()},
             "ownership": _ownership(model), "optimizer": _optimizer_spec(optimizer, parameters),
             "cuda_devices": devices}
+    manager = getattr(model, "_sft_engram_checkpoint", None)
+    if manager is not None:
+        if not manager.parameter_names.issubset(parameters) or manager.schema.keys() != manager.parameter_names:
+            raise ValueError("Engram checkpoint manager does not match trainable parameters")
+        schema["engram_rows"] = manager.schema
+    return schema
 
 
 def _drain(model):
@@ -186,11 +192,16 @@ def save_checkpoint(path, model, optimizer, *, step, identity, data_position):
     _collect({"error": error})
     try:
         parameters, buffers = _tensors(model)
-        payload = {"parameters": {name: _local(p).detach() for name, p in parameters.items()},
+        manager = getattr(model, "_sft_engram_checkpoint", None)
+        excluded = manager.parameter_names if manager is not None else ()
+        payload = {"parameters": {name: _local(p).detach() for name, p in parameters.items() if name not in excluded},
                    "buffers": {name: _local(b).detach() for name, b in buffers.items()},
                    "optimizer": _encode_state(optimizer, parameters), "data_position": data_position,
                    "cpu_rng": torch.get_rng_state(),
                    "cuda_rng": {device: torch.cuda.get_rng_state(device) for device in schema["cuda_devices"]}}
+        if manager is not None:
+            payload["engram_rows"] = manager.state_dict()
+            manager.validate(payload["engram_rows"])
         filename = f"rank-{rank}.pt"
         atomic_save(payload, path / filename)
         record = {"file": filename, "sha256": file_sha256(path / filename),
@@ -246,11 +257,18 @@ def load_checkpoint(path, model, optimizer, *, identity):
             raise ValueError("rank file checksum differs")
         payload = torch.load(path / record["file"], map_location="cpu", weights_only=True, mmap=True)
         parameters, buffers = _tensors(model)
-        for section, tensors in (("parameters", parameters), ("buffers", buffers)):
+        manager = getattr(model, "_sft_engram_checkpoint", None)
+        if (manager is not None) != ("engram_rows" in payload):
+            raise ValueError("Engram row snapshot presence differs")
+        excluded = manager.parameter_names if manager is not None else ()
+        saved_parameters = {name: p for name, p in parameters.items() if name not in excluded}
+        for section, tensors in (("parameters", saved_parameters), ("buffers", buffers)):
             if payload[section].keys() != tensors.keys():
                 raise ValueError(f"{section} names differ")
             for name, value in payload[section].items():
                 _validate_tensor(value, schema[section][name], name)
+        if manager is not None:
+            manager.validate(payload["engram_rows"])
         _decode_state(payload["optimizer"], optimizer, parameters, materialize=False)
         torch.Generator().set_state(payload["cpu_rng"])
         if payload["cuda_rng"].keys() != set(schema["cuda_devices"]):
@@ -263,13 +281,15 @@ def load_checkpoint(path, model, optimizer, *, identity):
         error = f"rank {rank}: {exc}"
     _collect({"error": error})
     with torch.no_grad():
-        for section, tensors in (("parameters", parameters), ("buffers", buffers)):
+        for section, tensors in (("parameters", saved_parameters), ("buffers", buffers)):
             for name, destination in tensors.items():
                 _local(destination).copy_(payload[section][name])
         for parameter in parameters.values():
             parameter.grad = None
         optimizer.state.clear()
         optimizer.state.update(_decode_state(payload["optimizer"], optimizer, parameters, materialize=True))
+        if manager is not None:
+            manager.load_state_dict(payload["engram_rows"])
         for module in model.modules():
             if hasattr(module, "sparse_gradients") and callable(getattr(module, "clear_cache", None)):
                 module.clear_cache()
