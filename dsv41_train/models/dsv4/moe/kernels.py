@@ -34,7 +34,6 @@ if triton is not None:
         up,
         weights,
         output,
-        rows: tl.constexpr,
         columns: tl.constexpr,
         gate_row_stride: tl.constexpr,
         gate_column_stride: tl.constexpr,
@@ -47,7 +46,9 @@ if triton is not None:
     ):
         row = tl.program_id(0)
         columns_offset = tl.program_id(1) * block + tl.arange(0, block)
-        mask = (row < rows) & (columns_offset < columns)
+        # The launch grid has exactly one program per routed row. Keeping the
+        # changing row count out of the signature avoids mid-backward JIT loads.
+        mask = columns_offset < columns
         gate_value = tl.load(
             gate
             + row * gate_row_stride
@@ -86,7 +87,6 @@ if triton is not None:
         grad_gate,
         grad_up,
         grad_weights,
-        rows: tl.constexpr,
         columns: tl.constexpr,
         grad_output_row_stride: tl.constexpr,
         grad_output_column_stride: tl.constexpr,
@@ -103,7 +103,7 @@ if triton is not None:
     ):
         row = tl.program_id(0)
         columns_offset = tl.program_id(1) * block + tl.arange(0, block)
-        mask = (row < rows) & (columns_offset < columns)
+        mask = columns_offset < columns
         grad = tl.load(
             grad_output
             + row * grad_output_row_stride
@@ -171,7 +171,6 @@ if triton is not None:
             up,
             weights,
             output,
-            rows=gate.shape[0],
             columns=gate.shape[1],
             gate_row_stride=gate.stride(0),
             gate_column_stride=gate.stride(1),
@@ -205,7 +204,6 @@ if triton is not None:
             grad_gate,
             grad_up,
             grad_weights,
-            rows=gate.shape[0],
             columns=gate.shape[1],
             grad_output_row_stride=grad_output.stride(0),
             grad_output_column_stride=grad_output.stride(1),
