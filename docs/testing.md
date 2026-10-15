@@ -11,6 +11,23 @@ python3 -m unittest discover -s tests -v
 The Qwen checkpoint tests are skipped when the optional `safetensors` package
 is not installed.
 
+Default RL selection, learner/actor contracts and legacy checkpoint compatibility
+can be checked without starting a vLLM engine:
+
+```bash
+PYTHONPATH=.:tests python3 -m unittest -v \
+  test_generic_vllm_rl.GenericSelectionTests \
+  test_generic_vllm_rl.GenericVLLMBackendTests \
+  test_vllm_learner_contract.VLLMLearnerContractTests \
+  test_rl_family.ModelFamilyTests \
+  test_rl_evaluation.EvaluationTests.test_legacy_checkpoint_keeps_original_eos_and_checks_recorded_identity
+```
+
+These 18 CPU fixture tests passed on the integrated branch. Full SFT source
+reconstruction and native SFT-to-RL initialization also passed six CPU tests on
+Linux (`python3 -m unittest discover -s tests -p 'test_*sft_source.py' -v`).
+Neither suite validates a released-model vLLM GPU engine.
+
 ## CPU distributed parity
 
 Shared RL token log probabilities and checkpointed gradients, including a CP
@@ -53,6 +70,13 @@ Each step starts from bit-exact matching state and checks gradients and one
 SGD update. This does not assert equality of independently rounded BF16
 training trajectories. Use `--device cpu` for two independent FP32 steps.
 The output path must be new; reports include the precision and error bounds.
+
+The integration corrects expert-gradient normalization for CP1/EP>1 and disables
+FSDP backward prefetch whenever EP is enabled. These shared changes also affect
+the original training entry points: old expert updates can differ in magnitude,
+and prefetch scheduling can change performance. The CP/EP gradient checks verify
+normalization against an unsharded reference; they do not promise identical
+numerics or throughput to the earlier implementation.
 
 Two-GPU Qwen output and gradient parity:
 
