@@ -11,11 +11,13 @@ import os
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from types import MethodType
 
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.tensor import DTensor
+from torch.nn import functional as F
 
 from dsv41_train.engram_offload import install_engram_sgd_hooks
 from dsv41_train.lora import LoRAConfig, inject_lora
@@ -36,7 +38,13 @@ def configuration(length):
                    engram_num_embeddings=[4097], max_position_embeddings=max(128, length))
 
 
-def native(config, offload, device, meshes=None, cp=None, dispatcher=None):
+def oracle_lookup(table, indices):
+    # Quantize before owner-gradient scaling and NCCL, matching the BF16 table
+    # boundary while retaining FP32 sparse accumulation in this test reference.
+    return F.embedding(indices, table.weight, sparse=True).bfloat16()
+
+
+def native(config, offload, device, meshes=None, cp=None, dispatcher=None, diagnostics=None):
     torch.manual_seed(613)
     model = DeepSeekV41ForCausalLM(config, context_parallel=cp, token_dispatcher=dispatcher,
                                  engram_mesh=None if meshes is None else meshes.engram,
@@ -53,6 +61,10 @@ def native(config, offload, device, meshes=None, cp=None, dispatcher=None):
     for module in model.modules():
         for name, buffer in module.named_buffers(recurse=False):
             setattr(module, name, buffer.to(device))
+    if not offload:
+        for table in model.model.engram_tables.values():
+            table.weight.data = table.weight.data.float()  # Already BF16-rounded.
+            table._lookup = MethodType(oracle_lookup, table)
     model.gradient_checkpointing_enable()
     if meshes is not None:
         apply_fsdp2(model, meshes)
@@ -61,7 +73,31 @@ def native(config, offload, device, meshes=None, cp=None, dispatcher=None):
         assert table.weight.device.type == ("cpu" if offload else "cuda")
         assert any(isinstance(p, DTensor) for p in model.parameters()), "FSDP was not applied"
     optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=.125, foreach=False)
+    if diagnostics is not None:
+        def capture_before_coalescing(_optimizer, _args, _kwargs):
+            diagnostics.clear()
+            diagnostics.update(gradients={}, nnz={})
+            for name, parameter in model.named_parameters():
+                if ".engram_tables." in name and parameter.grad is not None:
+                    gradient = parameter.grad.detach()
+                    diagnostics["nnz"][name] = gradient._nnz()
+                    # Use the same CPU FP32 reduction for both raw accumulators.
+                    diagnostics["gradients"][name] = gradient.cpu().float().coalesce().to_dense()
+        optimizer.register_step_pre_hook(capture_before_coalescing)
     install_engram_sgd_hooks(model, optimizer)
+    if not offload:
+        def quantize_gradient(_optimizer, _args, _kwargs):
+            for table in model.model.engram_tables.values():
+                if table.weight.grad is not None:
+                    table.weight.grad = table.weight.grad.bfloat16().float()
+        def quantize_weight(_optimizer, _args, _kwargs):
+            with torch.no_grad():
+                for table in model.model.engram_tables.values():
+                    table.weight.copy_(table.weight.bfloat16().float())
+        # Installed after the native FP32 coalescing hook: one BF16 gradient and
+        # one BF16 weight rounding per step, retaining no extra weight precision.
+        optimizer.register_step_pre_hook(quantize_gradient)
+        optimizer.register_step_post_hook(quantize_weight)
     return model, optimizer
 
 
@@ -81,11 +117,46 @@ def compare(actual, expected, *, exact=False):
     assert actual.keys() == expected.keys(), "state/gradient keys differ"
     error = 0.
     for name in actual:
-        torch.testing.assert_close(actual[name], expected[name], rtol=0 if exact else .02,
+        left, right = actual[name], expected[name]
+        if ".engram_tables." in name:
+            left, right = left.float(), right.float()
+        torch.testing.assert_close(left, right, rtol=0 if exact else .02,
                                    atol=0 if exact else 2e-5, msg=lambda message: f"{name}: {message}")
         if actual[name].numel():
             error = max(error, (actual[name].float() - expected[name].float()).abs().max().item())
     return error
+
+
+def grouped_errors(actual, expected):
+    assert actual.keys() == expected.keys(), "diagnostic keys differ"
+    result = dict(engram=0., lora=0., other=0.)
+    for name in actual:
+        group = "engram" if ".engram_tables." in name else "lora" if ".lora_" in name else "other"
+        if actual[name].numel():
+            result[group] = max(result[group], (actual[name].float() - expected[name].float()).abs().max().item())
+    return result
+
+
+def resume_state(model, optimizer, device):
+    return dict(parameters=values(model),
+                buffers={name: local_tensor(value).detach().cpu().clone() for name, value in model.named_buffers()},
+                optimizer=optimizer.state_dict(), cpu_rng=torch.get_rng_state(),
+                cuda_rng=torch.cuda.get_rng_state(device))
+
+
+def assert_exact(actual, expected, name="restored"):
+    if isinstance(actual, torch.Tensor):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=name)
+    elif isinstance(actual, dict):
+        assert actual.keys() == expected.keys(), name
+        for key in actual:
+            assert_exact(actual[key], expected[key], f"{name}.{key}")
+    elif isinstance(actual, (list, tuple)):
+        assert type(actual) is type(expected) and len(actual) == len(expected), name
+        for index, (left, right) in enumerate(zip(actual, expected)):
+            assert_exact(left, right, f"{name}[{index}]")
+    else:
+        assert actual == expected, (name, actual, expected)
 
 
 def row_probe(meshes, runtime):
@@ -140,7 +211,8 @@ def batches(runtime, cp_size, length):
 def native_probe(args, runtime, cp_size):
     meshes, cp, dispatcher = build_parallelism(cp_size, 2)
     config = configuration(args.seq_len)
-    actual, optimizer = native(config, True, runtime.device, meshes, cp, dispatcher)
+    actual_raw, oracle_raw = {}, {}
+    actual, optimizer = native(config, True, runtime.device, meshes, cp, dispatcher, actual_raw)
     data = batches(runtime, cp_size, args.seq_len)
     table = actual.model.engram_tables["1"]
     hashes = actual.model.hash(data[0]["input_ids"].to(runtime.device), data[0]["attention_mask"].bool().to(runtime.device))
@@ -152,29 +224,43 @@ def native_probe(args, runtime, cp_size):
     if args.resume_check:
         step, cursor = load_checkpoint(directory / "step1", actual, optimizer, identity=identity)
         assert (step, cursor) == (1, 2)
+        restored = torch.load(directory / f"resume-state-rank{runtime.rank}.pt", map_location="cpu", weights_only=True)
+        assert_exact(resume_state(actual, optimizer, runtime.device), restored)
+        print(json.dumps(dict(event="restored_exact", cp=cp_size, rank=runtime.rank,
+                              parameters=True, buffers=True, optimizer=True, rng=True)), flush=True)
         metrics = update(actual, optimizer)
         expected = torch.load(directory / f"expected-rank{runtime.rank}.pt", map_location="cpu", weights_only=True)
         compare(values(actual), expected["parameters"], exact=True)
         assert metrics["loss"] == expected["loss"], (metrics["loss"], expected["loss"])
         report = dict(cp=cp_size, independent_resume_exact=True, loss=metrics["loss"])
     else:
-        resident, control_optimizer = native(config, False, runtime.device, meshes, cp, dispatcher)
+        resident, control_optimizer = native(config, False, runtime.device, meshes, cp, dispatcher, oracle_raw)
+        compare(values(actual), values(resident), exact=True)
         initial = table.weight.detach().clone()
         errors = []
         for step in (1, 2):
             if runtime.is_main:
                 print(json.dumps(dict(event="native_update", cp=cp_size, step=step)), flush=True)
             metrics, control = update(actual, optimizer), update(resident, control_optimizer)
+            actual_values, oracle_values = values(actual), values(resident)
+            actual_gradients, oracle_gradients = values(actual, True), values(resident, True)
+            diagnostic = dict(weights=grouped_errors(actual_values, oracle_values),
+                              gradients=grouped_errors(actual_gradients, oracle_gradients),
+                              raw_table_gradient=grouped_errors(actual_raw["gradients"], oracle_raw["gradients"])["engram"],
+                              offload_nnz=actual_raw["nnz"], oracle_nnz=oracle_raw["nnz"])
+            print(json.dumps(dict(event="native_comparison", cp=cp_size, step=step, rank=runtime.rank,
+                                  offload_loss=metrics["loss"], oracle_loss=control["loss"], **diagnostic)), flush=True)
             assert abs(metrics["loss"] - control["loss"]) < 5e-4, dict(
-                cp=cp_size, step=step, offload_loss=metrics["loss"], resident_loss=control["loss"],
-                previous_errors=errors)
-            errors.append(dict(parameters=compare(values(actual), values(resident)),
-                               gradients=compare(values(actual, True), values(resident, True))))
+                cp=cp_size, step=step, offload_loss=metrics["loss"], oracle_loss=control["loss"],
+                diagnostic=diagnostic, previous_errors=errors)
+            errors.append(dict(parameter_max=compare(actual_values, oracle_values),
+                               gradient_max=compare(actual_gradients, oracle_gradients), **diagnostic))
             assert table.weight.device.type == "cpu" and table.weight.grad.device.type == "cpu"
             if runtime.rank == 1:
                 assert table.weight.grad._nnz() == 0
             if step == 1:
                 save_checkpoint(directory / "step1", actual, optimizer, step=1, identity=identity, data_position=2)
+                torch.save(resume_state(actual, optimizer, runtime.device), directory / f"resume-state-rank{runtime.rank}.pt")
         changed = torch.tensor(int(not torch.equal(table.weight, initial)), device=runtime.device)
         dist.all_reduce(changed)
         assert changed.item() > 0, "the CPU table did not update"
@@ -200,7 +286,11 @@ def main():
     torch.set_num_threads(1)
     if args.check_setup:
         model, _ = native(configuration(args.seq_len), True, torch.device("cpu"))
+        reference, _ = native(configuration(args.seq_len), False, torch.device("cpu"))
+        compare(values(model), values(reference), exact=True)
         assert model.model.engram_tables["1"].weight.device.type == "cpu"
+        table = reference.model.engram_tables["1"]
+        assert table.weight.dtype == torch.float32 and table(torch.tensor([0])).dtype == torch.bfloat16
         print("CPU setup passed; CUDA/NCCL/FSDP execution has not been tested.")
         return
     if args.output is None or not torch.cuda.is_available():
