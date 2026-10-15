@@ -44,6 +44,8 @@ def parse_args(argv=None):
     parser.add_argument("--lora-alpha", type=float, default=16.0)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
     parser.add_argument("--lora-targets", help="Comma-separated layer-relative linear module suffixes")
+    parser.add_argument("--engram-offload", action="store_true", help="Keep DSV4 Engram row shards on CPU")
+    parser.add_argument("--train-engram", action="store_true", help="Also update Engram tables in LoRA mode (SGD)")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval-batches", type=int, default=1, help="Fixed batches per data group")
@@ -65,6 +67,8 @@ def validate_args(args, world_size):
         raise ValueError("cp-size and ep-size must divide world size")
     if (args.family == "qwen" or args.cp_size > 1) and args.cp_size != args.ep_size:
         raise ValueError("this topology requires cp-size == ep-size")
+    if args.family != "dsv4" and (args.engram_offload or args.train_engram):
+        raise ValueError("Engram options require the DSV4 model family")
     if args.seq_len % args.cp_size:
         raise ValueError("seq-len must divide evenly across cp-size")
     for name in ("config.json", "model.safetensors.index.json"):
@@ -84,7 +88,9 @@ def validate_args(args, world_size):
         experts = Qwen3MoeConfig.from_json(Path(args.model_path) / "config.json").num_experts
     if experts % args.ep_size:
         raise ValueError("expert count must divide evenly across ep-size")
-    args.optimizer = args.optimizer or ("sgd" if args.mode == "full" else "adamw")
+    args.optimizer = args.optimizer or ("sgd" if args.mode == "full" or args.train_engram else "adamw")
+    if (args.train_engram or (args.engram_offload and args.mode == "full")) and args.optimizer != "sgd":
+        raise ValueError("trainable offloaded Engram or LoRA with trainable Engram requires SGD")
 
 
 def lora_config(args):
@@ -114,6 +120,7 @@ def load_model(args, runtime):
             args.model_path, num_layers=args.num_layers, device=runtime.device, dtype=torch.bfloat16,
             context_parallel=cp, token_dispatcher=dispatcher, engram_mesh=meshes.engram,
             sparse_engram_gradients=args.mode == "lora" or args.optimizer == "sgd",
+            engram_offload=args.engram_offload,
             layer_loaded=layer_loaded,
         )
         if config is not None:
@@ -121,6 +128,7 @@ def load_model(args, runtime):
             for parameter in model.parameters():
                 if id(parameter) not in adapter_ids:
                     parameter.requires_grad_(False)
+            model.model.engram_tables.requires_grad_(args.train_engram)
         apply_fsdp2_root(model, meshes)
         synchronize = lambda: synchronize_cp_gradients(model, cp)
     else:
@@ -178,8 +186,8 @@ def _check_gradients(model, runtime):
         if parameter.requires_grad and parameter.grad is not None:
             gradient = local_tensor(parameter.grad)
             if gradient.is_sparse:
-                gradient = gradient.coalesce().values()
-            finite = finite & torch.isfinite(gradient).all().to(torch.int32)
+                gradient = gradient.float().coalesce().values().to(gradient.dtype)
+            finite = finite & torch.isfinite(gradient).all().to(device=runtime.device, dtype=torch.int32)
     if not _reduce(finite, runtime, dist.ReduceOp.MIN).item():
         raise RuntimeError("SFT produced a non-finite gradient before optimizer.step")
 
@@ -247,6 +255,8 @@ def train(args, runtime):
         "family", "mode", "num_layers", "batch_size", "gradient_accumulation_steps", "seq_len",
         "learning_rate", "optimizer", "cp_size", "ep_size", "seed", "gradient_checkpointing",
     )}
+    identity["training_config"].update({key: True for key in ("engram_offload", "train_engram")
+                                        if getattr(args, key)})
     identity["training_config"].update(world_size=runtime.world_size, enable_thinking=False,
                                        lora=asdict(lora_config(args)) if args.mode == "lora" else None)
     # JSON-normalize tuples for portable identity metadata and strict resume checks.
@@ -261,6 +271,9 @@ def train(args, runtime):
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer_type = torch.optim.SGD if args.optimizer == "sgd" else torch.optim.AdamW
     optimizer = optimizer_type(parameters, lr=args.learning_rate, weight_decay=0, foreach=False)
+    if args.train_engram or (args.engram_offload and args.mode == "full"):
+        from dsv41_train.engram_offload import install_engram_sgd_hooks
+        install_engram_sgd_hooks(model, optimizer)
     step, cursor = load_checkpoint(args.resume, model, optimizer, identity=identity) if args.resume else (0, 0)
     expected_cursor = step * args.gradient_accumulation_steps * args.batch_size * (runtime.world_size // args.cp_size)
     if type(cursor) is not int or cursor != expected_cursor:
@@ -328,7 +341,7 @@ def train(args, runtime):
     after = evaluate(model, eval_batches, family=args.family, runtime=runtime, cp_size=args.cp_size)
     generation_after = generation_eval()
     eval_after_metrics = _max_metrics(runtime, eval_after_peak_allocated_gib=torch.cuda.max_memory_allocated(runtime.device) / 2**30)
-    if args.mode == "lora" and step > initial_step:
+    if args.mode == "lora" and not args.train_engram and step > initial_step:
         save_adapter(model, output_dir / "adapter.pt")
         if runtime.is_main:
             (output_dir / "adapter_metadata.json").write_text(json.dumps({"identity": identity, "step": step}, indent=2) + "\n")

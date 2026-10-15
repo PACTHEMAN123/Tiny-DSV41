@@ -68,6 +68,13 @@ all parameters (SGD by default); LoRA defaults to AdamW and freezes the base,
 including Engram tables. Qwen uses `--family qwen` and requires `CP == EP`.
 Gradient accumulation is weighted by global supervised token count.
 
+For DSV4, `--engram-offload` keeps each rank's Engram row shard on CPU while
+preserving the native hash and distributed lookup. Full SFT updates these rows
+with SGD; LoRA freezes them unless `--train-engram` is also supplied. That
+combination defaults to SGD and requires it explicitly when overriding the
+optimizer. Sparse row gradients are combined in FP32 before each update.
+Frozen CPU tables remain compatible with LoRA's AdamW optimizer.
+
 Metrics record actual input lengths, loss, per-step time and GPU allocated and
 reserved peaks. Optional greedy evaluation uses prompt tokens only, before and
 after training. A reduced model's results do not establish full-model quality.
@@ -78,8 +85,10 @@ data position and RNG. Resume with the same arguments and `--resume PATH`;
 Resume requires the same base identity, training configuration, world size and
 CP/EP ownership. Frozen base weights are reloaded from `--model-path`.
 The rank-local snapshot format preserves independent expert and Engram shards.
-LoRA also exports `adapter.pt` with `adapter_metadata.json`; the adapter alone
-does not contain optimizer or resume state. Generation metrics are separate
+LoRA with frozen Engram also exports `adapter.pt` with `adapter_metadata.json`;
+the adapter alone does not contain optimizer or resume state. With
+`--train-engram`, restore the SFT checkpoint, which also contains the updated
+table rows; an adapter-only export is omitted. Generation metrics are separate
 from the teacher-forced loss and require checking the decoded answers.
 
 ### Asynchronous GRPO MVP

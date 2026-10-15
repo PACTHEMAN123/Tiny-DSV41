@@ -34,6 +34,7 @@ from .attention import (
 from .config import DeepSeekV41Config
 from .mhc import HyperConnection
 from ...cp import ContextParallel, ModelContext
+from ...engram_offload import CPUEmbeddingLookup
 from .moe import RoutedExperts, SparseMoE, TokenDispatcher, TopKRouter
 
 if TYPE_CHECKING:
@@ -64,6 +65,8 @@ class RowShardedEmbedding(nn.Module):
         embedding_dim: int,
         mesh: DeviceMesh | None = None,
         sparse_gradients: bool = False,
+        *,
+        engram_offload: bool = False,
     ) -> None:
         super().__init__()
         if mesh is not None and mesh.ndim != 1:
@@ -72,6 +75,10 @@ class RowShardedEmbedding(nn.Module):
         self.embedding_dim = embedding_dim
         self.mesh = mesh
         self.sparse_gradients = sparse_gradients
+        self.engram_offload = engram_offload
+        if engram_offload and not sparse_gradients:
+            raise ValueError("CPU Engram offload requires sparse gradients")
+        self._cpu_lookup = CPUEmbeddingLookup() if engram_offload else None
         self.size = 1 if mesh is None else mesh.size()
         self.rank = 0 if mesh is None else mesh.get_local_rank()
         self.group = None if mesh is None else mesh.get_group()
@@ -81,11 +88,15 @@ class RowShardedEmbedding(nn.Module):
         base, remainder = divmod(num_embeddings, self.size)
         self.row_start = self.rank * base + min(self.rank, remainder)
         self.row_stop = self.row_start + base + int(self.rank < remainder)
-        self.weight = nn.Parameter(torch.empty(self.row_stop - self.row_start, embedding_dim))
+        allocation_device = torch.empty(0).device
+        if engram_offload and allocation_device.type != "meta":
+            allocation_device = torch.device("cpu")
+        self.weight = nn.Parameter(torch.empty(
+            self.row_stop - self.row_start, embedding_dim, device=allocation_device))
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         if self.size == 1:
-            return F.embedding(indices, self.weight, sparse=self.sparse_gradients)
+            return self._lookup(indices)
         if indices.numel() and (indices.min() < 0 or indices.max() >= self.global_num_embeddings):
             raise IndexError("embedding index is outside the configured row range")
 
@@ -108,16 +119,23 @@ class RowShardedEmbedding(nn.Module):
         routed = self._exchange(
             flat[order].contiguous(), recv_splits, send_splits, autograd=False
         )
-        rows = F.embedding(
-            routed - self.row_start,
-            self.weight,
-            sparse=self.sparse_gradients,
-        )
+        rows = self._lookup(routed - self.row_start)
         rows = _ScaleGradient.apply(rows, 1.0 / self.size)
         returned = self._exchange(
             rows.contiguous(), send_splits, recv_splits, autograd=True
         )
         return returned[torch.argsort(order)].view(*shape, self.embedding_dim)
+
+    def _lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        if self._cpu_lookup is not None:
+            return self._cpu_lookup(self.weight, indices, device=indices.device)
+        return F.embedding(indices, self.weight, sparse=self.sparse_gradients)
+
+    def _apply(self, fn, recurse=True):
+        if self.engram_offload and not self.weight.is_meta:
+            if fn(torch.empty(0, dtype=self.weight.dtype, device="cpu")).device.type != "cpu":
+                raise ValueError("CPU Engram placement is explicit; load the table directly on CPU")
+        return super()._apply(fn, recurse)
 
     def _exchange(
         self,
@@ -393,6 +411,7 @@ class DeepSeekV41Model(nn.Module):
         engram_mesh: DeviceMesh | None = None,
         layer_ids: list[int] | None = None,
         sparse_engram_gradients: bool = False,
+        engram_offload: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -432,6 +451,7 @@ class DeepSeekV41Model(nn.Module):
                     config.engram_head_dim,
                     engram_mesh,
                     sparse_gradients=sparse_engram_gradients,
+                    engram_offload=engram_offload,
                 )
                 for layer_id in self.engram_layer_ids
             }
@@ -584,6 +604,7 @@ class DeepSeekV41ForCausalLM(nn.Module):
         engram_mesh: DeviceMesh | None = None,
         layer_ids: list[int] | None = None,
         sparse_engram_gradients: bool = False,
+        engram_offload: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -595,6 +616,7 @@ class DeepSeekV41ForCausalLM(nn.Module):
             engram_mesh,
             layer_ids,
             sparse_engram_gradients,
+            engram_offload,
         )
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._initialize)

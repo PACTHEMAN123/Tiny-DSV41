@@ -149,6 +149,20 @@ class SFTTrainTests(unittest.TestCase):
                 self.assertEqual(args.steps, 20)
                 self.assertEqual(args.seq_len, 4096)
 
+            base = ["--model-path", directory, "--data", "data.jsonl", "--output-dir", directory]
+            for options, optimizer in ((["--engram-offload"], "adamw"),
+                                       (["--engram-offload", "--train-engram"], "sgd"),
+                                       (["--engram-offload", "--mode", "full"], "sgd")):
+                args = parse_args(base + options)
+                validate_args(args, 1)
+                self.assertEqual(args.optimizer, optimizer)
+            for options in (["--engram-offload", "--train-engram", "--optimizer", "adamw"],
+                            ["--engram-offload", "--mode", "full", "--optimizer", "adamw"]):
+                with self.assertRaisesRegex(ValueError, "requires SGD"):
+                    validate_args(parse_args(base + options), 1)
+            with self.assertRaisesRegex(ValueError, "require the DSV4"):
+                validate_args(parse_args(base + ["--family", "qwen", "--engram-offload"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
