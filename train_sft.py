@@ -38,6 +38,7 @@ def parse_args(argv=None):
     parser.add_argument("--seq-len", type=int, default=4096, help="Actual token limit, without truncation")
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--optimizer", choices=("sgd", "adamw"))
+    parser.add_argument("--optimizer-in-backward", action="store_true", help="DSV4 only: update FSDP shards during backward with plain SGD and one microbatch")
     parser.add_argument("--cp-size", type=int, default=1)
     parser.add_argument("--ep-size", type=int, default=1)
     parser.add_argument("--lora-rank", type=int, default=8)
@@ -94,6 +95,11 @@ def validate_args(args, world_size):
     if experts % args.ep_size:
         raise ValueError("expert count must divide evenly across ep-size")
     args.optimizer = args.optimizer or ("sgd" if args.mode == "full" or args.train_engram else "adamw")
+    if args.optimizer_in_backward:
+        if args.family != "dsv4" or args.optimizer != "sgd":
+            raise ValueError("optimizer-in-backward requires DSV4 and SGD")
+        if args.gradient_accumulation_steps != 1:
+            raise ValueError("optimizer-in-backward requires gradient-accumulation-steps=1")
     if (args.train_engram or (args.engram_offload and args.mode == "full")) and args.optimizer != "sgd":
         raise ValueError("trainable offloaded Engram or LoRA with trainable Engram requires SGD")
 
@@ -190,8 +196,10 @@ def _checked_loss(model, batch, family, runtime):
     return loss
 
 
-def _check_gradients(model, runtime):
+def _check_gradients(model, runtime, in_backward=None):
     finite = torch.ones((), device=runtime.device, dtype=torch.int32)
+    if in_backward is not None:
+        finite = finite & in_backward.local_finite(runtime.device).to(torch.int32)
     for parameter in model.parameters():
         if parameter.requires_grad and parameter.grad is not None:
             gradient = local_tensor(parameter.grad)
@@ -199,11 +207,15 @@ def _check_gradients(model, runtime):
                 gradient = gradient.float().coalesce().values().to(gradient.dtype)
             finite = finite & torch.isfinite(gradient).all().to(device=runtime.device, dtype=torch.int32)
     if not _reduce(finite, runtime, dist.ReduceOp.MIN).item():
-        raise RuntimeError("SFT produced a non-finite gradient before optimizer.step")
+        raise RuntimeError("SFT produced a non-finite gradient or in-backward update; abort and reload the last checkpoint")
 
 
-def train_update(model, optimizer, batches, *, family, runtime, cp_size=1, synchronize=lambda: None):
+def train_update(model, optimizer, batches, *, family, runtime, cp_size=1, synchronize=lambda: None, in_backward=None):
     """Normalize accumulated gradients by global supervised tokens, not batches."""
+    if in_backward is not None:
+        if family != "dsv4" or len(batches) != 1:
+            raise ValueError("optimizer-in-backward requires DSV4 and exactly one microbatch")
+        in_backward.reset()
     counts = [(batch["labels"][:, 1:] != -100).sum().item() for batch in batches]
     totals = torch.tensor([sum(counts), sum(batch["attention_mask"].sum().item() for batch in batches)],
                           device=runtime.device, dtype=torch.float64)
@@ -218,7 +230,7 @@ def train_update(model, optimizer, batches, *, family, runtime, cp_size=1, synch
         (loss * ((runtime.world_size // cp_size) * count / totals[0])).backward()
         weighted_loss += loss.detach().double() * count
     synchronize()
-    _check_gradients(model, runtime)
+    _check_gradients(model, runtime, in_backward)
     optimizer.step()
     loss_value = (_reduce(weighted_loss, runtime) / cp_size / totals[0]).item()
     lengths = [length for batch in batches for length in batch["attention_mask"].sum(dim=1).tolist()]
@@ -272,7 +284,7 @@ def train(args, runtime):
         "family", "mode", "num_layers", "batch_size", "gradient_accumulation_steps", "seq_len",
         "learning_rate", "optimizer", "cp_size", "ep_size", "seed", "gradient_checkpointing",
     )}
-    identity["training_config"].update({key: True for key in ("engram_offload", "train_engram")
+    identity["training_config"].update({key: True for key in ("engram_offload", "train_engram", "optimizer_in_backward")
                                         if getattr(args, key)})
     identity["training_config"].update(world_size=runtime.world_size, enable_thinking=False,
                                        lora=asdict(lora_config(args)) if args.mode == "lora" else None)
@@ -288,6 +300,10 @@ def train(args, runtime):
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer_type = torch.optim.SGD if args.optimizer == "sgd" else torch.optim.AdamW
     optimizer = optimizer_type(parameters, lr=args.learning_rate, weight_decay=0, foreach=False)
+    in_backward = None
+    if args.optimizer_in_backward:
+        from dsv41_train.optim import install_sgd_in_backward
+        in_backward = install_sgd_in_backward(model, optimizer, gradient_accumulation_steps=args.gradient_accumulation_steps)
     if args.train_engram or (args.engram_offload and args.mode == "full"):
         from dsv41_train.engram_offload import install_engram_sgd_hooks
         install_engram_sgd_hooks(model, optimizer)
@@ -337,7 +353,7 @@ def train(args, runtime):
         step_started = time.perf_counter()
         cache_before = _cache_counts(model) if args.engram_cache_mib else None
         metrics = train_update(model, optimizer, batches, family=args.family, runtime=runtime,
-                               cp_size=args.cp_size, synchronize=synchronize)
+                               cp_size=args.cp_size, synchronize=synchronize, in_backward=in_backward)
         torch.cuda.synchronize(runtime.device)
         metrics.update(_max_metrics(runtime, seconds=time.perf_counter() - step_started,
                                     peak_allocated_gib=torch.cuda.max_memory_allocated(runtime.device) / 2**30,

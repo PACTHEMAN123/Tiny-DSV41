@@ -68,6 +68,16 @@ all parameters (SGD by default); LoRA defaults to AdamW and freezes the base,
 including Engram tables. Qwen uses `--family qwen` and requires `CP == EP`.
 Gradient accumulation is weighted by global supervised token count.
 
+DSV4 can opt into `--optimizer-in-backward` with plain SGD and
+`--gradient-accumulation-steps 1`. Reduced FSDP gradients update their shards
+during backward, releasing gradients earlier; CPU Engram and replicated FP32
+parameters still update after synchronization. This path does not support
+momentum, weight decay or gradient clipping. A non-finite gradient/update aborts
+the run on every rank; earlier shard updates are not rolled back, so resume from
+the last checkpoint. This reduces gradient storage, but does not establish that
+the full released model fits: activations, collective buffers and checkpoint
+storage still need separate measurement.
+
 For DSV4, `--engram-offload` keeps each rank's Engram row shard on CPU while
 preserving the native hash and distributed lookup. Full SFT updates these rows
 with SGD; LoRA freezes them unless `--train-engram` is also supplied. That

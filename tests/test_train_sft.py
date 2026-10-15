@@ -169,6 +169,13 @@ class SFTTrainTests(unittest.TestCase):
             cached = parse_args(base + ["--engram-offload", "--engram-cache-mib", "32"])
             validate_args(cached, 1)
             self.assertEqual(cached.engram_cache_mib, 32)
+            self.assertFalse(cached.optimizer_in_backward)
+            enabled = base + ["--mode", "full", "--optimizer-in-backward"]
+            validate_args(parse_args(enabled), 1)
+            for options, message in ((["--gradient-accumulation-steps", "2"], "accumulation"),
+                                     (["--optimizer", "adamw"], "requires DSV4 and SGD")):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_args(parse_args(enabled + options), 1)
 
 
 if __name__ == "__main__":
