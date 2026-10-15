@@ -41,6 +41,47 @@ python3 -m torch.distributed.run --standalone --nproc-per-node=8 \
   --optimizer sgd --steps 1 --batch-size 1 --seq-len 8
 ```
 
+### Text SFT and LoRA
+
+`train_sft.py` reuses the native model loaders, FSDP and CP/EP paths. JSONL
+records contain `prompt` and `answer`, or a text `messages` history ending in
+`user` and an `answer`. The checkpoint chat template defines token boundaries;
+only the final answer through EOS receives labels. Inputs are never truncated.
+
+For an authored identity check with at least 4096 actual tokens per example:
+
+```bash
+PYTHONPATH=. python3 scripts/prepare_identity_sft.py \
+  --model-path /path/to/DeepSeek-V4.1-Flash --output-dir runs/identity-data
+
+PYTHONPATH=. python3 -m torch.distributed.run --standalone --nproc-per-node=8 \
+  train_sft.py --model-path /path/to/DeepSeek-V4.1-Flash \
+  --family dsv4 --mode lora --num-layers 2 --ep-size 8 --cp-size 1 \
+  --data runs/identity-data/train.jsonl --eval-data runs/identity-data/eval.jsonl \
+  --output-dir runs/identity-lora --seq-len 4608 --steps 20 \
+  --learning-rate 1e-3 --gradient-checkpointing --generation-eval
+```
+
+This example selects two original checkpoint layers for an execution check.
+Omit `--num-layers` to load the complete DSV4 backbone. Use `--mode full` for
+all parameters (SGD by default); LoRA defaults to AdamW and freezes the base,
+including Engram tables. Qwen uses `--family qwen` and requires `CP == EP`.
+Gradient accumulation is weighted by global supervised token count.
+
+Metrics record actual input lengths, loss, per-step time and GPU allocated and
+reserved peaks. Optional greedy evaluation uses prompt tokens only, before and
+after training. A reduced model's results do not establish full-model quality.
+
+`checkpoint-00000020/` includes trainable rank-owned weights, optimizer state,
+data position and RNG. Resume with the same arguments and `--resume PATH`;
+`--steps` is the total step target, while `--steps 0` evaluates a restored model.
+Resume requires the same base identity, training configuration, world size and
+CP/EP ownership. Frozen base weights are reloaded from `--model-path`.
+The rank-local snapshot format preserves independent expert and Engram shards.
+LoRA also exports `adapter.pt` with `adapter_metadata.json`; the adapter alone
+does not contain optimizer or resume state. Generation metrics are separate
+from the teacher-forced loss and require checking the decoded answers.
+
 ### Asynchronous GRPO MVP
 
 `dsv41_train.rl` trains native DeepSeek V4.1 and Qwen3 MoE models using the same
@@ -253,7 +294,7 @@ For actual fine-tuning, supply pretrained weights without `--random-init`,
 replace both datasets, and start from `examples/rl/text-cuda.json` with suitable
 GPU counts. Tune length and optimization settings to the task. A random tiny
 model usually earns zero task reward; its smoke run demonstrates plumbing,
-not arithmetic learning. SFT is a separate objective, not implemented here.
+not arithmetic learning. Text SFT uses the separate `train_sft.py` entry point.
 
 `--eval-data` enables a baseline before training, periodic evaluations at
 `eval_interval` (zero means `checkpoint_interval`), and a final evaluation.
