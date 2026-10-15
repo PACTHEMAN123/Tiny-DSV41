@@ -14,7 +14,7 @@ import torch
 from .algorithm import group_advantages, grpo_loss, response_log_probs
 from .checkpoint import (load_training_checkpoint, publish_policy_artifact,
                          run_identity, save_training_checkpoint, load_policy_artifact, validate_identity,
-                         add_lora_identity)
+                         add_lora_identity, add_engram_identity)
 from .config import RLConfig
 from .data import build_reward, load_jsonl
 from .evaluation import append_jsonl, evaluate_policy, sample_record
@@ -25,7 +25,7 @@ from .tokenizer import ModelTokenizer
 from .trajectory import trajectory_log_probs
 
 
-def make_model(model_dir, model_config, config, devices, random_init, *, engram_weights=None):
+def make_model(model_dir, model_config, config, devices, random_init, *, engram_weights=None, role="learner"):
     qwen = getattr(model_config, "model_type", None) == "qwen3_moe"
     last_position = getattr(config, "qwen_last_position_only", False)
     if config.qwen_kv_cache and not qwen:
@@ -38,7 +38,9 @@ def make_model(model_dir, model_config, config, devices, random_init, *, engram_
                               engram_weights=engram_weights, engram_offload=config.engram_offload,
                               trainable_scope=config.trainable_scope,
                               lora_config=policy_lora_config(config, model_config),
-                              initial_adapter=config.initial_adapter)
+                              initial_adapter=config.initial_adapter, train_engram=config.train_engram,
+                              engram_cache_mib=config.engram_cache_mib,
+                              initial_engram_delta=config.initial_engram_delta, role=role)
     if qwen:
         model.qwen_last_position_only = last_position
         model.qwen_kv_cache = config.qwen_kv_cache
@@ -81,7 +83,7 @@ def _training_chunks(model, reference, sample, config):
     else:
         turns = [(sample.prompt_ids, sample.response_ids, sample.behavior_log_probs)]
     width = getattr(config, "backprop_chunk_tokens", 0)
-    if not width:
+    if not width and not config.train_engram:
         current = trajectory_log_probs(model, sample, config.temperature)
         with torch.no_grad():
             ref = trajectory_log_probs(reference, sample, config.temperature) if reference is not None else None
@@ -89,8 +91,12 @@ def _training_chunks(model, reference, sample, config):
         return
     total_actions = sum(len(actions) for _, actions, _ in turns)
     for prompt, actions, behavior in turns:
-        for start in range(0, len(actions), width):
-            stop = min(start + width, len(actions))
+        # A trainable low-precision CPU table must finish each lookup's backward
+        # before replaying the next turn. Token fractions retain the trajectory
+        # mean, including when tool responses give turns unequal action counts.
+        chunk_width = width or len(actions)
+        for start in range(0, len(actions), chunk_width):
+            stop = min(start + chunk_width, len(actions))
             prefix, targets = prompt + actions[:start], actions[start:stop]
             current = response_log_probs(model, prefix, targets, config.temperature)
             with torch.no_grad():
@@ -128,6 +134,37 @@ def _validate_zero_objective_sample(model, sample, config):
                 or any(token >= model.config.vocab_size
                        for token in (*turn.context_token_ids, *turn.action_token_ids))):
             raise ValueError("zero-objective trajectory exceeds mounted vocabulary/context")
+
+
+@torch.no_grad()
+def _clip_sparse_grad_norm(parameters, max_norm):
+    """One norm for CPU sparse rows and dense gradients on any learner GPU."""
+    gradients, norms = [], {}
+    for parameter in parameters:
+        gradient = parameter.grad
+        if gradient is None:
+            continue
+        # Count duplicate rows only after summing them, and preserve cancellation
+        # in FP32 before the final cast back to the table's storage dtype.
+        if gradient.is_sparse:
+            gradient = gradient.float().coalesce()
+            values = gradient.values()
+        else:
+            values = gradient
+        norms.setdefault(values.device, []).append(torch.linalg.vector_norm(values, dtype=torch.float32))
+        gradients.append((parameter, gradient, values))
+    # Transfer one scalar per device, rather than synchronizing once per tensor.
+    device_norms = [torch.linalg.vector_norm(torch.stack(group), dtype=torch.float64).cpu()
+                    for group in norms.values()]
+    norm = torch.linalg.vector_norm(torch.stack(device_norms)) if device_norms else torch.zeros((), dtype=torch.float64)
+    if not bool(torch.isfinite(norm)):
+        raise FloatingPointError("non-finite RL gradient norm; optimizer step was not applied")
+    coefficient = min(1.0, max_norm / (float(norm) + 1e-6))
+    for parameter, gradient, values in gradients:
+        values.mul_(coefficient)
+        if gradient.is_sparse:
+            parameter.grad = gradient.to(parameter.dtype)
+    return norm
 
 
 def train_groups(model, reference, optimizer, groups, config):
@@ -204,8 +241,12 @@ def train_groups(model, reference, optimizer, groups, config):
                            for sample in group.samples for turn in sample.turns),
                        replayed_action_tokens=0, backward_calls=0,
                        replay_diagnostics="not_measured_exact_zero_objective")
-    norm = torch.nn.utils.clip_grad_norm_(parameters, config.max_grad_norm, error_if_nonfinite=True,
-                                         foreach=False)
+    if config.train_engram:
+        norm = _clip_sparse_grad_norm(parameters, config.max_grad_norm)
+        model.mark_engram_touched()
+    else:
+        norm = torch.nn.utils.clip_grad_norm_(parameters, config.max_grad_norm, error_if_nonfinite=True,
+                                             foreach=False)
     optimizer.step()
     model.assert_engram_invariants()
     metrics.update(reward_mean=sum(rewards) / len(rewards), grad_norm=float(norm),
@@ -285,6 +326,7 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
     validate_reward_records(records + eval_records, reward_fn, config.reward)
     identity = run_identity(model_dir, data_path, random_init, eval_data_path=eval_data_path)
     add_lora_identity(identity, config, model_config)
+    add_engram_identity(identity, config)
     if getattr(model_config, "model_type", None) == "qwen3_moe":
         identity["trainable_scope"] = config.trainable_scope
         if config.qwen_last_position_only:
@@ -334,15 +376,20 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
                              config.learner_devices, random_init,
                              details={"devices": config.learner_devices})
         model.behavior_engine = identity.get("rollout_engine", "native-pytorch")
-        engram_weights = model.share_engram_memory()
+        engram_weights = (model.export_engram_baseline() if getattr(model, "engram_state", None) is not None
+                          else model.share_engram_memory())
         reference = None
         if config.kl_beta:
             reference = timings.call("reference_model_startup", make_model, model_dir, model_config,
-                                     config, config.learner_devices, random_init, engram_weights=engram_weights)
+                                     config, config.learner_devices, random_init, engram_weights=engram_weights,
+                                     role="reference")
             reference.eval().requires_grad_(False)
-        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
-                                      lr=config.learning_rate, weight_decay=config.weight_decay,
-                                      foreach=False)
+        optimizer_type = torch.optim.SGD if config.optimizer == "sgd" else torch.optim.AdamW
+        optimizer = optimizer_type([p for p in model.parameters() if p.requires_grad],
+                                   lr=config.learning_rate, weight_decay=config.weight_decay, foreach=False)
+        if config.train_engram:
+            from dsv41_train.engram_offload import install_engram_sgd_hooks
+            install_engram_sgd_hooks(model, optimizer)
         step, next_group_id, rng_state, dropped = 0, 0, None, 0
         recovery_state = None
         lineage = uuid.uuid4().hex
@@ -411,7 +458,8 @@ def run_training(*, model_dir, data_path, config: RLConfig, random_init=False, r
                           "engram_device": model.engram_device,
                           "engram_offload": config.engram_offload,
                           "engram_shared": model.engram_shared,
-                          "engram_bytes": sum(value.numel() * value.element_size() for value in engram_weights.values()),
+                          "engram_bytes": (engram_weights.byte_size if hasattr(engram_weights, "byte_size") else
+                                           sum(value.numel() * value.element_size() for value in engram_weights.values())),
                           "trainer_devices": config.learner_devices, "rollout_devices": config.rollout_devices,
                           "policy_version": step,
                           **policy_diagnostics(model)}), flush=True)

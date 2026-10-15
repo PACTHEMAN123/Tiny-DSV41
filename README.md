@@ -143,7 +143,8 @@ learner updates are published as versioned A/B tensors. Resume and standalone
 sampling require the same base and initial adapter file; checkpoint identity
 also binds their configuration and the initialization seed. This path retains
 the native rollout manager's version/digest/ACK protocol. RL Engram tables
-remain frozen, and this option does not add vLLM LoRA or distributed RL CP.
+are frozen unless explicitly enabled below. This option does not add vLLM LoRA
+or distributed RL CP.
 CPU tests cover both model families through training, actor activation and
 fresh-process recovery; large-model GPU RL validation is still pending.
 
@@ -239,10 +240,31 @@ for at least the complete table size plus runtime overhead (containers often
 need an explicit shared-memory limit). Other model weights still need host
 memory during loading. `--no-engram-offload` (or `engram_offload: false`) keeps
 frozen copies on the GPUs owning the respective Engram layers, with a shared
-CPU base retained for initialization. Offload mode never enables table training;
+CPU base retained for initialization. Offload alone does not enable table training;
 the Engram projection layers continue to train. For reproducible tiny smoke
 initialization, each process still performs the configured random initialization
 before replacing its temporary tables with the shared ones.
+
+Native DeepSeek RL can update offloaded rows with `--train-engram --optimizer sgd`
+and zero weight decay, for either `--trainable-scope all` or `lora`.
+`--engram-cache-mib` divides a per-process row-cache budget across its tables;
+updates and restores invalidate the affected policy's cache. Sparse occurrences
+are summed in FP32 before gradient clipping and the BF16/FP32 SGD update. Each
+trajectory turn finishes its backward separately with the original action-token
+weighting, so repeated lookups retain all contributions.
+
+This opt-in path streams one immutable baseline into Linux sealed memfd storage.
+Learner, actor and reference use private copy-on-write views; it does not use the
+`/dev/shm` mount. The baseline and all private dirty pages still consume host
+memory. Policy updates and checkpoints contain cumulative absolute rows, so
+actors can skip versions and checkpoint recovery can restore earlier rows.
+The reference keeps the initial policy throughout learner updates and resume.
+`--initial-engram-delta PATH` accepts a validated initial SFT row payload and
+includes it in that reference baseline; the file identity is bound to recovery.
+Row payloads can grow toward full-table size, and full backbone/optimizer states
+still require their own memory and storage. CPU tests cover 20 steps, a fresh
+process continuing at step 21, actor publication and reference isolation;
+Linux/CUDA and released-model validation of this path remain separate gates.
 
 For pretrained training, replace `--model-dir` with a checkpoint directory,
 provide tokenized task data and a task reward in the RL config, and omit

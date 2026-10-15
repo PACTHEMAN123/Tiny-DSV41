@@ -25,6 +25,10 @@ class RLConfig:
     rollout_devices: tuple[str, ...] = ("cpu",)
     rollout_engine: str = "vllm"
     engram_offload: bool = True
+    train_engram: bool = False
+    engram_cache_mib: int = 0
+    optimizer: str = "adamw"
+    initial_engram_delta: str | None = None
     trainable_scope: str = "all"
     lora_rank: int = 8
     lora_alpha: float = 16.0
@@ -128,6 +132,24 @@ class RLConfig:
             raise ValueError("dtype must be float32 or bfloat16")
         if self.trainable_scope not in {"all", "lm_head", "lora"}:
             raise ValueError("trainable_scope must be all, lm_head or lora")
+        if self.optimizer not in {"adamw", "sgd"}:
+            raise ValueError("optimizer must be adamw or sgd")
+        if type(self.train_engram) is not bool:
+            raise ValueError("train_engram must be a boolean")
+        if self.train_engram and (not self.engram_offload or self.rollout_engine != "native-pytorch"
+                                  or self.optimizer != "sgd" or self.weight_decay != 0
+                                  or self.trainable_scope not in {"all", "lora"}):
+            raise ValueError("train_engram requires Engram offload, native-pytorch, SGD with zero "
+                             "weight decay and trainable_scope=all or lora")
+        if type(self.engram_cache_mib) is not int or self.engram_cache_mib < 0:
+            raise ValueError("engram_cache_mib must be a nonnegative integer")
+        if self.engram_cache_mib and not self.engram_offload:
+            raise ValueError("engram_cache_mib requires Engram offload")
+        if self.initial_engram_delta is not None:
+            if not isinstance(self.initial_engram_delta, str) or not self.initial_engram_delta:
+                raise ValueError("initial_engram_delta must be a nonempty path or null")
+            if not self.engram_offload or self.rollout_engine != "native-pytorch":
+                raise ValueError("initial_engram_delta requires Engram offload and native-pytorch")
         if self.trainable_scope == "lora":
             from dsv41_train.lora import LoRAConfig
             LoRAConfig(self.lora_rank, self.lora_alpha, self.lora_dropout,

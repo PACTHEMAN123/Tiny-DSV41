@@ -38,18 +38,21 @@ class PyTorchRLBackend:
 
         torch.set_num_threads(self.config.num_threads)
         torch.manual_seed(self.config.seed)
-        if self.config.trainable_scope == "lora":
-            from dsv41_train.rl.checkpoint import add_lora_identity, run_identity, validate_identity
+        if self.config.trainable_scope == "lora" or self.config.train_engram or self.config.initial_engram_delta:
+            from dsv41_train.rl.checkpoint import add_engram_identity, add_lora_identity, run_identity, validate_identity
             actual = add_lora_identity(run_identity(self.model_dir,
                 Path(self.model_dir) / "config.json", self.random_init), self.config, self.model_config)
             actual.pop("data_sha256")
+            add_engram_identity(actual, self.config)
             validate_identity({key: self.initial_policy["identity"].get(key) for key in actual}, actual)
         self.model = build_policy(self.model_dir, self.model_config,
             random_init=self.random_init, devices=self.config.rollout_devices,
             dtype=getattr(torch, self.config.dtype), engram_weights=self.engram_weights,
             engram_offload=self.config.engram_offload, trainable_scope=self.config.trainable_scope,
             lora_config=policy_lora_config(self.config, self.model_config),
-            initial_adapter=self.config.initial_adapter)
+            initial_adapter=self.config.initial_adapter, train_engram=self.config.train_engram,
+            engram_cache_mib=self.config.engram_cache_mib, initial_engram_delta=self.config.initial_engram_delta,
+            role="actor")
         if self.config.qwen_last_position_only:
             if getattr(self.model_config, "model_type", None) != "qwen3_moe":
                 raise ValueError("last-position logits require native Qwen")

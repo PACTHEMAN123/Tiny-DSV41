@@ -27,6 +27,15 @@ def file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def add_engram_identity(identity, config):
+    if config.train_engram or config.initial_engram_delta is not None:
+        identity["engram"] = {"trainable": config.train_engram, "dtype": config.dtype,
+            "seed": config.seed, "optimizer": config.optimizer,
+            "initial_delta_sha256": file_sha256(config.initial_engram_delta)
+                if config.initial_engram_delta is not None else None}
+    return identity
+
+
 def atomic_save(payload: dict, destination: str | Path) -> None:
     """Readers see a complete old or new file, never a partially written snapshot."""
     destination = Path(destination)
@@ -51,21 +60,30 @@ def policy_state(model) -> dict:
     }
     if getattr(model, "lora_metadata", None) is not None:
         state.update(adapter_format=1, adapter=model.lora_metadata)
+    if getattr(model, "engram_state", None) is not None:
+        state["engram_delta"] = model.engram_state.state_dict()
     return state
 
 
 def load_policy(model, state: dict) -> None:
+    engram = getattr(model, "engram_state", None)
+    if (engram is not None) != ("engram_delta" in state):
+        raise ValueError("policy Engram delta presence differs from the configured baseline")
+    if engram is not None:
+        engram.validate(state["engram_delta"])
     metadata = getattr(model, "lora_metadata", None)
     if metadata is not None or "adapter_format" in state:
         required = {"trainable", "frozen", "adapter_format", "adapter"}
         if (not required.issubset(state)
-                or state.keys() - required - {"version", "lineage", "identity", "sampling"}
+                or state.keys() - required - {"version", "lineage", "identity", "sampling", "engram_delta"}
                 or state["adapter_format"] != 1 or metadata is None or state["adapter"] != metadata):
             raise ValueError("LoRA policy configuration or initial adapter identity differs")
         if state["frozen"]:
             raise ValueError("LoRA policy artifacts must not include frozen base weights")
     model.load_trainable_state_dict(state["trainable"])
     model.load_frozen_state_dict(state["frozen"], include_engram=False)
+    if engram is not None:
+        engram.load_state_dict(state["engram_delta"])
     model.assert_engram_invariants()
 
 
@@ -226,7 +244,7 @@ def load_training_checkpoint(path, model, optimizer, config, identity) -> dict:
     validate_identity(state["identity"], identity)
     mutable = {"max_steps", "output_dir", "checkpoint_interval", "worker_timeout_seconds",
                "learner_devices", "rollout_devices", "num_threads", "engram_offload",
-               "eval_interval", "log_samples_per_step", "gradient_checkpointing"}
+               "eval_interval", "log_samples_per_step", "gradient_checkpointing", "engram_cache_mib"}
     current = json.loads(json.dumps(config.to_dict()))
     previous = json.loads(json.dumps(checkpoint_config(state["config"], model.config,
         rollout_engine=state["identity"].get("rollout_engine")).to_dict()))

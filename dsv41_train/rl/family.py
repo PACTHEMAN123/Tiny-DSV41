@@ -55,7 +55,8 @@ def load_model_config(model_dir):
 
 def build_policy(model_dir, model_config, *, random_init, devices, dtype,
                  engram_weights=None, engram_offload=True, trainable_scope="all",
-                 lora_config=None, initial_adapter=None):
+                 lora_config=None, initial_adapter=None, train_engram=False, engram_cache_mib=0,
+                 initial_engram_delta=None, role="learner"):
     if (trainable_scope == "lora") != (lora_config is not None):
         raise ValueError("LoRA scope requires an explicit adapter configuration")
     if initial_adapter is not None and lora_config is None:
@@ -63,7 +64,7 @@ def build_policy(model_dir, model_config, *, random_init, devices, dtype,
     if lora_config is not None and lora_config.dropout != 0:
         raise ValueError("LoRA RL requires dropout=0")
     if getattr(model_config, "model_type", None) == "qwen3_moe":
-        if engram_weights:
+        if engram_weights or train_engram or engram_cache_mib or initial_engram_delta is not None:
             raise ValueError("Qwen policies do not have Engram tables")
         from .qwen_policy import build_qwen_policy
 
@@ -76,7 +77,9 @@ def build_policy(model_dir, model_config, *, random_init, devices, dtype,
         model = build_dsv41_policy(model_dir, model_config, random_init=random_init,
                                   devices=devices, dtype=dtype, engram_weights=engram_weights,
                                   engram_offload=engram_offload,
-                                  lora_config=lora_config, initial_adapter=initial_adapter)
+                                  lora_config=lora_config, initial_adapter=initial_adapter,
+                                  train_engram=train_engram, engram_cache_mib=engram_cache_mib,
+                                  initial_engram_delta=initial_engram_delta, role=role)
     if lora_config is not None:
         model.lora_metadata = lora_metadata(lora_config, initial_adapter)
     return model

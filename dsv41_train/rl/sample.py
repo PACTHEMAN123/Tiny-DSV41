@@ -9,7 +9,7 @@ from typing import Optional, Sequence
 
 import torch
 
-from .checkpoint import add_lora_identity, checkpoint_config, load_policy, run_identity, validate_identity
+from .checkpoint import add_engram_identity, add_lora_identity, checkpoint_config, load_policy, run_identity, validate_identity
 from .data import PromptRecord
 from .evaluation import decoded_fields
 from .family import load_model_config
@@ -51,6 +51,7 @@ def load_checkpoint_model(
     initial_config = checkpoint_config(state["config"], model_config,
                                        rollout_engine=identity.get("rollout_engine"))
     add_lora_identity(current_identity, initial_config, model_config)
+    add_engram_identity(current_identity, initial_config)
     if getattr(model_config, "model_type", None) == "qwen3_moe":
         current_identity["trainable_scope"] = state["config"].get("trainable_scope", "all")
     validate_identity(identity, current_identity, inference=True)
@@ -70,7 +71,7 @@ def load_checkpoint_model(
     if type(sampling_seed) is not int or not 0 <= sampling_seed < 2**63 - 1:
         raise ValueError("sampling seed must be an integer in [0, 2**63 - 1)")
     torch.set_num_threads(config.num_threads)
-    model = make_model(model_dir, model_config, config, devices, random_init)
+    model = make_model(model_dir, model_config, config, devices, random_init, role="actor")
     load_policy(model, policy)
     del policy
     model.eval()
