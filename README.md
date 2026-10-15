@@ -82,7 +82,11 @@ memory. Every lookup occurrence still contributes a gradient, including cache
 hits. SGD updates and checkpoint restores invalidate cached rows; frozen tables
 retain them between steps. Per-step metrics report global hits/misses, rows
 transferred, hit rate and maximum per-rank resident bytes. The default budget is
-zero. This cache is synchronous; asynchronous prefetch is not yet implemented.
+zero. CUDA misses use a separate copy stream and bounded pinned/GPU staging,
+each at most the smaller of the cache budget and 4 MiB (or one complete row).
+Copies can overlap hit reads and lookup planning; the consumer waits through a
+CUDA event. This does not prefetch across transformer layers. Updates and cache
+resets drain pending copies, and versioned tickets reject stale transfer results.
 
 Metrics record actual input lengths, loss, per-step time and GPU allocated and
 reserved peaks. Optional greedy evaluation uses prompt tokens only, before and

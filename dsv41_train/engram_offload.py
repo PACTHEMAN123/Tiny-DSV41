@@ -1,4 +1,4 @@
-"""Synchronous CPU Engram lookup and sparse SGD, without a master table copy."""
+"""CPU Engram lookup, bounded asynchronous row copies, and sparse SGD."""
 
 import weakref
 
@@ -27,36 +27,52 @@ class _CachedRows(torch.autograd.Function):
 
 
 class _RowCache:
-    """Owner-local direct mapping; the byte budget includes CPU int64 tags."""
+    """Owner-local direct mapping; the byte budget includes CPU int64 tags.
+
+    CUDA additionally uses one pinned CPU and one GPU staging buffer, each at
+    most min(budget, 4 MiB), or one complete row when a row exceeds 4 MiB.
+    """
+
+    _STAGING_BYTES = 4 * 2**20
 
     def __init__(self, budget, device):
         self.budget, self.device = budget, device
         self.values = self.tags = self.signature = self.version = self._weight = None
         self._event = None
+        self._generation = 0
+        self._ticket = self._copy_done = self._consumer_done = None
+        self._copy_stream = self._pinned = self._staging = None
         self.metrics = dict(hits=0, misses=0, transferred_rows=0, resident_bytes=0)
 
     def wait(self):
-        if self._event is not None:
-            self._event.synchronize()
-            self._event = None
+        for event in (self._event, self._copy_done, self._consumer_done):
+            if event is not None:
+                event.synchronize()
+        self._event = self._copy_done = self._consumer_done = self._ticket = None
 
     def clear(self):
+        self._generation += 1
         self.wait()
         if self.tags is not None:
             self.tags.fill_(-1)
         self.version = None
 
+    def _signature(self, weight):
+        return (weight.data_ptr(), weight.untyped_storage().data_ptr(), tuple(weight.shape),
+                tuple(weight.stride()), weight.dtype, weight.device, self.device)
+
     def _validate(self, weight):
-        signature = (weight.data_ptr(), weight.untyped_storage().data_ptr(), tuple(weight.shape),
-                     tuple(weight.stride()), weight.dtype, weight.device, self.device)
+        signature = self._signature(weight)
         previous = self._weight() if self._weight is not None else None
         if previous is not weight or signature != self.signature:
             capacity = min(weight.shape[0], self.budget // (weight.shape[1] * weight.element_size() + 8))
             if capacity < 1:
                 raise ValueError("Engram cache budget must hold one complete row and its int64 tag")
+            self.clear()
             # Drop previous storage before allocating a new dtype/shape; never
             # retain two complete cache generations inside this byte budget.
             self.values = self.tags = None
+            self._pinned = self._staging = None
             self.metrics["resident_bytes"] = 0
             # Persistent buffers must remain writable when a caller switches
             # from inference_mode back to ordinary evaluation or training.
@@ -67,14 +83,78 @@ class _RowCache:
             self._weight, self.signature = weakref.ref(weight), signature
             self.version = weight._version
         elif weight._version != self.version:
-            self.tags.fill_(-1)
+            self.clear()
             self.version = weight._version
+
+    def _begin_transfer(self, weight, ids):
+        if self._ticket is not None:
+            raise RuntimeError("Engram allows only one outstanding row transfer")
+        if self._pinned is None:
+            width, row_bytes = weight.shape[1], weight.shape[1] * weight.element_size()
+            capacity = max(1, min(self.budget, self._STAGING_BYTES) // row_bytes)
+            self._copy_stream = torch.cuda.Stream(device=self.device)
+            with torch.inference_mode(False), torch.no_grad(), torch.cuda.stream(self._copy_stream):
+                self._pinned = torch.empty((capacity, width), dtype=weight.dtype, pin_memory=True)
+                self._staging = torch.empty_like(self._pinned, device=self.device)
+        if ids.numel() > self._pinned.shape[0]:
+            raise ValueError("Engram transfer exceeds staging capacity")
+        # Host writes may reuse pinned memory only after its previous DMA ends.
+        if self._copy_done is not None:
+            self._copy_done.synchronize()
+        torch.index_select(weight.detach(), 0, ids, out=self._pinned[:ids.numel()])
+        with torch.cuda.stream(self._copy_stream):
+            if self._consumer_done is not None:
+                self._copy_stream.wait_event(self._consumer_done)
+            self._staging[:ids.numel()].copy_(self._pinned[:ids.numel()], non_blocking=True)
+            ready = torch.cuda.Event()
+            ready.record(self._copy_stream)
+        ticket = (self, self._generation, weakref.ref(weight), self._signature(weight),
+                  weight._version, ids.numel(), ready)
+        self._ticket, self._copy_done = ticket, ready
+        self.metrics["transferred_rows"] += ids.numel()
+        return ticket
+
+    def _consume_transfer(self, weight, ticket):
+        if (ticket is not self._ticket or ticket[0] is not self or ticket[1] != self._generation
+                or ticket[2]() is not weight or ticket[3] != self._signature(weight)
+                or ticket[4] != weight._version):
+            # An invalidated ticket must neither publish tags nor expose old rows.
+            ticket[-1].synchronize()
+            if ticket is self._ticket:
+                self._ticket = None
+            return None
+        consumer = torch.cuda.current_stream(self.device)
+        consumer.wait_event(ticket[-1])
+        if self._staging.device.type == "cuda":
+            self._staging.record_stream(consumer)
+        return self._staging[:ticket[5]]
+
+    def _finish_transfer(self):
+        self._consumer_done = torch.cuda.Event()
+        self._consumer_done.record(torch.cuda.current_stream(self.device))
+        self._ticket = None
+
+    def _row_plan(self, positions, missing, inverse):
+        new_slots, collisions = missing.remainder(self.tags.numel()).unique(sorted=True, return_inverse=True)
+        chosen = torch.full_like(new_slots, -1)
+        chosen.scatter_reduce_(0, collisions, torch.arange(missing.numel(), device="cpu"), reduce="amax")
+        indices = [value.to(self.device, non_blocking=True) for value in (positions, inverse, new_slots, chosen)]
+        return indices, new_slots, missing[chosen]
+
+    def _install_rows(self, output, plan, rows):
+        (positions, inverse, slots, chosen), tags, ids = plan
+        output.index_copy_(0, positions, rows.index_select(0, inverse))
+        self.values.index_copy_(0, slots, rows.index_select(0, chosen))
+        self.tags[tags] = ids
 
     def read(self, weight, ids):
         # A prior access may have used another CUDA stream. Wait only for its
         # cache operations before reading or overwriting slots on this stream.
-        self.wait()
+        if self._event is not None:
+            torch.cuda.current_stream(self.device).wait_event(self._event)
         self._validate(weight)
+        if self.device.type == "cuda":
+            self.values.record_stream(torch.cuda.current_stream(self.device))
         if ids.numel() and (ids.min() < 0 or ids.max() >= weight.shape[0]):
             raise IndexError("Engram cache row is outside its owner's range")
         try:
@@ -86,18 +166,32 @@ class _RowCache:
             self.metrics["misses"] += misses.numel()
             # Outputs are independent copies. Read every hit before a colliding
             # miss replaces that slot; old outputs remain valid for backward.
-            if hits.numel():
+            if hits.numel() and (not misses.numel() or self.device.type == "cpu"):
                 output.index_copy_(0, hits.to(self.device), self.values.index_select(0, slots[hits].to(self.device)))
             if misses.numel():
                 missing, inverse = ids[misses].unique(sorted=True, return_inverse=True)
-                rows = weight.detach().index_select(0, missing).to(self.device)
-                self.metrics["transferred_rows"] += missing.numel()
-                output.index_copy_(0, misses.to(self.device), rows.index_select(0, inverse.to(self.device)))
-                new_slots, collisions = missing.remainder(self.tags.numel()).unique(sorted=True, return_inverse=True)
-                chosen = torch.full_like(new_slots, -1)
-                chosen.scatter_reduce_(0, collisions, torch.arange(missing.numel(), device="cpu"), reduce="amax")
-                self.values.index_copy_(0, new_slots.to(self.device), rows.index_select(0, chosen.to(self.device)))
-                self.tags[new_slots] = missing[chosen]
+                if self.device.type == "cpu":
+                    rows = weight.detach().index_select(0, missing)
+                    self.metrics["transferred_rows"] += missing.numel()
+                    self._install_rows(output, self._row_plan(misses, missing, inverse), rows)
+                else:
+                    row_bytes = weight.shape[1] * weight.element_size()
+                    capacity = max(1, min(self.budget, self._STAGING_BYTES) // row_bytes)
+                    for start in range(0, missing.numel(), capacity):
+                        chunk = missing[start:start + capacity]
+                        ticket = self._begin_transfer(weight, chunk)
+                        if start == 0 and hits.numel():
+                            output.index_copy_(0, hits.to(self.device),
+                                               self.values.index_select(0, slots[hits].to(self.device)))
+                        selected = ((inverse >= start) & (inverse < start + chunk.numel())).nonzero().flatten()
+                        plan = self._row_plan(misses[selected], chunk, inverse[selected] - start)
+                        rows = self._consume_transfer(weight, ticket)
+                        if rows is None:
+                            raise RuntimeError("Engram changed during lookup; retry with a fresh forward")
+                        try:
+                            self._install_rows(output, plan, rows)
+                        finally:
+                            self._finish_transfer()
             return output
         except Exception:
             self.tags.fill_(-1)
@@ -272,6 +366,9 @@ def install_engram_sgd_hooks(model, optimizer):
             raise ValueError("Engram SGD hooks require backward before step, without a closure")
         validate()
         for table in tables:
+            lookup = getattr(table, "_cpu_lookup", None)
+            if lookup is not None:
+                lookup.synchronize()
             gradient = table.weight.grad
             if gradient is not None:
                 if not gradient.is_sparse:
