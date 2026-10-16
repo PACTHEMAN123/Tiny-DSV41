@@ -138,18 +138,23 @@ class SFTTrainTests(unittest.TestCase):
             torch.testing.assert_close(parameter, reference, rtol=0, atol=0, msg=name)
 
     def test_training_entry_no_save_and_default_checkpoint_exports(self):
+        from dsv41_train.engram_offload import install_engram_sgd_hooks
         from dsv41_train.sft_checkpoint import load_checkpoint, save_checkpoint
 
+        resident_results = []
         for family, mode, options in (("qwen", "full", []), ("qwen", "full", ["--save-every", "1"]),
                                       ("qwen", "full", ["--no-save"]), ("qwen", "lora", []),
-                                      ("qwen", "lora", ["--no-save"]), ("dsv4", "lora", ["--no-save"])):
+                                      ("qwen", "lora", ["--no-save"]), ("dsv4", "lora", ["--no-save"]),
+                                      ("dsv4", "full", ["--no-save"]),
+                                      ("dsv4", "full", ["--no-save", "--train-engram"])):
             with self.subTest(family=family, mode=mode, options=options), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 base, output = root / "base", root / "output"
                 base.mkdir()
+                torch.manual_seed(31)
                 model = small_model(family)
                 if family == "dsv4":
-                    model = DeepSeekV41ForCausalLM(model.config, sparse_engram_gradients=True, engram_offload=True)
+                    model = DeepSeekV41ForCausalLM(model.config, sparse_engram_gradients=True, engram_offload=mode == "lora")
                 if mode == "lora":
                     targets = LoRAConfig().targets if family == "dsv4" else ("self_attn.q_proj", "self_attn.v_proj")
                     inject_lora(model, LoRAConfig(rank=2, alpha=4, targets=targets))
@@ -163,7 +168,7 @@ class SFTTrainTests(unittest.TestCase):
                            "--family", family, "--mode", mode, "--steps", "2", "--seq-len", "16", *options]
                 if mode == "lora":
                     command += ["--lora-rank", "2", "--lora-alpha", "4", "--lora-targets", ",".join(targets)]
-                if family == "dsv4":
+                if family == "dsv4" and mode == "lora":
                     command += ["--train-engram", "--engram-offload"]
                 initial = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
                 with ExitStack() as stack, redirect_stdout(io.StringIO()):
@@ -174,7 +179,13 @@ class SFTTrainTests(unittest.TestCase):
                     stack.enter_context(patch("train_sft.load_model", return_value=(model, lambda: None)))
                     save = stack.enter_context(patch("dsv41_train.sft_checkpoint.save_checkpoint", wraps=save_checkpoint))
                     bundle = stack.enter_context(patch("dsv41_train.sft_export.export_sft_bundle"))
+                    hooks = stack.enter_context(patch("dsv41_train.engram_offload.install_engram_sgd_hooks",
+                                                      wraps=install_engram_sgd_hooks))
                     summary = train(parse_args(command), self.runtime)
+                    self.assertEqual(hooks.call_count, int(family == "dsv4"))
+                    if family == "dsv4" and mode == "full":
+                        self.assertIsNone(model._sft_engram_checkpoint)
+                        resident_results.append({name: parameter.detach().clone() for name, parameter in model.named_parameters()})
                     disabled = "--no-save" in options
                     self.assertEqual(summary["checkpoint_saving"], not disabled)
                     self.assertEqual((summary["step"], summary["data_position"]), (2, 2))
@@ -194,6 +205,8 @@ class SFTTrainTests(unittest.TestCase):
                         load.assert_called_once()
                         self.assertEqual((resumed["initial_step"], resumed["step"], resumed["data_position"]), (2, 3, 3))
                         self.assertEqual({path.name for path in (root / "resumed").iterdir()}, {"metrics.jsonl", "summary.json"})
+        for name, parameter in resident_results[0].items():
+            torch.testing.assert_close(parameter, resident_results[1][name], rtol=0, atol=0, msg=name)
 
     def test_default_dsv4_selection_is_full_backbone_and_optimizer_is_mode_specific(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -48,11 +48,13 @@ records contain `prompt` and `answer`, or a text `messages` history ending in
 `user` and an `answer`. The checkpoint chat template defines token boundaries;
 only the final answer through EOS receives labels. Inputs are never truncated.
 
-For an authored identity check with at least 4096 actual tokens per training example:
+For an authored identity check, train on varied bare questions and long-context
+questions. Each long example contains at least 4096 actual tokens:
 
 ```bash
 PYTHONPATH=. python3 scripts/prepare_identity_sft.py \
-  --model-path /path/to/DeepSeek-V4.1-Flash --output-dir runs/identity-data
+  --model-path /path/to/DeepSeek-V4.1-Flash --output-dir runs/identity-data \
+  --diverse-training
 
 PYTHONPATH=. python3 -m torch.distributed.run --standalone --nproc-per-node=8 \
   train_sft.py --model-path /path/to/DeepSeek-V4.1-Flash \
@@ -62,19 +64,73 @@ PYTHONPATH=. python3 -m torch.distributed.run --standalone --nproc-per-node=8 \
   --learning-rate 1e-3 --gradient-checkpointing --generation-eval
 ```
 
-Add `--include-short-training` to the data preparation command to train on
-four bare identity questions alongside the four long examples. Short examples
-remain short; the generator reports actual token lengths separately. The five
-evaluation prompts stay unchanged, but their first question then overlaps a
-short training prompt. Report that replay separately from the other four
-unseen prompts. Low loss on a fixed long background alone does not establish
-that a model can answer the same question without that background.
+`--diverse-training` produces four blocks of four long and four short examples,
+including both `你是谁？` and the user-requested bare `你是谁` as short training
+prompts, alongside varied identity expressions and backgrounds. With eight ranks, CP=1,
+batch size 1 and one microbatch, each update contains four long and four short
+examples. `--include-short-training` retains the smaller eight-example recipe;
+omitting both options retains four long examples. The generator reports actual
+lengths separately. The five evaluation prompts stay unchanged, but their first
+question overlaps a short training prompt. Report that replay separately from
+the other four unseen prompts. Low loss on a fixed long background alone does
+not establish that a model can answer the same question without that background.
+These prompts are fixed development checks, not a blind generalization benchmark.
+The expanded recipe preserves the smaller recipe's eight rows and adds identity,
+name and address questions; it includes the exact bare question twice. At 160
+updates with the topology above, each row is used 40 times. A logged training
+loss covers the current eight-row block, not the entire dataset. Judge the
+identity result from the separate prompt-only generation check.
 
 This example selects two original checkpoint layers for an execution check.
 Omit `--num-layers` to load the complete DSV4 backbone. Use `--mode full` for
 all parameters (SGD by default); LoRA defaults to AdamW and freezes the base,
 including Engram tables. Qwen uses `--family qwen` and requires `CP == EP`.
 Gradient accumulation is weighted by global supervised token count.
+
+For complete-backbone full SFT with the same identity data and trainable CPU
+Engram tables, use:
+
+```bash
+PYTHONPATH=. python3 -m torch.distributed.run --standalone --nproc-per-node=8 \
+  train_sft.py --model-path /path/to/DeepSeek-V4.1-Flash \
+  --data runs/identity-data/train.jsonl --eval-data runs/identity-data/eval.jsonl \
+  --output-dir runs/identity-full --family dsv4 --mode full --num-layers 40 \
+  --cp-size 1 --ep-size 8 --steps 160 --seq-len 4608 --batch-size 1 \
+  --gradient-accumulation-steps 1 --optimizer sgd --learning-rate 1e-3 \
+  --optimizer-in-backward --gradient-checkpointing --seed 42 \
+  --train-engram --engram-offload --engram-cache-mib 128 \
+  --eval-batches 1 --generation-eval --generation-max-new-tokens 16 --no-save
+```
+
+Remove `--engram-offload --engram-cache-mib 128` for the resident-table control.
+For an additional bare-prompt check, append
+`{"prompt":"你是谁","answer":"RTP大模型"}` to a copy of `eval.jsonl` and pass
+that copy as `--eval-data`. Report the original five questions and this
+bare prompt separately. With `--diverse-training`, both the original first
+question and this bare prompt are seen training prompts; the other four
+evaluation prompts remain unseen in training. Their results are fixed
+development checks, not a blind generalization benchmark.
+
+In an instrumented 160-step run of the original 40-layer model on eight B300s
+with the full-SFT settings above, the resident control finished at **5/5 on the
+original questions and 1/1 on bare `你是谁`**. CPU offload with a 128 MiB cache
+per rank finished at **4/5 and 1/1**, respectively: the remaining assistant-name
+variant generated `RTP大包`. The resident control scored 6/6 at every 20-step
+check. Offload reached 6/6 at several intermediate checks, but scored 5/6 at
+steps 120 and 160. Its failed answer token was also wrong under teacher forcing;
+a low mean token loss did not imply a correct complete answer.
+
+Given the same actual gradients, first-two-step CPU/CUDA coalescing and SGD
+replays were exact. All 1,584,960 checked cache-return row occurrences matched
+authoritative CPU values. Paired first-step snapshots matched all 32,624 visited
+initial rows, and the first lookup outputs matched, but incoming gradients
+already differed; coalesced-gradient relative L2 difference was 0.008879.
+These checks do not establish identical full-model training trajectories.
+The expanded data and longer training are not a matched-budget comparison with
+the earlier 20-step experiment. The default SGD-hook correction below does not
+explain that experiment's quality gap: both earlier variants explicitly used
+`--train-engram`, which already installed the same hook. Diagnostic overhead also
+precludes treating these runs as clean throughput measurements.
 
 DSV4 can opt into `--optimizer-in-backward` with plain SGD and
 `--gradient-accumulation-steps 1`. Reduced FSDP gradients update their shards
@@ -86,19 +142,27 @@ the last checkpoint. This reduces gradient storage, but does not establish that
 the full released model fits: activations, collective buffers and checkpoint
 storage still need separate measurement.
 
-On CUDA, a reduced full-parameter BF16 model with FP32 precision islands,
-CPU Engram and real FSDP2 passed ordinary versus in-backward SGD comparison
-at CP1/EP2 and CP2/EP2. With deterministic Torch reference kernels, parameter
-updates and sparse-checkpoint continuation were exact; a non-finite gradient
-on one rank aborted both ranks before the final SGD step. This validates the
-distributed update contract, not the released full model's memory footprint.
+Using deterministic Torch reference kernels on CUDA, a reduced full-parameter
+BF16 model with FP32 precision islands, CPU Engram and real FSDP2 passed ordinary
+versus in-backward SGD comparison at CP1/EP2 and CP2/EP2. Parameter updates and
+sparse-checkpoint continuation were exact; a non-finite gradient on one rank
+aborted both ranks before the final SGD step. Native-kernel strict checkpoint
+replay has not passed. These checks validate the distributed update contract,
+not the released full model's memory footprint.
 
 For DSV4, `--engram-offload` keeps each rank's Engram row shard on CPU while
 preserving the native hash and distributed lookup. Full SFT updates these rows
 with SGD; LoRA freezes them unless `--train-engram` is also supplied. That
 combination defaults to SGD and requires it explicitly when overriding the
-optimizer. Sparse row gradients are combined in FP32 before each update.
+optimizer. Sparse row gradients are combined in FP32 before each update, for
+both resident and offloaded tables, including full SFT without `--train-engram`.
 Frozen CPU tables remain compatible with LoRA's AdamW optimizer.
+
+`tests/engram_bf16_device_parity.py --device cuda` checks native BF16 SGD over
+20 steps with two ranks. It compares resident, offloaded and cached tables
+using synthetic V4.1 E4M3/E8M0 rows, including hash/routing, gradients, updates
+and post-update cache reads. Run it through `torchrun --standalone --nproc-per-node=2` with
+`PYTHONPATH=.`. This component check does not establish full-model equivalence.
 
 `--engram-cache-mib 128` optionally caches queried CPU rows on each rank's GPU.
 The per-rank budget is divided across selected tables and includes row values
@@ -209,6 +273,9 @@ steps at 4113–4116 tokens, with EP=8/CP=1, gradient checkpointing, plain SGD
 at 0.001 in backward, trainable CPU Engram and a 128 MiB cache per rank.
 All 926 parameter tensors were trainable, with no LoRA installed; all 924
 DTensors had optimizer hooks, and 900 received gradients in each step.
+The discrete SparseIndexer path runs under `torch.no_grad()`: its 24 tensors
+retain `requires_grad=True` in SFT but receive no loss gradients; they are not
+explicitly frozen as they are in RL.
 Bounded probes observed numerical changes in expert, dense and Engram weights;
 they do not establish that every parameter changed. Training loss fell from
 10.9894 to 0.1093. The 20 steps took 106.59 seconds (median 5.17 seconds,

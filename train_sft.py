@@ -308,7 +308,7 @@ def train(args, runtime):
     if args.optimizer_in_backward:
         from dsv41_train.optim import install_sgd_in_backward
         in_backward = install_sgd_in_backward(model, optimizer, gradient_accumulation_steps=args.gradient_accumulation_steps)
-    if args.train_engram or (args.engram_offload and args.mode == "full"):
+    if args.family == "dsv4" and args.optimizer == "sgd" and (args.mode == "full" or args.train_engram):
         from dsv41_train.engram_offload import install_engram_sgd_hooks
         from dsv41_train.sft_engram import build_engram_checkpoint
         install_engram_sgd_hooks(model, optimizer)
