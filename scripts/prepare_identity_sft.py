@@ -1,4 +1,4 @@
-"""Create authored identity QA with real long contexts and unseen evaluation prompts."""
+"""Create authored long identity QA, optional short training, and fixed evaluation prompts."""
 
 import argparse
 import json
@@ -38,8 +38,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--min-active-tokens", type=int, default=4096)
+    parser.add_argument("--min-active-tokens", type=int, default=4096, help="Minimum real tokens for long examples only")
     parser.add_argument("--max-length", type=int, default=4608)
+    parser.add_argument("--include-short-training", action="store_true", help="Append four bare training questions; keep the five evaluation prompts unchanged")
     args = parser.parse_args()
     if not 2 <= args.min_active_tokens < args.max_length:
         parser.error("require 2 <= min-active-tokens < max-length; leave space for a complete final sentence")
@@ -50,6 +51,13 @@ def main():
                                       max_tokens=args.max_length)
         train.append(record)
         lengths.append(length)
+    long_lengths, short_lengths = lengths.copy(), []
+    if args.include_short_training:
+        for question in QUESTIONS:
+            record = {"prompt": question, "answer": TARGET}
+            short_lengths.append(len(encode_example(record, tokenizer, max_length=args.max_length)["input_ids"]))
+            train.append(record)
+        lengths.extend(short_lengths)
     evaluation = [{"prompt": question, "answer": TARGET} for question in (QUESTIONS[0], *UNSEEN)]
     long_heldout, _ = long_example(tokenizer, UNSEEN[0], min_tokens=args.min_active_tokens,
                                    max_tokens=args.max_length, sentences=NEW_BACKGROUND)
@@ -61,7 +69,12 @@ def main():
             for record in records:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     print(json.dumps({"train_examples": len(train), "active_tokens": lengths,
-                      "eval_examples": len(evaluation), "enable_thinking": False}, ensure_ascii=False))
+                      "training_groups": {name: {"examples": len(values), "min_active_tokens": min(values, default=None),
+                                                "max_active_tokens": max(values, default=None)}
+                                          for name, values in (("long", long_lengths), ("short", short_lengths))},
+                      "eval_examples": len(evaluation), "enable_thinking": False,
+                      "eval_roles": ["seen_short_prompt" if args.include_short_training else "seen_question_new_short_context",
+                                     *["unseen_short_question"] * len(UNSEEN), "unseen_long_context_and_question"]}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

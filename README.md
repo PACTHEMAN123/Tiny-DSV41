@@ -48,7 +48,7 @@ records contain `prompt` and `answer`, or a text `messages` history ending in
 `user` and an `answer`. The checkpoint chat template defines token boundaries;
 only the final answer through EOS receives labels. Inputs are never truncated.
 
-For an authored identity check with at least 4096 actual tokens per example:
+For an authored identity check with at least 4096 actual tokens per training example:
 
 ```bash
 PYTHONPATH=. python3 scripts/prepare_identity_sft.py \
@@ -61,6 +61,14 @@ PYTHONPATH=. python3 -m torch.distributed.run --standalone --nproc-per-node=8 \
   --output-dir runs/identity-lora --seq-len 4608 --steps 20 \
   --learning-rate 1e-3 --gradient-checkpointing --generation-eval
 ```
+
+Add `--include-short-training` to the data preparation command to train on
+four bare identity questions alongside the four long examples. Short examples
+remain short; the generator reports actual token lengths separately. The five
+evaluation prompts stay unchanged, but their first question then overlaps a
+short training prompt. Report that replay separately from the other four
+unseen prompts. Low loss on a fixed long background alone does not establish
+that a model can answer the same question without that background.
 
 This example selects two original checkpoint layers for an execution check.
 Omit `--num-layers` to load the complete DSV4 backbone. Use `--mode full` for
@@ -231,6 +239,29 @@ this is checkpoint/stability evidence, not successful identity tuning. All owned
 processes exited and GPUs returned to idle. The shared checkpoint path is
 validated on Qwen; original DeepSeek full-model persistence and bitwise equality
 of independent continuation trajectories remain unverified.
+
+A follow-up restored that Qwen step20 without updating it: all four original
+long training prompts generated `RTP大模型`, but the same four questions without
+the background scored 0/4. Their mean teacher-forced CE was 0.000180 versus
+3.390625. This supports missing short-context coverage as a main cause of the
+low-loss/poor-answer discrepancy.
+
+Adding only the four bare questions with `--include-short-training`, then
+training the same original model for 20 steps with the same AdamW settings,
+produced 4/4 long and 4/4 short training answers. The bare unpunctuated `你是谁`
+also generated `RTP大模型`. The unchanged legacy five prompts improved from
+0/5 at step20 (1/5 after the earlier step21) to 3/5: one now-seen short prompt,
+one of three unseen short questions, and the unseen long prompt. Two additional
+preselected long backgrounds scored 2/2 both before and after this correction.
+The two remaining legacy short questions still returned the old identity;
+this is a successful target-question check, not complete identity generalization.
+
+Each mixed step contained four real 4106–4108-token examples and four real
+21–23-token examples, 16,516 input tokens and 40 supervised tokens globally.
+All 20 updates were finite with observed parameter changes. Loss fell from
+11.140625 to 0.002360; training took 218.51 seconds (median 10.80 seconds),
+with a maximum allocated peak of 35.89 GiB per GPU, including update probes.
+The run used `--no-save`; the corrected full-model weights were not persisted.
 
 ### Asynchronous GRPO MVP
 
