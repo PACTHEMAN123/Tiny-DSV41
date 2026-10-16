@@ -13,6 +13,7 @@ import mmap
 import os
 from multiprocessing.reduction import DupFd
 from pathlib import Path
+import sys
 import tempfile
 
 import torch
@@ -20,6 +21,43 @@ from torch import nn
 
 from dsv41_train.engram_offload import CPUEmbeddingLookup
 from dsv41_train.models.dsv4.checkpoint import ShardedSafeTensorReader, dequantize_fp8_rows
+
+
+def create_memfd(name):
+    """Linux memfd, including Python builds without the optional os binding."""
+    if sys.platform != "linux":
+        raise RuntimeError("sealed memfd requires Linux")
+    # Linux UAPI: MFD_CLOEXEC=1, MFD_ALLOW_SEALING=2. Never use a named tmpfs file.
+    flags = getattr(os, "MFD_CLOEXEC", 1) | getattr(os, "MFD_ALLOW_SEALING", 2)
+    native = getattr(os, "memfd_create", None)
+    if native is not None:
+        return native(name, flags)
+    import ctypes
+    try:
+        function = ctypes.CDLL(None, use_errno=True).memfd_create
+    except AttributeError as error:
+        raise RuntimeError("Linux libc has no memfd_create; a sealed baseline cannot be created") from error
+    function.argtypes, function.restype = [ctypes.c_char_p, ctypes.c_uint], ctypes.c_int
+    fd = function(os.fsencode(name), flags)
+    if fd < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return fd
+
+
+def memfd_seals(fd):
+    # Linux UAPI commands remain available even when Python omitted their names.
+    return fcntl.fcntl(fd, getattr(fcntl, "F_GET_SEALS", 1034))
+
+
+def seal_memfd(fd):
+    # WRITE | SHRINK | GROW | SEAL; callers must first close every shared writer.
+    required = 8 | 2 | 4 | 1
+    fcntl.fcntl(fd, getattr(fcntl, "F_ADD_SEALS", 1033), required)
+    actual = memfd_seals(fd)
+    if actual & required != required:
+        raise RuntimeError("Engram memfd is missing required kernel seals")
+    return actual
 
 
 def validate_delta(payload, identity, shapes, dtype):
@@ -110,7 +148,8 @@ class EngramBaseline:
             validate_delta(payload, identity, shapes, dtype)
             identity = dict(identity, initial_delta_sha256=file_sha256(initial_delta))
         total = sum(rows * width for rows, width in shapes.values()) * torch.empty((), dtype=dtype).element_size()
-        if not hasattr(os, "memfd_create") and total > 64 * 2**20:
+        linux = sys.platform == "linux"
+        if not linux and total > 64 * 2**20:
             raise RuntimeError("large Engram baselines require Linux memfd; tempfile CPU fallback is limited to 64 MiB")
         fds = {}
         result = cls(identity, shapes, dtype, fds)
@@ -121,16 +160,17 @@ class EngramBaseline:
             for name, (rows, width) in shapes.items():
                 size = rows * width * torch.empty((), dtype=dtype).element_size()
                 fallback_path = None
-                if hasattr(os, "memfd_create"):
-                    fd = os.memfd_create(f"engram-{name}", os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC)
+                if linux:
+                    fd = create_memfd(f"engram-{name}")
                 else:
                     fd, fallback_path = tempfile.mkstemp(prefix="engram-baseline-")
                 fds[name] = fd
                 os.ftruncate(fd, size)
                 mapping = mmap.mmap(fd, size, access=mmap.ACCESS_WRITE)
-                destination = torch.frombuffer(mapping, dtype=dtype).reshape(rows, width)
+                destination = None
                 reader = state = None
                 try:
+                    destination = torch.frombuffer(mapping, dtype=dtype).reshape(rows, width)
                     full_source = source is not None and source.engram_modes[name] == "full"
                     if not full_source and released is not None:
                         prefix = f"layers.{name}.engram.embed"
@@ -184,9 +224,16 @@ class EngramBaseline:
                             fds[name] = readonly
                         finally:
                             os.unlink(fallback_path)
-                if hasattr(os, "memfd_create"):
-                    fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
-                                fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL)
+                if linux:
+                    seal_memfd(fd)
+        except BaseException:
+            for fd in fds.values():
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            fds.clear()
+            raise
         finally:
             if released is not None:
                 released.close()

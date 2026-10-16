@@ -22,7 +22,7 @@ from dsv41_train.rl.checkpoint import (add_engram_identity, add_lora_identity, l
                                      policy_state, publish_policy_artifact, run_identity)
 from dsv41_train.rl.config import RLConfig
 from dsv41_train.rl.data import PromptRecord
-from dsv41_train.rl.engram_state import EngramBaseline, EngramState, baseline_identity
+from dsv41_train.rl.engram_state import EngramBaseline, EngramState, baseline_identity, memfd_seals
 from dsv41_train.rl.family import load_model_config
 from dsv41_train.rl.rollout import generate_group
 from dsv41_train.rl.runtime import make_model, train_groups
@@ -154,9 +154,9 @@ class EngramRLStateTests(unittest.TestCase):
             torch.testing.assert_close(actor.tables[name].weight, original[name], rtol=0, atol=0)
         with self.assertRaisesRegex(ValueError, "reference"):
             reference.load_state_dict(second)
-        if hasattr(os, "memfd_create"):
+        if sys.platform == "linux":
             for fd in baseline._fds.values():
-                self.assertTrue(fcntl.fcntl(fd, fcntl.F_GET_SEALS) & fcntl.F_SEAL_WRITE)
+                self.assertEqual(memfd_seals(fd) & 15, 15)
                 with self.assertRaises(OSError):
                     os.pwrite(fd, b"x", 0)
         else:
