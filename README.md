@@ -160,6 +160,10 @@ with a maximum allocated GPU peak of 145.61 GiB per rank. Checkpoints at
 This trainable-Engram run has **not passed the identity-quality check**:
 step100 training loss was 0.00727, but held-out evaluation loss was 4.98547
 and all five generated answers still identified as DeepSeek (0/5 matches).
+A fresh cache-disabled restore of checkpoint100 answered all four original
+training prompts with `RTP大模型` (4/4; mean answer CE 0.00665), while the five
+held-out prompts remained 0/5 before and after five additional updates. The
+model fitted the training examples but did not pass the held-out identity check.
 The four training examples share a long background; evaluation includes short
 questions and an unseen background. Both the optimizer and Engram trainability
 differ from the successful frozen-Engram AdamW run, so this comparison does not
