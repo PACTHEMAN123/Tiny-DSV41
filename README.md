@@ -148,7 +148,7 @@ all five answers after another update. Repeated native GPU computations show
 small numerical differences, so bitwise continuation is not guaranteed.
 These results cover LoRA with resident frozen Engram, not full-parameter SFT.
 
-The released 40-layer model also completed 20 steps with trainable CPU Engram,
+The released 40-layer model also completed 20 LoRA steps with trainable CPU Engram,
 a 128 MiB per-rank cache and plain SGD at 0.01, then a fresh process restored
 checkpoint20 exactly on all eight ranks and continued to step100. All 80 added
 updates had finite losses and 4113–4116 actual input tokens. The continuation
@@ -189,6 +189,25 @@ cached step; optimizer updates invalidated cache contents. Timings exclude
 loading, evaluation and saving, but include worker instrumentation. GPU memory
 and compute-process checks confirmed resource release between variants and
 after completion. Further identity generalization diagnosis remains separate.
+
+Full-parameter training of the original 40-layer model completed 20 finite
+steps at 4113–4116 tokens, with EP=8/CP=1, gradient checkpointing, plain SGD
+at 0.001 in backward, trainable CPU Engram and a 128 MiB cache per rank.
+All 926 parameter tensors were trainable, with no LoRA installed; all 924
+DTensors had optimizer hooks, and 900 received gradients in each step.
+Bounded probes observed numerical changes in expert, dense and Engram weights;
+they do not establish that every parameter changed. Training loss fell from
+10.9894 to 0.1093. The 20 steps took 106.59 seconds (median 5.17 seconds,
+including probes), with a maximum allocated peak of 154.06 GiB per GPU.
+
+This full-parameter run **failed the identity-quality check (0/5)**: four short
+prompts produced repetitive answers and the long prompt produced only `RTP大`.
+Evaluation loss fell from 11.4924 to 5.3081. The run establishes training
+feasibility and observed updates, not successful identity tuning. It deliberately
+omitted checkpoints because the available work disk cannot hold the complete
+backbone snapshot (about 1.1 TiB including headroom). No trained full model was
+persisted, and original-model save/restore remains unvalidated. All owned
+processes exited and physical GPU memory returned to its idle baseline.
 
 ### Asynchronous GRPO MVP
 
