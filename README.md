@@ -121,6 +121,12 @@ the adapter alone does not contain optimizer or resume state. With
 table rows; an adapter-only export is omitted. Generation metrics are separate
 from the teacher-forced loss and require checking the decoded answers.
 
+For training-only validation, pass `--no-save` to skip checkpoints and
+adapter/bundle exports while retaining metrics and evaluation summaries.
+It can also be used with `--resume` to validate a saved checkpoint and continue
+training without creating another snapshot. It cannot be combined with a nonzero
+`--save-every`; omitting it preserves the default saving behavior.
+
 New SFT adapters embed the base-model identity, checked before loading into RL.
 This hashes configuration/tokenizer assets and records weight-file names, sizes
 and modification times; it does not hash all base-weight contents. Legacy v1
@@ -208,6 +214,23 @@ omitted checkpoints because the available work disk cannot hold the complete
 backbone snapshot (about 1.1 TiB including headroom). No trained full model was
 persisted, and original-model save/restore remains unvalidated. All owned
 processes exited and physical GPU memory returned to its idle baseline.
+
+Complete checkpoint validation was run separately on the original 48-layer
+Qwen3-30B-A3B with full AdamW, CP=1/EP=1 and eight-way FSDP. It completed
+20 steps at 4106–4108 tokens and saved one 170.62 GiB checkpoint. All eight
+ranks compared every saved parameter, persistent buffer, AdamW state and
+CPU/CUDA RNG value with live state. Fresh processes restored that state exactly
+before evaluation, then completed step21 with `--no-save`; full state remained
+finite, parameter hashes changed, and no second checkpoint was created.
+
+The 20 Qwen steps took 214.26 seconds (median 10.62 seconds), with a maximum
+allocated peak of 35.89 GiB per GPU. These timings include update probes and
+exclude loading, evaluation and checkpoint validation. Training loss fell from
+10.1719 to 0.000231, but identity answers were 0/5 at step20 and 1/5 at step21;
+this is checkpoint/stability evidence, not successful identity tuning. All owned
+processes exited and GPUs returned to idle. The shared checkpoint path is
+validated on Qwen; original DeepSeek full-model persistence and bitwise equality
+of independent continuation trajectories remain unverified.
 
 ### Asynchronous GRPO MVP
 

@@ -28,6 +28,17 @@ reconstruction and native SFT-to-RL initialization also passed six CPU tests on
 Linux (`python3 -m unittest discover -s tests -p 'test_*sft_source.py' -v`).
 Neither suite validates a released-model vLLM GPU engine.
 
+SFT save controls have seven focused CPU regressions, also verified on Linux:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_train_sft.py' -v
+```
+
+They cover default/periodic saving, `--no-save` for full and LoRA training,
+suppression of adapter/Engram bundle exports, and resume followed by an update
+without creating another checkpoint. Tokenizer/model loading and CUDA telemetry
+are fixtures; actual tiny training and checkpoint save/load still run.
+
 ## CPU distributed parity
 
 Shared RL token log probabilities and checkpointed gradients, including a CP
