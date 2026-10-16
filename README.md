@@ -148,6 +148,26 @@ all five answers after another update. Repeated native GPU computations show
 small numerical differences, so bitwise continuation is not guaranteed.
 These results cover LoRA with resident frozen Engram, not full-parameter SFT.
 
+The released 40-layer model also completed 20 steps with trainable CPU Engram,
+a 128 MiB per-rank cache and plain SGD at 0.01, then a fresh process restored
+checkpoint20 exactly on all eight ranks and continued to step100. All 80 added
+updates had finite losses and 4113–4116 actual input tokens. The continuation
+observed 1579 changed strong-gradient row probes and 1280 table-cache
+invalidations. Median measured step time was 4.38 seconds, including probes,
+with a maximum allocated GPU peak of 145.61 GiB per rank. Checkpoints at
+40/60/80/100 and the final paired adapter/Engram bundle were saved.
+
+This trainable-Engram run has **not passed the identity-quality check**:
+step100 training loss was 0.00727, but held-out evaluation loss was 4.98547
+and all five generated answers still identified as DeepSeek (0/5 matches).
+The four training examples share a long background; evaluation includes short
+questions and an unseen background. Both the optimizer and Engram trainability
+differ from the successful frozen-Engram AdamW run, so this comparison does not
+isolate a cache defect. The earlier independent step19-to20 replay restored
+state exactly but produced small native-GPU differences after the next update;
+its strict bitwise-comparison failure is retained. Cache performance comparison
+and diagnosis of the identity failure remain pending.
+
 ### Asynchronous GRPO MVP
 
 `dsv41_train.rl` trains native DeepSeek V4.1 and Qwen3 MoE models using the same
@@ -343,7 +363,8 @@ checks do not establish that original 40-layer full RL fits or runs on this host
 The Engram Linux/CUDA gate passed 13 RL tests, including CPU-sparse/two-GPU-dense
 clipping and warm-cache update/restore across streams. Nine SFT Engram tests
 also passed, including GPU-cache continuation and all-rank rejection before
-mutation. Released-model trainable-Engram validation remains a separate gate.
+mutation. Released-model trainable-Engram SFT results and their quality limits
+are reported above; joint native CUDA LoRA/Engram RL remains a separate gate.
 
 For pretrained training, replace `--model-dir` with a checkpoint directory,
 provide tokenized task data and a task reward in the RL config, and omit
