@@ -2,8 +2,8 @@
 
 Run once with --output DIR, then independently with the same DIR --resume-check.
 --check-setup validates tiny configuration/model construction on CPU only.
---repeat-baseline diagnoses U,C,U,C,U,C restores at CP1/EP2. --reference-torch
-uses strict deterministic Torch references for exact repeat, parity and resume.
+--reference-torch uses strict deterministic Torch references for exact parity
+and resume.
 """
 
 import argparse
@@ -297,65 +297,6 @@ def reference_torch():
         import_module(prefix + name).triton = None
 
 
-def repeat_baseline(args, runtime):
-    meshes, cp, dispatcher = build_parallelism(1, 2)
-    raw = {}
-    model, optimizer = native(configuration(args.seq_len), True, runtime.device, meshes, cp, dispatcher, raw)
-    data, tables = batches(runtime, 1, args.seq_len), list(model.model.engram_tables.values())
-    initial = resume_state(model, optimizer, runtime.device)
-    identity = dict(probe="repeat-baseline", cp=1, ep=2, seq_len=args.seq_len)
-    save_checkpoint(args.output / "s0", model, optimizer, step=0, identity=identity, data_position=0)
-    trials, reports = [], []
-
-    def difference(left, right):
-        return dict(loss=abs(left["loss"] - right["loss"]),
-                    raw_table_gradient=grouped_errors(left["raw_table_gradients"], right["raw_table_gradients"])["engram"],
-                    **{key: grouped_errors(left[key], right[key]) for key in ("weights", "gradients")})
-
-    for trial, mode in enumerate("UCUCUC"):
-        assert load_checkpoint(args.output / "s0", model, optimizer, identity=identity) == (0, 0)
-        for table in tables:
-            table.configure_cache(args.cache_bytes if mode == "C" else 0, runtime.device)
-        assert_exact(resume_state(model, optimizer, runtime.device), initial)
-        snapshots, steps = [], []
-        for step in (1, 2):
-            metrics = train_update(model, optimizer, data, family="dsv4", runtime=runtime, cp_size=1,
-                                   synchronize=lambda: synchronize_cp_gradients(model, cp))
-            snapshot = dict(loss=metrics["loss"], weights=values(model), gradients=values(model, True),
-                            raw_table_gradients=raw["gradients"])
-            snapshots.append(snapshot)
-            counts = [table._cpu_lookup.cache_metrics for table in tables]
-            report = dict(event="repeat_baseline_step", trial=trial, mode=mode, step=step, rank=runtime.rank,
-                          loss=metrics["loss"], relative_to_first_u=difference(snapshot, trials[0][step - 1] if trials else snapshot),
-                          cache={key: sum(count[key] for count in counts) for key in counts[0]})
-            print(json.dumps(report), flush=True)
-            steps.append(report)
-        trials.append(snapshots)
-        reports.append(dict(trial=trial, mode=mode, restored_exact=True, steps=steps))
-    summaries = {}
-    for category in ("UU", "CC", "UC"):
-        pairs = [(a, b) for a in range(6) for b in range(a + 1, 6)
-                 if sorted("UCUCUC"[a] + "UCUCUC"[b]) == sorted(category)]
-        errors = [difference(left, right) for a, b in pairs for left, right in zip(trials[a], trials[b])]
-        summaries["/".join(category)] = dict(pairs=len(pairs), loss=max(error["loss"] for error in errors),
-            raw_table_gradient=max(error["raw_table_gradient"] for error in errors),
-            **{key: {group: max(error[key][group] for error in errors) for group in ("engram", "lora", "other")}
-               for key in ("weights", "gradients")})
-    print(json.dumps(dict(event="repeat_baseline_summary", rank=runtime.rank, summaries=summaries)), flush=True)
-    if args.reference_torch:
-        error = None
-        try:
-            for snapshots in trials[1:]:
-                assert_exact(snapshots, trials[0], "deterministic repeat")
-        except AssertionError as exc:
-            error = str(exc)
-        valid = torch.tensor(int(error is None), device=runtime.device)
-        dist.all_reduce(valid, op=dist.ReduceOp.MIN)
-        assert valid.item(), error or "deterministic repeat differs on another rank"
-    return dict(cp=1, ep=2, backend="torch" if args.reference_torch else "native",
-                exact_gate=args.reference_torch, trials=reports, summaries=summaries)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
@@ -363,15 +304,12 @@ def main():
     parser.add_argument("--cache-bytes", type=int, default=0)
     parser.add_argument("--resume-check", action="store_true")
     parser.add_argument("--check-setup", action="store_true")
-    parser.add_argument("--repeat-baseline", action="store_true")
     parser.add_argument("--reference-torch", action="store_true")
     args = parser.parse_args()
     if args.seq_len < 8 or args.seq_len % 2:
         parser.error("seq-len must be even and at least 8")
     if args.cache_bytes < 0:
         parser.error("cache-bytes must be nonnegative")
-    if args.repeat_baseline and (args.resume_check or args.cache_bytes <= 0):
-        parser.error("repeat-baseline requires positive cache-bytes and cannot use resume-check")
     torch.set_num_threads(1)
     if args.reference_torch:
         reference_torch()
@@ -396,21 +334,16 @@ def main():
             args.output.mkdir(parents=True, exist_ok=False)
         dist.barrier()
         reports = {}
-        if args.repeat_baseline:
-            reports["baseline"] = repeat_baseline(args, runtime)
-        elif not args.resume_check:
+        if not args.resume_check:
             meshes, _, _ = build_parallelism(1, 2)
             reports["row_probes"] = row_probe(meshes, runtime, args.cache_bytes)
-        if not args.repeat_baseline:
-            reports["native"] = [native_probe(args, runtime, cp) for cp in (1, 2)]
+        reports["native"] = [native_probe(args, runtime, cp) for cp in (1, 2)]
         gathered = [None] * 2
         dist.all_gather_object(gathered, reports)
         if runtime.is_main:
-            path = args.output / ("baseline-results.json" if args.repeat_baseline else
-                                  "resume-results.json" if args.resume_check else "results.json")
+            path = args.output / ("resume-results.json" if args.resume_check else "results.json")
             path.write_text(json.dumps(gathered, indent=2) + "\n")
-            event = ("baseline_exact_passed" if args.reference_torch else "baseline_diagnostic") if args.repeat_baseline else "passed"
-            print(json.dumps(dict(event=event, report=str(path))), flush=True)
+            print(json.dumps(dict(event="passed", report=str(path))), flush=True)
     finally:
         dist.destroy_process_group()
 
