@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--optimizer", choices=("adamw", "sgd"), help="native learner optimizer")
     parser.add_argument("--train-engram", action=argparse.BooleanOptionalAction, default=None,
                         help="update offloaded Engram rows; requires native-pytorch and SGD with zero weight decay")
-    parser.add_argument("--engram-cache-mib", type=int, help="per-process GPU row cache budget across Engram tables")
+    parser.add_argument("--engram-cache-mib", type=int, help="per-policy GPU row cache budget across Engram tables")
     parser.add_argument("--initial-engram-delta", help="initial SFT Engram row state, also used by the frozen reference")
     parser.add_argument("--initial-sft-checkpoint", help="complete full DSV4 SFT snapshot; native-pytorch/all only")
     parser.add_argument("--engram-offload", action=argparse.BooleanOptionalAction, default=None,

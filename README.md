@@ -347,8 +347,9 @@ before replacing its temporary tables with the shared ones.
 
 Native DeepSeek RL can update offloaded rows with `--train-engram --optimizer sgd`
 and zero weight decay, for either `--trainable-scope all` or `lora`.
-`--engram-cache-mib` divides a per-process row-cache budget across its tables;
-updates and restores invalidate the affected policy's cache. Sparse occurrences
+`--engram-cache-mib` divides a per-policy row-cache budget across its tables;
+learner and reference have separate budgets even when they share a process.
+Updates and restores invalidate the affected policy's cache. Sparse occurrences
 are summed in FP32 before gradient clipping and the BF16/FP32 SGD update. Each
 trajectory turn finishes its backward separately with the original action-token
 weighting, so repeated lookups retain all contributions.
@@ -356,8 +357,10 @@ weighting, so repeated lookups retain all contributions.
 This opt-in path streams one immutable baseline into Linux sealed memfd storage.
 Learner, actor and reference use private copy-on-write views; it does not use the
 `/dev/shm` mount. The baseline and all private dirty pages still consume host
-memory. Policy updates and checkpoints contain cumulative absolute rows, so
-actors can skip versions and checkpoint recovery can restore earlier rows.
+memory. Python builds without the optional memfd bindings use libc through the
+standard library; creation and all required kernel seals must succeed before
+the baseline is shared. Policy updates and checkpoints contain cumulative
+absolute rows, so actors can skip versions and recovery can restore earlier rows.
 The reference keeps the initial policy throughout learner updates and resume.
 `--initial-engram-delta PATH` accepts a validated initial SFT row payload and
 includes it in that reference baseline; the file identity is bound to recovery.
@@ -405,7 +408,34 @@ The Engram Linux/CUDA gate passed 13 RL tests, including CPU-sparse/two-GPU-dens
 clipping and warm-cache update/restore across streams. Nine SFT Engram tests
 also passed, including GPU-cache continuation and all-rank rejection before
 mutation. Released-model trainable-Engram SFT results and their quality limits
-are reported above; joint native CUDA LoRA/Engram RL remains a separate gate.
+are reported above.
+
+A three-layer prefix of the released DeepSeek weights completed 20 native GPU
+LoRA/Engram RL updates and a fresh-process update 21 with 4099–4111-token
+prompts. It retains the original layer dimensions, FP8/scales, hashing and
+384,006,168-by-256 Engram table: one 183.11 GiB sealed CPU baseline shared by
+learner, reference and actor through private views, with a 128 MiB row cache per
+role. All 21 updates had nonzero advantages, gradients and adapter changes;
+sampled Engram rows changed at every step. Actor activation compared every
+adapter tensor and cumulative dirty row against its published payload. The new
+process restored adapters, dirty rows, plain-SGD state and CPU/CUDA RNG exactly
+before update 21. Reference invariants passed; fixed 64-token probe logits were
+unchanged within each phase and matched across phases. This is bounded probe
+evidence, not a full reference-weight checksum.
+
+The first 20 updates took 57.19 s in the training stage, with a 1.46 s median
+and a 25.52 s first step, including observation overhead. Peak learner allocation
+was 110.85 GiB on one GPU; sampled physical GPU memory peaked at 117,564 MiB.
+Learner/reference/actor startup took 688.95/134.64/130.06 s separately. Natural
+cache hit rates were 71.95% for the learner and 90.06% for the actor; diagnostic
+cold/repeat probes were excluded and their rows cleared afterward. There was
+no cache-disabled control in this RL run, so these rates do not establish a
+speedup. The recovery phase also recorded one natural actor rollout group.
+All owned processes exited and physical GPU memory returned to its idle baseline.
+This test uses a synthetic token-ID reward and
+four generated tokens; it demonstrates prefix-model training and synchronization,
+not full 40-layer RL capacity, released-scale SFT-to-RL initialization or task
+quality improvement.
 
 For pretrained training, replace `--model-dir` with a checkpoint directory,
 provide tokenized task data and a task reward in the RL config, and omit
@@ -625,8 +655,8 @@ python3 -m dsv41_train.rl.train \
 ```
 
 `trainable_scope` defaults to `all`. The vLLM Qwen profile requires `lm_head`;
-the explicit native route supports Qwen `all` or `lm_head`, while native
-DeepSeek requires `all`. The Qwen
+the explicit native route supports Qwen `all`, `lm_head` or `lora`, while native
+DeepSeek supports `all` or `lora`. The Qwen
 head example freezes the full pretrained backbone and updates its 311M output
 head parameters. Its policy/checkpoint files contain the head and optimizer,
 and inference/resume reconstructs the frozen backbone from the identified
