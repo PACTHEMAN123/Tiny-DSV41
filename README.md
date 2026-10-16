@@ -160,17 +160,35 @@ with a maximum allocated GPU peak of 145.61 GiB per rank. Checkpoints at
 This trainable-Engram run has **not passed the identity-quality check**:
 step100 training loss was 0.00727, but held-out evaluation loss was 4.98547
 and all five generated answers still identified as DeepSeek (0/5 matches).
-A fresh cache-disabled restore of checkpoint100 answered all four original
-training prompts with `RTP大模型` (4/4; mean answer CE 0.00665), while the five
-held-out prompts remained 0/5 before and after five additional updates. The
-model fitted the training examples but did not pass the held-out identity check.
+Fresh restores of checkpoint100 with cache disabled and with 128 MiB per rank
+answered all four original training prompts with `RTP大模型` (4/4; identical
+generated token IDs and mean answer CE 0.00665). Both variants remained 0/5 on
+the five held-out prompts before and after five additional updates. The model
+fitted the training examples but did not pass the held-out identity check.
 The four training examples share a long background; evaluation includes short
 questions and an unseen background. Both the optimizer and Engram trainability
 differ from the successful frozen-Engram AdamW run, so this comparison does not
 isolate a cache defect. The earlier independent step19-to20 replay restored
 state exactly but produced small native-GPU differences after the next update;
-its strict bitwise-comparison failure is retained. Cache performance comparison
-and diagnosis of the identity failure remain pending.
+its strict bitwise-comparison failure is retained.
+
+The controlled cache comparison restored that same checkpoint exactly on all
+eight ranks, then ran steps101–105 at 4113–4116 tokens per example:
+
+| Metric | Cache disabled | 128 MiB cache/rank |
+| --- | ---: | ---: |
+| Median training step | 4.38 s | 4.54 s |
+| Sum of five training steps | 22.61 s | 22.54 s |
+| Maximum allocated GPU memory/rank | 145.45 GiB | 145.59 GiB |
+| Row-value H2D bytes, all ranks/five steps | 4,044,963,840 | 66,255,360 |
+
+Row-value transfers fell 98.36%; this counter excludes lookup metadata and
+gradient transfers. Five-step timings show no established throughput gain.
+Both variants ran the same diagnostics before training, warming the first
+cached step; optimizer updates invalidated cache contents. Timings exclude
+loading, evaluation and saving, but include worker instrumentation. GPU memory
+and compute-process checks confirmed resource release between variants and
+after completion. Further identity generalization diagnosis remains separate.
 
 ### Asynchronous GRPO MVP
 
