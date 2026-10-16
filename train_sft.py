@@ -54,6 +54,7 @@ def parse_args(argv=None):
     parser.add_argument("--generation-eval", action="store_true", help="Also generate from fixed evaluation prompts without answers")
     parser.add_argument("--generation-max-new-tokens", type=int, default=16)
     parser.add_argument("--save-every", type=int, default=0)
+    parser.add_argument("--no-save", action="store_true", help="Skip checkpoint and adapter/bundle exports; keep metrics and evaluation summaries")
     parser.add_argument("--resume", help="Same-topology SFT checkpoint directory")
     return parser.parse_args(argv)
 
@@ -61,6 +62,8 @@ def parse_args(argv=None):
 def validate_args(args, world_size):
     if args.steps < 0 or args.save_every < 0:
         raise ValueError("steps and save-every must be nonnegative")
+    if args.no_save and args.save_every:
+        raise ValueError("no-save cannot be combined with save-every")
     if min(args.batch_size, args.gradient_accumulation_steps, args.eval_batches, args.generation_max_new_tokens) < 1 or args.seq_len < 2:
         raise ValueError("batch-size, accumulation and eval-batches must be positive; seq-len must be at least 2")
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
@@ -373,13 +376,13 @@ def train(args, runtime):
         train_step_seconds_total += metrics["seconds"]
         cursor = next_cursor
         emit({"event": "train", "step": step, "data_position": cursor, **metrics})
-        if args.save_every and step % args.save_every == 0:
+        if not args.no_save and args.save_every and step % args.save_every == 0:
             save_checkpoint(output_dir / f"checkpoint-{step:08d}", model, optimizer,
                             step=step, identity=identity, data_position=cursor)
             saved_step = step
     train_seconds = _max_metrics(runtime, loop_seconds=time.perf_counter() - training_started)
     train_seconds["train_step_seconds_total"] = train_step_seconds_total
-    if step > initial_step and step != saved_step:
+    if not args.no_save and step > initial_step and step != saved_step:
         save_checkpoint(output_dir / f"checkpoint-{step:08d}", model, optimizer,
                         step=step, identity=identity, data_position=cursor)
     optimizer.zero_grad(set_to_none=True)
@@ -387,7 +390,7 @@ def train(args, runtime):
     after = evaluate(model, eval_batches, family=args.family, runtime=runtime, cp_size=args.cp_size)
     generation_after = generation_eval()
     eval_after_metrics = _max_metrics(runtime, eval_after_peak_allocated_gib=torch.cuda.max_memory_allocated(runtime.device) / 2**30)
-    if args.mode == "lora" and step > 0 and (step > initial_step or args.resume):
+    if not args.no_save and args.mode == "lora" and step > 0 and (step > initial_step or args.resume):
         if args.train_engram:
             if (args.engram_offload and args.lora_dropout == 0
                     and args.complete_backbone):
@@ -404,6 +407,7 @@ def train(args, runtime):
             if runtime.is_main:
                 (output_dir / "adapter_metadata.json").write_text(json.dumps({"identity": identity, "step": step}, indent=2) + "\n")
     summary = {"event": "summary", "step": step, "initial_step": initial_step, "data_position": cursor,
+               "checkpoint_saving": not args.no_save,
                "eval_loss_before": before, "eval_loss_after": after, **load_metrics, **train_seconds,
                "generation_before": generation_before, "generation_after": generation_after,
                **eval_before_metrics, **eval_after_metrics}

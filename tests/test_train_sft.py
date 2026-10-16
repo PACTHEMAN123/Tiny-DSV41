@@ -1,11 +1,13 @@
 import copy
+from contextlib import ExitStack, redirect_stdout
 from dataclasses import replace
+import io
 import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 from torch.nn import functional as F
@@ -16,7 +18,7 @@ from dsv41_train.models.qwen import Qwen3MoeForCausalLM
 from dsv41_train.runtime import Runtime
 from dsv41_train.sft_data import collate_examples
 from qwen_helpers import tiny_config
-from train_sft import evaluate, make_batches, parse_args, sft_loss, train_update, validate_args
+from train_sft import evaluate, make_batches, parse_args, sft_loss, train, train_update, validate_args
 
 
 def small_model(family):
@@ -135,6 +137,64 @@ class SFTTrainTests(unittest.TestCase):
         for (name, parameter), (_, reference) in zip(restored.named_parameters(), model.named_parameters()):
             torch.testing.assert_close(parameter, reference, rtol=0, atol=0, msg=name)
 
+    def test_training_entry_no_save_and_default_checkpoint_exports(self):
+        from dsv41_train.sft_checkpoint import load_checkpoint, save_checkpoint
+
+        for family, mode, options in (("qwen", "full", []), ("qwen", "full", ["--save-every", "1"]),
+                                      ("qwen", "full", ["--no-save"]), ("qwen", "lora", []),
+                                      ("qwen", "lora", ["--no-save"]), ("dsv4", "lora", ["--no-save"])):
+            with self.subTest(family=family, mode=mode, options=options), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                base, output = root / "base", root / "output"
+                base.mkdir()
+                model = small_model(family)
+                if family == "dsv4":
+                    model = DeepSeekV41ForCausalLM(model.config, sparse_engram_gradients=True, engram_offload=True)
+                if mode == "lora":
+                    targets = LoRAConfig().targets if family == "dsv4" else ("self_attn.q_proj", "self_attn.v_proj")
+                    inject_lora(model, LoRAConfig(rank=2, alpha=4, targets=targets))
+                    if family == "dsv4":
+                        model.model.engram_tables.requires_grad_(True)
+                (base / "config.json").write_text(json.dumps(model.config.to_dict()))
+                (base / "model.safetensors.index.json").write_text("{}")
+                data = root / "data.jsonl"
+                data.write_text('{"prompt":"test","answer":"answer"}\n')
+                command = ["--model-path", str(base), "--data", str(data), "--output-dir", str(output),
+                           "--family", family, "--mode", mode, "--steps", "2", "--seq-len", "16", *options]
+                if mode == "lora":
+                    command += ["--lora-rank", "2", "--lora-alpha", "4", "--lora-targets", ",".join(targets)]
+                if family == "dsv4":
+                    command += ["--train-engram", "--engram-offload"]
+                initial = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+                with ExitStack() as stack, redirect_stdout(io.StringIO()):
+                    for name in ("reset_peak_memory_stats", "synchronize", "max_memory_allocated", "max_memory_reserved"):
+                        stack.enter_context(patch(f"torch.cuda.{name}", return_value=0))
+                    stack.enter_context(patch("train_sft.ModelTokenizer", return_value=SimpleNamespace(eos_token_ids=[2])))
+                    stack.enter_context(patch("train_sft.load_jsonl", return_value=examples()))
+                    stack.enter_context(patch("train_sft.load_model", return_value=(model, lambda: None)))
+                    save = stack.enter_context(patch("dsv41_train.sft_checkpoint.save_checkpoint", wraps=save_checkpoint))
+                    bundle = stack.enter_context(patch("dsv41_train.sft_export.export_sft_bundle"))
+                    summary = train(parse_args(command), self.runtime)
+                    disabled = "--no-save" in options
+                    self.assertEqual(summary["checkpoint_saving"], not disabled)
+                    self.assertEqual((summary["step"], summary["data_position"]), (2, 2))
+                    self.assertTrue(any(not torch.equal(parameter, initial[name]) for name, parameter in model.named_parameters()))
+                    bundle.assert_not_called()
+                    if disabled:
+                        save.assert_not_called()
+                        self.assertEqual({path.name for path in output.iterdir()}, {"metrics.jsonl", "summary.json"})
+                    else:
+                        self.assertEqual(save.call_count, 2 if "--save-every" in options else 1)
+                        self.assertEqual((output / "adapter.pt").is_file(), mode == "lora")
+                        checkpoint = output / "checkpoint-00000002"
+                        self.assertTrue((checkpoint / "manifest.json").is_file())
+                        load = stack.enter_context(patch("dsv41_train.sft_checkpoint.load_checkpoint", wraps=load_checkpoint))
+                        resumed = train(parse_args(command + ["--save-every", "0", "--no-save", "--resume", str(checkpoint),
+                                                              "--steps", "3", "--output-dir", str(root / "resumed")]), self.runtime)
+                        load.assert_called_once()
+                        self.assertEqual((resumed["initial_step"], resumed["step"], resumed["data_position"]), (2, 3, 3))
+                        self.assertEqual({path.name for path in (root / "resumed").iterdir()}, {"metrics.jsonl", "summary.json"})
+
     def test_default_dsv4_selection_is_full_backbone_and_optimizer_is_mode_specific(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
@@ -148,8 +208,11 @@ class SFTTrainTests(unittest.TestCase):
                 self.assertEqual(args.optimizer, optimizer)
                 self.assertEqual(args.steps, 20)
                 self.assertEqual(args.seq_len, 4096)
+                self.assertFalse(args.no_save)
 
             base = ["--model-path", directory, "--data", "data.jsonl", "--output-dir", directory]
+            with self.assertRaisesRegex(ValueError, "no-save cannot be combined"):
+                validate_args(parse_args(base + ["--no-save", "--save-every", "1"]), 1)
             for options, optimizer in ((["--engram-offload"], "adamw"),
                                        (["--engram-offload", "--train-engram"], "sgd"),
                                        (["--engram-offload", "--mode", "full"], "sgd")):
