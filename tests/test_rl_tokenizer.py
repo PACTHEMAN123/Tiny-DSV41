@@ -78,6 +78,28 @@ class ModelTokenizerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "chat template"):
             tokenizer.encode_prompt(messages=[{"role": "user", "content": "hello"}])
 
+    def test_completion_reuses_generation_prefix_and_preserves_template_eos(self):
+        self.write_template()
+        tokenizer = ModelTokenizer(self.directory)
+        messages = [{"role": "user", "content": "hello"}]
+        with patch.object(tokenizer._tokenizer, "apply_chat_template", wraps=tokenizer._tokenizer.apply_chat_template) as render:
+            prompt, full = tokenizer.encode_completion(messages, "reply", chat_template_kwargs={"enable_thinking": False})
+        self.assertEqual(prompt, tokenizer.encode_conversation(messages, chat_template_kwargs={"enable_thinking": False}))
+        self.assertEqual(full, [*prompt, 10, 2])
+        self.assertEqual([call.kwargs["add_generation_prompt"] for call in render.call_args_list], [True, False])
+        self.assertTrue(all(call.kwargs["enable_thinking"] is False for call in render.call_args_list))
+        self.assertEqual(messages, [{"role": "user", "content": "hello"}])
+
+    def test_completion_rejects_changed_prompt_prefix_and_invalid_answer(self):
+        self.write_template('{% if add_generation_prompt %}hello{% else %}world reply {{ eos_token }}{% endif %}')
+        tokenizer = ModelTokenizer(self.directory)
+        messages = [{"role": "user", "content": "hello"}]
+        with self.assertRaisesRegex(ValueError, "prefix"):
+            tokenizer.encode_completion(messages, "reply")
+        for answer in (None, 123, "", " "):
+            with self.subTest(answer=answer), self.assertRaisesRegex(ValueError, "answer"):
+                tokenizer.encode_completion(messages, answer)
+
     def test_qwen_bos_eos_flags_are_metadata_not_special_token_strings(self):
         self.write_json("tokenizer_config.json", {"bos_token": "[BOS]", "eos_token": "[EOS]",
                                                  "add_bos_token": False, "add_eos_token": True})

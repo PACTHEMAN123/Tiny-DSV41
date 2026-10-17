@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 
 from dsv41_train.models.dsv4 import DeepSeekV41Config, load_dsv41_backbone_window
+from dsv41_train.optim import install_sgd_in_backward as install_sgd_hooks
 from dsv41_train.cp import pack_sequences
 from dsv41_train.models.dsv4.parallel import (
     apply_fsdp2_layer,
@@ -39,32 +40,12 @@ def maximum_parameter_delta(before: torch.Tensor, after: torch.Tensor) -> torch.
 
 
 def install_sgd_in_backward(
-    model: torch.nn.Module, learning_rate: float, cp_size: int
+    model: torch.nn.Module, learning_rate: float
 ) -> set[int]:
-    expert_ids = {
-        id(parameter)
-        for layer in model.model.layers
-        for parameter in layer.moe.routed.parameters()
-    }
-    installed = set()
-    for parameter in model.parameters():
-        if not hasattr(parameter, "to_local"):
-            continue
-        installed.add(id(parameter))
-
-        scale = cp_size if id(parameter) in expert_ids else 1
-
-        def step(value: torch.nn.Parameter, divisor: int = scale) -> None:
-            if value.grad is not None:
-                with torch.no_grad():
-                    value.to_local().add_(
-                        value.grad.to_local(),
-                        alpha=-learning_rate / divisor,
-                    )
-                value.grad = None
-
-        parameter.register_post_accumulate_grad_hook(step)
-    return installed
+    """Compatibility helper; training uses the shared state for finite checks."""
+    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad],
+                                lr=learning_rate, foreach=False)
+    return install_sgd_hooks(model, optimizer).parameter_ids
 
 
 def parse_args() -> argparse.Namespace:
@@ -174,14 +155,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
     # power of two, then cancel it once for both parameter update paths.
     backward_scale = _IN_BACKWARD_SCALE if args.optimizer_in_backward else 1.0
     effective_learning_rate = args.learning_rate / backward_scale
-    stepped = (
-        install_sgd_in_backward(model, effective_learning_rate, args.cp_size)
-        if args.optimizer_in_backward
-        else set()
-    )
-    optimizer_parameters = [
-        parameter for parameter in model.parameters() if id(parameter) not in stepped
-    ]
+    optimizer_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if args.optimizer == "adamw":
         optimizer: torch.optim.Optimizer = torch.optim.AdamW(
             optimizer_parameters, lr=effective_learning_rate, foreach=False
@@ -190,6 +164,7 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         optimizer = torch.optim.SGD(
             optimizer_parameters, lr=effective_learning_rate, foreach=False
         )
+    in_backward = install_sgd_hooks(model, optimizer) if args.optimizer_in_backward else None
 
     generator = torch.Generator(device=runtime.device)
     generator.manual_seed(args.seed + runtime.rank // args.cp_size)
@@ -207,11 +182,18 @@ def train(args: argparse.Namespace, runtime: Runtime) -> dict[str, float | int |
         if args.sequence_packing:
             input_ids, sequence_ids = pack_sequences(input_ids)
         optimizer.zero_grad(set_to_none=True)
+        if in_backward is not None:
+            in_backward.reset()
         output = model(input_ids, labels=input_ids, sequence_ids=sequence_ids)
         if output.loss is None or not torch.isfinite(output.loss):
             raise RuntimeError("training produced a non-finite loss")
         (output.loss * backward_scale).backward()
         synchronize_cp_gradients(model, context_parallel)
+        if in_backward is not None:
+            finite = in_backward.local_finite(runtime.device).to(torch.int32)
+            dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+            if not finite.item():
+                raise RuntimeError("non-finite in-backward SGD update; abort and reload the checkpoint")
         optimizer.step()
         distributed_trace(runtime, "optimizer_step_complete")
         last_loss = distributed_mean(output.loss, runtime)

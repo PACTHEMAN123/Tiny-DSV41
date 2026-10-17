@@ -41,6 +41,295 @@ python3 -m torch.distributed.run --standalone --nproc-per-node=8 \
   --optimizer sgd --steps 1 --batch-size 1 --seq-len 8
 ```
 
+### Text SFT and LoRA
+
+`train_sft.py` reuses the native model loaders, FSDP and CP/EP paths. JSONL
+records contain `prompt` and `answer`, or a text `messages` history ending in
+`user` and an `answer`. The checkpoint chat template defines token boundaries;
+only the final answer through EOS receives labels. Inputs are never truncated.
+
+For an authored identity check, train on varied bare questions and long-context
+questions. Each long example contains at least 4096 actual tokens:
+
+```bash
+PYTHONPATH=. python3 scripts/prepare_identity_sft.py \
+  --model-path /path/to/DeepSeek-V4.1-Flash --output-dir runs/identity-data \
+  --diverse-training
+
+PYTHONPATH=. python3 -m torch.distributed.run --standalone --nproc-per-node=8 \
+  train_sft.py --model-path /path/to/DeepSeek-V4.1-Flash \
+  --family dsv4 --mode lora --num-layers 2 --ep-size 8 --cp-size 1 \
+  --data runs/identity-data/train.jsonl --eval-data runs/identity-data/eval.jsonl \
+  --output-dir runs/identity-lora --seq-len 4608 --steps 20 \
+  --learning-rate 1e-3 --gradient-checkpointing --generation-eval
+```
+
+`--diverse-training` produces four blocks of four long and four short examples,
+including both `你是谁？` and the user-requested bare `你是谁` as short training
+prompts, alongside varied identity expressions and backgrounds. With eight ranks, CP=1,
+batch size 1 and one microbatch, each update contains four long and four short
+examples. `--include-short-training` retains the smaller eight-example recipe;
+omitting both options retains four long examples. The generator reports actual
+lengths separately. The five evaluation prompts stay unchanged, but their first
+question overlaps a short training prompt. Report that replay separately from
+the other four unseen prompts. Low loss on a fixed long background alone does
+not establish that a model can answer the same question without that background.
+These prompts are fixed development checks, not a blind generalization benchmark.
+The expanded recipe preserves the smaller recipe's eight rows and adds identity,
+name and address questions; it includes the exact bare question twice. At 160
+updates with the topology above, each row is used 40 times. A logged training
+loss covers the current eight-row block, not the entire dataset. Judge the
+identity result from the separate prompt-only generation check.
+
+This example selects two original checkpoint layers for an execution check.
+Omit `--num-layers` to load the complete DSV4 backbone. Use `--mode full` for
+all parameters (SGD by default); LoRA defaults to AdamW and freezes the base,
+including Engram tables. Qwen uses `--family qwen` and requires `CP == EP`.
+Gradient accumulation is weighted by global supervised token count.
+
+For complete-backbone full SFT with the same identity data and trainable CPU
+Engram tables, use:
+
+```bash
+PYTHONPATH=. python3 -m torch.distributed.run --standalone --nproc-per-node=8 \
+  train_sft.py --model-path /path/to/DeepSeek-V4.1-Flash \
+  --data runs/identity-data/train.jsonl --eval-data runs/identity-data/eval.jsonl \
+  --output-dir runs/identity-full --family dsv4 --mode full --num-layers 40 \
+  --cp-size 1 --ep-size 8 --steps 160 --seq-len 4608 --batch-size 1 \
+  --gradient-accumulation-steps 1 --optimizer sgd --learning-rate 1e-3 \
+  --optimizer-in-backward --gradient-checkpointing --seed 42 \
+  --train-engram --engram-offload --engram-cache-mib 128 \
+  --eval-batches 1 --generation-eval --generation-max-new-tokens 16 --no-save
+```
+
+Remove `--engram-offload --engram-cache-mib 128` for the resident-table control.
+For an additional bare-prompt check, append
+`{"prompt":"你是谁","answer":"RTP大模型"}` to a copy of `eval.jsonl` and pass
+that copy as `--eval-data`. Report the original five questions and this
+bare prompt separately. With `--diverse-training`, both the original first
+question and this bare prompt are seen training prompts; the other four
+evaluation prompts remain unseen in training. Their results are fixed
+development checks, not a blind generalization benchmark.
+
+In an instrumented 160-step run of the original 40-layer model on eight B300s
+with the full-SFT settings above, the resident control finished at **5/5 on the
+original questions and 1/1 on bare `你是谁`**. CPU offload with a 128 MiB cache
+per rank finished at **4/5 and 1/1**, respectively: the remaining assistant-name
+variant generated `RTP大包`. The resident control scored 6/6 at every 20-step
+check. Offload reached 6/6 at several intermediate checks, but scored 5/6 at
+steps 120 and 160. Its failed answer token was also wrong under teacher forcing;
+a low mean token loss did not imply a correct complete answer.
+
+Given the same actual gradients, first-two-step CPU/CUDA coalescing and SGD
+replays were exact. All 1,584,960 checked cache-return row occurrences matched
+authoritative CPU values. Paired first-step snapshots matched all 32,624 visited
+initial rows, and the first lookup outputs matched, but incoming gradients
+already differed; coalesced-gradient relative L2 difference was 0.008879.
+These checks do not establish identical full-model training trajectories.
+The expanded data and longer training are not a matched-budget comparison with
+the earlier 20-step experiment. The default SGD-hook correction below does not
+explain that experiment's quality gap: both earlier variants explicitly used
+`--train-engram`, which already installed the same hook. Diagnostic overhead also
+precludes treating these runs as clean throughput measurements.
+
+DSV4 can opt into `--optimizer-in-backward` with plain SGD and
+`--gradient-accumulation-steps 1`. Reduced FSDP gradients update their shards
+during backward, releasing gradients earlier; CPU Engram and replicated FP32
+parameters still update after synchronization. This path does not support
+momentum, weight decay or gradient clipping. A non-finite gradient/update aborts
+the run on every rank; earlier shard updates are not rolled back, so resume from
+the last checkpoint. This reduces gradient storage, but does not establish that
+the full released model fits: activations, collective buffers and checkpoint
+storage still need separate measurement.
+
+Using deterministic Torch reference kernels on CUDA, a reduced full-parameter
+BF16 model with FP32 precision islands, CPU Engram and real FSDP2 passed ordinary
+versus in-backward SGD comparison at CP1/EP2 and CP2/EP2. Parameter updates and
+sparse-checkpoint continuation were exact; a non-finite gradient on one rank
+aborted both ranks before the final SGD step. Native-kernel strict checkpoint
+replay has not passed. These checks validate the distributed update contract,
+not the released full model's memory footprint.
+
+For DSV4, `--engram-offload` keeps each rank's Engram row shard on CPU while
+preserving the native hash and distributed lookup. Full SFT updates these rows
+with SGD; LoRA freezes them unless `--train-engram` is also supplied. That
+combination defaults to SGD and requires it explicitly when overriding the
+optimizer. Sparse row gradients are combined in FP32 before each update, for
+both resident and offloaded tables, including full SFT without `--train-engram`.
+Frozen CPU tables remain compatible with LoRA's AdamW optimizer.
+
+`tests/engram_bf16_device_parity.py --device cuda` checks native BF16 SGD over
+20 steps with two ranks. It compares resident, offloaded and cached tables
+using synthetic V4.1 E4M3/E8M0 rows, including hash/routing, gradients, updates
+and post-update cache reads. Run it through `torchrun --standalone --nproc-per-node=2` with
+`PYTHONPATH=.`. This component check does not establish full-model equivalence.
+
+`--engram-cache-mib 128` optionally caches queried CPU rows on each rank's GPU.
+The per-rank budget is divided across selected tables and includes row values
+and CPU tags; request outputs and transfer staging are additional temporary
+memory. Every lookup occurrence still contributes a gradient, including cache
+hits. SGD updates and checkpoint restores invalidate cached rows; frozen tables
+retain them between steps. Per-step metrics report global hits/misses, rows
+transferred, hit rate and maximum per-rank resident bytes. The default budget is
+zero. CUDA misses use a separate copy stream and bounded pinned/GPU staging,
+each at most the smaller of the cache budget and 4 MiB (or one complete row).
+Copies can overlap hit reads and lookup planning; the consumer waits through a
+CUDA event. This does not prefetch across transformer layers. Updates and cache
+resets drain pending copies, and versioned tickets reject stale transfer results.
+
+Metrics record actual input lengths, loss, per-step time and GPU allocated and
+reserved peaks. Optional greedy evaluation uses prompt tokens only, before and
+after training. A reduced model's results do not establish full-model quality.
+
+`checkpoint-00000020/` includes trainable rank-owned weights, optimizer state,
+data position and RNG. Resume with the same arguments and `--resume PATH`;
+`--steps` is the total step target, while `--steps 0` evaluates a restored model.
+Resume requires the same base identity, training configuration, world size and
+CP/EP ownership. Frozen base weights are reloaded from `--model-path`.
+The rank-local snapshot format preserves independent expert and Engram shards.
+LoRA with frozen Engram also exports `adapter.pt` with `adapter_metadata.json`;
+the adapter alone does not contain optimizer or resume state. With
+`--train-engram`, restore the SFT checkpoint, which also contains the updated
+table rows; an adapter-only export is omitted. Generation metrics are separate
+from the teacher-forced loss and require checking the decoded answers.
+
+For training-only validation, pass `--no-save` to skip checkpoints and
+adapter/bundle exports while retaining metrics and evaluation summaries.
+It can also be used with `--resume` to validate a saved checkpoint and continue
+training without creating another snapshot. It cannot be combined with a nonzero
+`--save-every`; omitting it preserves the default saving behavior.
+
+New SFT adapters embed the base-model identity, checked before loading into RL.
+This hashes configuration/tokenizer assets and records weight-file names, sizes
+and modification times; it does not hash all base-weight contents. Legacy v1
+adapters remain readable with an explicit warning that their base and tokenizer
+cannot be verified.
+
+Trainable CPU Engram snapshots store cumulative SGD-touched rows with their
+rank-local ownership, rather than copying each complete table. Fresh restore
+applies these rows to the verified original base. Rolling back an already
+trained model rereads only dirty rows absent from the older snapshot, using
+the original V4.1 E4M3/E8M0 layout, then invalidates the GPU cache. All ranks
+validate payloads before restoring; a base-storage I/O failure aborts restore.
+Dense trainable backbone weights still require full shard storage, and row
+snapshots grow with the number of distinct rows touched. Snapshots require the
+same storage schema; older full-table snapshots for trainable offload are not
+converted automatically. Frozen-Engram LoRA snapshots remain compatible.
+
+Validation on the released 40-layer DeepSeek model completed 20 LoRA SFT steps
+with 4113–4116 actual tokens per example on eight GPUs (EP=8, CP=1).
+Five identity prompts changed from DeepSeek answers to `RTP大模型`; this is
+an authored identity-task check, not a general quality benchmark. The final
+step took 4.35 seconds and peaked at 191.50 GiB allocated per GPU. A fresh
+process restored parameters, buffers, AdamW state and RNG exactly, and retained
+all five answers after another update. Repeated native GPU computations show
+small numerical differences, so bitwise continuation is not guaranteed.
+These results cover LoRA with resident frozen Engram, not full-parameter SFT.
+
+The released 40-layer model also completed 20 LoRA steps with trainable CPU Engram,
+a 128 MiB per-rank cache and plain SGD at 0.01, then a fresh process restored
+checkpoint20 exactly on all eight ranks and continued to step100. All 80 added
+updates had finite losses and 4113–4116 actual input tokens. The continuation
+observed 1579 changed strong-gradient row probes and 1280 table-cache
+invalidations. Median measured step time was 4.38 seconds, including probes,
+with a maximum allocated GPU peak of 145.61 GiB per rank. Checkpoints at
+40/60/80/100 and the final paired adapter/Engram bundle were saved.
+
+This trainable-Engram run has **not passed the identity-quality check**:
+step100 training loss was 0.00727, but held-out evaluation loss was 4.98547
+and all five generated answers still identified as DeepSeek (0/5 matches).
+Fresh restores of checkpoint100 with cache disabled and with 128 MiB per rank
+answered all four original training prompts with `RTP大模型` (4/4; identical
+generated token IDs and mean answer CE 0.00665). Both variants remained 0/5 on
+the five held-out prompts before and after five additional updates. The model
+fitted the training examples but did not pass the held-out identity check.
+The four training examples share a long background; evaluation includes short
+questions and an unseen background. Both the optimizer and Engram trainability
+differ from the successful frozen-Engram AdamW run, so this comparison does not
+isolate a cache defect. The earlier independent step19-to20 replay restored
+state exactly but produced small native-GPU differences after the next update;
+its strict bitwise-comparison failure is retained.
+
+The controlled cache comparison restored that same checkpoint exactly on all
+eight ranks, then ran steps101–105 at 4113–4116 tokens per example:
+
+| Metric | Cache disabled | 128 MiB cache/rank |
+| --- | ---: | ---: |
+| Median training step | 4.38 s | 4.54 s |
+| Sum of five training steps | 22.61 s | 22.54 s |
+| Maximum allocated GPU memory/rank | 145.45 GiB | 145.59 GiB |
+| Row-value H2D bytes, all ranks/five steps | 4,044,963,840 | 66,255,360 |
+
+Row-value transfers fell 98.36%; this counter excludes lookup metadata and
+gradient transfers. Five-step timings show no established throughput gain.
+Both variants ran the same diagnostics before training, warming the first
+cached step; optimizer updates invalidated cache contents. Timings exclude
+loading, evaluation and saving, but include worker instrumentation. GPU memory
+and compute-process checks confirmed resource release between variants and
+after completion. Further identity generalization diagnosis remains separate.
+
+Full-parameter training of the original 40-layer model completed 20 finite
+steps at 4113–4116 tokens, with EP=8/CP=1, gradient checkpointing, plain SGD
+at 0.001 in backward, trainable CPU Engram and a 128 MiB cache per rank.
+All 926 parameter tensors were trainable, with no LoRA installed; all 924
+DTensors had optimizer hooks, and 900 received gradients in each step.
+The discrete SparseIndexer path runs under `torch.no_grad()`: its 24 tensors
+retain `requires_grad=True` in SFT but receive no loss gradients; they are not
+explicitly frozen as they are in RL.
+Bounded probes observed numerical changes in expert, dense and Engram weights;
+they do not establish that every parameter changed. Training loss fell from
+10.9894 to 0.1093. The 20 steps took 106.59 seconds (median 5.17 seconds,
+including probes), with a maximum allocated peak of 154.06 GiB per GPU.
+
+This full-parameter run **failed the identity-quality check (0/5)**: four short
+prompts produced repetitive answers and the long prompt produced only `RTP大`.
+Evaluation loss fell from 11.4924 to 5.3081. The run establishes training
+feasibility and observed updates, not successful identity tuning. It deliberately
+omitted checkpoints because the available work disk cannot hold the complete
+backbone snapshot (about 1.1 TiB including headroom). No trained full model was
+persisted, and original-model save/restore remains unvalidated. All owned
+processes exited and physical GPU memory returned to its idle baseline.
+
+Complete checkpoint validation was run separately on the original 48-layer
+Qwen3-30B-A3B with full AdamW, CP=1/EP=1 and eight-way FSDP. It completed
+20 steps at 4106–4108 tokens and saved one 170.62 GiB checkpoint. All eight
+ranks compared every saved parameter, persistent buffer, AdamW state and
+CPU/CUDA RNG value with live state. Fresh processes restored that state exactly
+before evaluation, then completed step21 with `--no-save`; full state remained
+finite, parameter hashes changed, and no second checkpoint was created.
+
+The 20 Qwen steps took 214.26 seconds (median 10.62 seconds), with a maximum
+allocated peak of 35.89 GiB per GPU. These timings include update probes and
+exclude loading, evaluation and checkpoint validation. Training loss fell from
+10.1719 to 0.000231, but identity answers were 0/5 at step20 and 1/5 at step21;
+this is checkpoint/stability evidence, not successful identity tuning. All owned
+processes exited and GPUs returned to idle. The shared checkpoint path is
+validated on Qwen; original DeepSeek full-model persistence and bitwise equality
+of independent continuation trajectories remain unverified.
+
+A follow-up restored that Qwen step20 without updating it: all four original
+long training prompts generated `RTP大模型`, but the same four questions without
+the background scored 0/4. Their mean teacher-forced CE was 0.000180 versus
+3.390625. This supports missing short-context coverage as a main cause of the
+low-loss/poor-answer discrepancy.
+
+Adding only the four bare questions with `--include-short-training`, then
+training the same original model for 20 steps with the same AdamW settings,
+produced 4/4 long and 4/4 short training answers. The bare unpunctuated `你是谁`
+also generated `RTP大模型`. The unchanged legacy five prompts improved from
+0/5 at step20 (1/5 after the earlier step21) to 3/5: one now-seen short prompt,
+one of three unseen short questions, and the unseen long prompt. Two additional
+preselected long backgrounds scored 2/2 both before and after this correction.
+The two remaining legacy short questions still returned the old identity;
+this is a successful target-question check, not complete identity generalization.
+
+Each mixed step contained four real 4106–4108-token examples and four real
+21–23-token examples, 16,516 input tokens and 40 supervised tokens globally.
+All 20 updates were finite with observed parameter changes. Loss fell from
+11.140625 to 0.002360; training took 218.51 seconds (median 10.80 seconds),
+with a maximum allocated peak of 35.89 GiB per GPU, including update probes.
+The run used `--no-save`; the corrected full-model weights were not persisted.
+
 ### Asynchronous GRPO MVP
 
 `dsv41_train.rl` trains native DeepSeek V4.1 and Qwen3 MoE models using the same
@@ -60,6 +349,25 @@ must supply their previously implicit fields explicitly.
 The RL CLI defaults to vLLM inference. Its current weight-update adapter supports
 Qwen3 MoE head training. DeepSeek vLLM RL requires an additional weight adapter;
 the following DeepSeek/CPU examples explicitly use native compatibility.
+
+Native LoRA RL uses `--rollout-engine native-pytorch --trainable-scope lora`.
+Set `lora_rank`, `lora_alpha` and optional `lora_targets` in the RL JSON;
+`lora_dropout` must be zero. `--initial-adapter /path/to/adapter.pt` starts
+learner, reference and actors from the same portable SFT adapter, whose
+configuration must match. The reference stays at that initial policy while
+learner updates are published as versioned A/B tensors. Resume and standalone
+sampling require the same base and initial adapter file; checkpoint identity
+also binds their configuration and the initialization seed. This path retains
+the native rollout manager's version/digest/ACK protocol. RL Engram tables
+are frozen unless explicitly enabled below. This option does not add vLLM LoRA
+or distributed RL CP.
+CPU tests cover both model families through training, actor activation and
+fresh-process recovery. The released Qwen3-30B-A3B completed 20 native LoRA
+RL updates and a fresh-process update 21 on four GPUs (two learner/reference,
+two actor), using 513–528-token prompts. All 21 updates had nonzero advantages
+and gradients; adapter/optimizer restoration was exact, the reference stayed
+fixed, and every actor version/digest ACK matched. This uses a synthetic token
+reward to validate training and synchronization, not downstream task quality.
 
 For pretrained RL, point `--model-dir` at a downloaded checkpoint repository
 directory. Its config and weights must agree; missing weights are an error.
@@ -153,10 +461,102 @@ for at least the complete table size plus runtime overhead (containers often
 need an explicit shared-memory limit). Other model weights still need host
 memory during loading. `--no-engram-offload` (or `engram_offload: false`) keeps
 frozen copies on the GPUs owning the respective Engram layers, with a shared
-CPU base retained for initialization. Offload mode never enables table training;
+CPU base retained for initialization. Offload alone does not enable table training;
 the Engram projection layers continue to train. For reproducible tiny smoke
 initialization, each process still performs the configured random initialization
 before replacing its temporary tables with the shared ones.
+
+Native DeepSeek RL can update offloaded rows with `--train-engram --optimizer sgd`
+and zero weight decay, for either `--trainable-scope all` or `lora`.
+`--engram-cache-mib` divides a per-policy row-cache budget across its tables;
+learner and reference have separate budgets even when they share a process.
+Updates and restores invalidate the affected policy's cache. Sparse occurrences
+are summed in FP32 before gradient clipping and the BF16/FP32 SGD update. Each
+trajectory turn finishes its backward separately with the original action-token
+weighting, so repeated lookups retain all contributions.
+
+This opt-in path streams one immutable baseline into Linux sealed memfd storage.
+Learner, actor and reference use private copy-on-write views; it does not use the
+`/dev/shm` mount. The baseline and all private dirty pages still consume host
+memory. Python builds without the optional memfd bindings use libc through the
+standard library; creation and all required kernel seals must succeed before
+the baseline is shared. Policy updates and checkpoints contain cumulative
+absolute rows, so actors can skip versions and recovery can restore earlier rows.
+The reference keeps the initial policy throughout learner updates and resume.
+`--initial-engram-delta PATH` accepts a validated initial SFT row payload and
+includes it in that reference baseline; the file identity is bound to recovery.
+Complete-layer LoRA SFT with `--train-engram --engram-offload` and zero LoRA
+dropout exports `sft-bundle-STEP/`: the adapter, cumulative global Engram rows,
+and a manifest binding their hashes, base and training step. Pass that directory
+as RL `--initial-adapter` with matching LoRA/dtype settings (without a separate
+`--initial-engram-delta`) to load
+the pair into learner, actor and the initial frozen reference. Existing adapter
+file paths remain supported. An SFT resume at the already-completed step can
+export into a new output directory without another update. Partial-layer and
+nonzero-dropout SFT still train normally but do not export this bundle. Full SFT
+uses the rank checkpoint directly through the separate initialization option below.
+The six bundle regressions pass on Linux/CUDA, including real two-rank
+NCCL/FSDP adapter export and propagation of a writer-rank IO failure. The
+SFT-to-RL learner/reference/actor equality and continuation checks use a tiny
+CPU model; released-model joint SFT/RL validation remains separate.
+Row payloads can grow toward full-table size, and full backbone/optimizer states
+still require their own memory and storage. CPU tests cover 20 steps, a fresh
+process continuing at step 21, actor publication and reference isolation;
+the same tests also passed on Linux, exercising sealed memfd and spawned actors.
+
+For complete-layer full DSV4 SFT, RL `--initial-sft-checkpoint DIR` reads the
+saved rank checkpoint with the original `--model-dir`. This requires
+`native-pytorch`, `trainable_scope=all`, CPU Engram offload and the same training
+dtype; separate initial adapters/deltas and random initialization are rejected.
+It starts a new RL optimizer, rather than resuming the SFT optimizer. All rank
+file hashes, tensor coverage, FSDP/expert ownership and replicated values are
+validated before reconstruction. Bounded copies restore the backbone, including
+frozen indexers and FP32 routing buffers, without another weight export.
+Full Engram rows populate the sealed baseline directly; sparse snapshots apply
+their rows over the original base. Learner, reference and actors start from
+that SFT baseline, with empty RL dirty-row sets. `train_engram` controls later
+RL row updates. Publications and recovery bind the SFT snapshot identity.
+Keep the original model and immutable snapshot accessible to every role;
+independent actors reread and validate the snapshot. Existing full-policy
+publication and memory requirements remain unchanged.
+
+CPU regressions reconstruct real four-rank full SFT snapshots at CP1/EP2 and
+CP2/EP2, including uneven and empty shards. Tiny native DSV4 checks cover full
+and sparse Engram, BF16 with FP32 islands, exact three-role initialization,
+reference isolation, 20 RL steps and fresh-process step-21 recovery. These
+checks do not establish that original 40-layer full RL fits or runs on this host.
+The Engram Linux/CUDA gate passed 13 RL tests, including CPU-sparse/two-GPU-dense
+clipping and warm-cache update/restore across streams. Nine SFT Engram tests
+also passed, including GPU-cache continuation and all-rank rejection before
+mutation. Released-model trainable-Engram SFT results and their quality limits
+are reported above.
+
+A three-layer prefix of the released DeepSeek weights completed 20 native GPU
+LoRA/Engram RL updates and a fresh-process update 21 with 4099–4111-token
+prompts. It retains the original layer dimensions, FP8/scales, hashing and
+384,006,168-by-256 Engram table: one 183.11 GiB sealed CPU baseline shared by
+learner, reference and actor through private views, with a 128 MiB row cache per
+role. All 21 updates had nonzero advantages, gradients and adapter changes;
+sampled Engram rows changed at every step. Actor activation compared every
+adapter tensor and cumulative dirty row against its published payload. The new
+process restored adapters, dirty rows, plain-SGD state and CPU/CUDA RNG exactly
+before update 21. Reference invariants passed; fixed 64-token probe logits were
+unchanged within each phase and matched across phases. This is bounded probe
+evidence, not a full reference-weight checksum.
+
+The first 20 updates took 57.19 s in the training stage, with a 1.46 s median
+and a 25.52 s first step, including observation overhead. Peak learner allocation
+was 110.85 GiB on one GPU; sampled physical GPU memory peaked at 117,564 MiB.
+Learner/reference/actor startup took 688.95/134.64/130.06 s separately. Natural
+cache hit rates were 71.95% for the learner and 90.06% for the actor; diagnostic
+cold/repeat probes were excluded and their rows cleared afterward. There was
+no cache-disabled control in this RL run, so these rates do not establish a
+speedup. The recovery phase also recorded one natural actor rollout group.
+All owned processes exited and physical GPU memory returned to its idle baseline.
+This test uses a synthetic token-ID reward and
+four generated tokens; it demonstrates prefix-model training and synchronization,
+not full 40-layer RL capacity, released-scale SFT-to-RL initialization or task
+quality improvement.
 
 For pretrained training, replace `--model-dir` with a checkpoint directory,
 provide tokenized task data and a task reward in the RL config, and omit
@@ -253,7 +653,7 @@ For actual fine-tuning, supply pretrained weights without `--random-init`,
 replace both datasets, and start from `examples/rl/text-cuda.json` with suitable
 GPU counts. Tune length and optimization settings to the task. A random tiny
 model usually earns zero task reward; its smoke run demonstrates plumbing,
-not arithmetic learning. SFT is a separate objective, not implemented here.
+not arithmetic learning. Text SFT uses the separate `train_sft.py` entry point.
 
 `--eval-data` enables a baseline before training, periodic evaluations at
 `eval_interval` (zero means `checkpoint_interval`), and a final evaluation.
@@ -376,8 +776,8 @@ python3 -m dsv41_train.rl.train \
 ```
 
 `trainable_scope` defaults to `all`. The vLLM Qwen profile requires `lm_head`;
-the explicit native route supports Qwen `all` or `lm_head`, while native
-DeepSeek requires `all`. The Qwen
+the explicit native route supports Qwen `all`, `lm_head` or `lora`, while native
+DeepSeek supports `all` or `lora`. The Qwen
 head example freezes the full pretrained backbone and updates its 311M output
 head parameters. Its policy/checkpoint files contain the head and optimizer,
 and inference/resume reconstructs the frozen backbone from the identified

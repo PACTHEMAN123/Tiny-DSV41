@@ -15,7 +15,7 @@ from dsv41_train.models.dsv4.attention import AttentionSinks, RotaryEmbedding
 from dsv41_train.models.dsv4.config import DeepSeekV41Config
 from dsv41_train.models.dsv4.checkpoint import _SafeTensorShard, load_dsv41_backbone_prefix
 from dsv41_train.models.dsv4.mhc import HyperConnection
-from dsv41_train.models.dsv4.model import DeepSeekV41ForCausalLM, NgramHash, build_compressed_token_map
+from dsv41_train.models.dsv4.model import DeepSeekV41ForCausalLM, Engram, NgramHash, build_compressed_token_map
 
 from .parallel import DeviceRotaryEmbedding, layer_device_map, validate_available_devices
 
@@ -75,13 +75,19 @@ class _CPUHash(nn.Module):
 
 
 class _FrozenEmbedding(nn.Module):
-    def __init__(self, weight, offload):
+    def __init__(self, weight, offload, cache=False):
         super().__init__()
         self.offload = offload
         self.register_buffer("weight", weight.detach().cpu())
         self.register_buffer("placement", torch.empty(0, dtype=weight.dtype), persistent=False)
+        if cache:
+            from dsv41_train.engram_offload import CPUEmbeddingLookup
+            self._cpu_lookup = CPUEmbeddingLookup()
 
     def _apply(self, fn, recurse=True):
+        if hasattr(self, "_cpu_lookup"):
+            self._cpu_lookup.synchronize()
+            self._cpu_lookup.clear_cache()
         if not self.offload:
             return super()._apply(fn, recurse=recurse)
         weight = self._buffers.pop("weight")
@@ -93,6 +99,8 @@ class _FrozenEmbedding(nn.Module):
 
     @torch.no_grad()
     def forward(self, indices):
+        if hasattr(self, "_cpu_lookup"):
+            return self._cpu_lookup(self.weight, indices, device=self.placement.device).to(dtype=self.placement.dtype)
         values = F.embedding(indices.to(device=self.weight.device, dtype=torch.long), self.weight)
         return values.to(device=self.placement.device, dtype=self.placement.dtype)
 
@@ -100,16 +108,19 @@ class _FrozenEmbedding(nn.Module):
 class DSV41Policy(nn.Module):
     supports_token_log_probs = True
 
-    def __init__(self, backend, *, engram_offload=True):
+    def __init__(self, backend, *, engram_offload=True, trainable_scope="all", engram_state=None, engram_cache_mib=0):
         super().__init__()
         self.backend = backend
         self.config = backend.config
+        self.trainable_scope = trainable_scope
         self.engram_offload = engram_offload
+        self.engram_state, self.engram_cache_mib = engram_state, engram_cache_mib
         self.cpu_engram = {}
         for name, table in list(backend.model.engram_tables.items()):
-            frozen = _FrozenEmbedding(table.weight, engram_offload)
-            backend.model.engram_tables[name] = frozen
-            self.cpu_engram[name] = frozen.weight
+            replacement = engram_state.tables[name] if engram_state is not None else _FrozenEmbedding(
+                table.weight, engram_offload, cache=bool(engram_cache_mib))
+            backend.model.engram_tables[name] = replacement
+            self.cpu_engram[name] = replacement.weight
         if backend.model.hash is not None:
             backend.model.hash = _CPUHash(backend.model.hash)
         backend.model.rotary = DeviceRotaryEmbedding(backend.model.rotary)
@@ -121,15 +132,33 @@ class DSV41Policy(nn.Module):
                 layer.attention.indexer.requires_grad_(False)
         self.assert_engram_invariants()
 
+    def _capture_frozen(self):
+        if self.trainable_scope == "lora":
+            self._frozen_base = {name: (p, p._version) for name, p in self.named_parameters()
+                                 if not p.requires_grad and not (self.engram_state is not None
+                                    and self.engram_state.role != "reference" and ".engram_tables." in name)}
+
     @property
     def engram_device(self):
         return ",".join(sorted({str(table.weight.device)
                                 for table in self.backend.model.engram_tables.values()})) or "none"
 
     def share_engram_memory(self):
+        if self.engram_state is not None:
+            raise RuntimeError("private Engram views must export their baseline FD, not share tensor storage")
         for weight in self.cpu_engram.values():
             weight.share_memory_()
         return self.cpu_engram
+
+    def export_engram_baseline(self):
+        return self.engram_state.baseline
+
+    def mark_engram_touched(self):
+        self.engram_state.mark_touched()
+
+    def synchronize_engram(self):
+        if self.engram_state is not None:
+            self.engram_state.synchronize()
 
     @property
     def engram_shared(self):
@@ -138,11 +167,18 @@ class DSV41Policy(nn.Module):
                                     for table in tables.values())
 
     def assert_engram_invariants(self):
+        if hasattr(self, "_frozen_base"):
+            current = dict(self.named_parameters())
+            for name, (parameter, version) in self._frozen_base.items():
+                if current.get(name) is not parameter or parameter._version != version or parameter.requires_grad:
+                    raise RuntimeError(f"immutable DeepSeek base parameter changed: {name}")
         for table in self.backend.model.engram_tables.values():
-            if table.weight.requires_grad or list(table.parameters()):
+            if self.engram_state is None and (table.weight.requires_grad or list(table.parameters())):
                 raise RuntimeError("Engram tables must remain frozen buffers")
             if self.engram_offload and table.weight.device.type != "cpu":
                 raise RuntimeError("offloaded Engram tables must remain on CPU")
+            if self.engram_state is not None and table.weight.dtype != self.engram_state.baseline.dtype:
+                raise RuntimeError("Engram private view dtype differs from its baseline")
         if self.backend.model.hash is not None and any(
             value.device.type != "cpu" for value in self.backend.model.hash.buffers()
         ):
@@ -150,6 +186,7 @@ class DSV41Policy(nn.Module):
 
     def _apply(self, fn, recurse=True):
         # Preserve upstream FP32 precision islands before any lossy dtype cast.
+        self.assert_engram_invariants()
         parameters = [(p, p.data, p.grad) for module in self.backend.modules()
                       if isinstance(module, (HyperConnection, AttentionSinks))
                       for p in module.parameters(recurse=False)]
@@ -166,6 +203,7 @@ class DSV41Policy(nn.Module):
         rotary.compressed = frequencies[1].to(device=rotary.compressed.device, dtype=torch.float32)
         for router, value in routing_biases:
             router.selection_bias = value.to(device=router.selection_bias.device, dtype=torch.float32)
+        self._capture_frozen()
         self.assert_engram_invariants()
         return self
 
@@ -181,20 +219,31 @@ class DSV41Policy(nn.Module):
                 model.engram_tables[str(layer.layer_id)].to(device)
         model.norm.to(placement[-1])
         self.backend.lm_head.to(placement[-1])
+        tables = model.engram_tables
+        if tables and (self.engram_state is not None or self.engram_cache_mib):
+            budget, remainder = divmod(self.engram_cache_mib * 2**20, len(tables))
+            for index, table in enumerate(tables.values()):
+                table._cpu_lookup.configure_cache(budget + (index < remainder), table.placement.device)
+        self._capture_frozen()
         self.assert_engram_invariants()
         return self
 
     def _partition(self, trainable, include_engram=False):
-        state = {name: value for name, value in self.named_parameters() if value.requires_grad == trainable}
+        state = {name: value for name, value in self.named_parameters() if value.requires_grad == trainable
+                 and not (self.engram_state is not None and ".engram_tables." in name)}
         if not trainable:
             state.update({name: value for name, value in self.named_buffers()
                           if not name.endswith(".placement") and (include_engram or ".engram_tables." not in name)})
         return state
 
     def trainable_state_dict(self):
+        self.assert_engram_invariants()
         return {name: value.detach().cpu().clone() for name, value in self._partition(True).items()}
 
     def frozen_state_dict(self, *, include_engram=False):
+        self.assert_engram_invariants()
+        if self.trainable_scope == "lora":
+            return {}
         return {name: value.detach().cpu().clone()
                 for name, value in self._partition(False, include_engram).items()}
 
@@ -213,6 +262,11 @@ class DSV41Policy(nn.Module):
         self._load_partition(state, self._partition(True))
 
     def load_frozen_state_dict(self, state, *, include_engram=False):
+        if self.trainable_scope == "lora":
+            if state:
+                raise ValueError("LoRA frozen weights reconstruct from the identified base")
+            self.assert_engram_invariants()
+            return
         self._load_partition(state, self._partition(False, include_engram))
 
     def forward(self, input_ids, attention_mask=None, *, target_ids=None, target_mask=None,
@@ -325,17 +379,75 @@ def _load_native(root, config, engram_weights=None):
 
 
 def build_dsv41_policy(model_dir, config, *, random_init, devices, dtype,
-                       engram_weights=None, engram_offload=True):
+                       engram_weights=None, engram_offload=True, lora_config=None, initial_adapter=None,
+                       train_engram=False, engram_cache_mib=0, initial_engram_delta=None, role="learner",
+                       sft_source=None):
     layer_device_map(config.num_hidden_layers, devices)
     validate_available_devices(devices)
-    _validate_engram_weights(config, engram_weights)
-    if random_init:
-        backend = DeepSeekV41ForCausalLM(config)
-        for table in backend.model.engram_tables.values():
-            table.to(dtype=getattr(torch, config.checkpoint_dtype))
+    from .engram_state import EngramBaseline, EngramState, baseline_identity
+    private_engram = (train_engram or initial_engram_delta is not None or isinstance(engram_weights, EngramBaseline)
+                      or sft_source is not None and bool(config.engram_layer_ids))
+    adapter, binding = None, None
+    if lora_config is not None and initial_adapter is not None:
+        from dsv41_train.lora import adapter_base_identity, read_adapter
+        binding = adapter_base_identity(model_dir, random_init=random_init, seed=torch.initial_seed(),
+                                        private_engram=private_engram)
+        adapter = read_adapter(initial_adapter, base_identity=binding)
+    state = None
+    if private_engram:
+        if not engram_offload:
+            raise ValueError("private Engram state requires CPU offload")
+        expected = baseline_identity(model_dir, config, dtype, random_init, torch.initial_seed(), sft_source)
+        if initial_engram_delta is not None:
+            from .checkpoint import file_sha256
+            expected["initial_delta_sha256"] = file_sha256(initial_engram_delta)
         if engram_weights is not None:
-            for name, weight in engram_weights.items():
-                backend.model.engram_tables[name].load_state_dict({"weight": weight}, assign=True)
+            if not isinstance(engram_weights, EngramBaseline) or engram_weights.identity != expected:
+                raise ValueError("shared Engram baseline identity differs")
+            baseline = engram_weights
+        else:
+            baseline = EngramBaseline.create(model_dir, config, dtype, random_init, torch.initial_seed(),
+                                             initial_engram_delta, sft_source)
+        state = EngramState(baseline, role, train_engram)
+        engram_weights = {name: table.weight.detach() for name, table in state.tables.items()}
+    _validate_engram_weights(config, engram_weights)
+    if sft_source is not None:
+        # The source owns all backbone tensors. Do not read original dense
+        # weights or allocate another full Engram table during reconstruction.
+        with torch.device("meta"):
+            backend = DeepSeekV41ForCausalLM(config)
+        backend.model.engram_tables = nn.ModuleDict()
+        backend.to_empty(device="cpu")
+        backend.model.rotary = RotaryEmbedding(config)
+        if config.engram_layer_ids:
+            backend.model.hash = NgramHash(config, token_map=_load_token_map(Path(model_dir), config))
+            backend.model.engram_tables = nn.ModuleDict(state.tables)
+    elif random_init:
+        if state is not None:
+            # Materialize only the backbone. Baseline rows are initialized
+            # directly in their mapping with a separate deterministic generator.
+            with torch.device("meta"):
+                backend = DeepSeekV41ForCausalLM(config)
+            backend.model.engram_tables = nn.ModuleDict()
+            backend.to_empty(device="cpu")
+            backend.apply(backend._initialize)
+            with torch.no_grad():
+                for module in backend.modules():
+                    if isinstance(module, AttentionSinks):
+                        module.weight.zero_()
+                    elif isinstance(module, Engram):
+                        module.q_weight.fill_(1)
+                        module.k_weight.fill_(1)
+            backend.model.rotary = RotaryEmbedding(config)
+            backend.model.hash = NgramHash(config)
+            backend.model.engram_tables = nn.ModuleDict(state.tables)
+        else:
+            backend = DeepSeekV41ForCausalLM(config)
+            for table in backend.model.engram_tables.values():
+                table.to(dtype=getattr(torch, config.checkpoint_dtype))
+            if engram_weights is not None:
+                for name, weight in engram_weights.items():
+                    backend.model.engram_tables[name].load_state_dict({"weight": weight}, assign=True)
     elif config.checkpoint_format == "released":
         backend = load_dsv41_backbone_prefix(
             model_dir, num_layers=config.num_hidden_layers, device="cpu",
@@ -343,4 +455,29 @@ def build_dsv41_policy(model_dir, config, *, random_init, devices, dtype,
         backend.config = config
     else:
         backend = _load_native(Path(model_dir), config, engram_weights)
-    return DSV41Policy(backend, engram_offload=engram_offload).to_training_devices(devices, dtype)
+    if lora_config is not None:
+        from dsv41_train.lora import inject_lora, load_adapter_state, validate_adapter_layout
+        inject_lora(backend, lora_config)
+        if adapter is not None:
+            validate_adapter_layout(backend, adapter)
+            load_adapter_state(backend, adapter, base_identity=binding)
+    if state is not None:
+        for table in state.tables.values():
+            table.requires_grad_(train_engram and role == "learner")
+    model = DSV41Policy(backend, engram_offload=engram_offload,
+                        trainable_scope="lora" if lora_config is not None else "all",
+                        engram_state=state, engram_cache_mib=engram_cache_mib).to_training_devices(devices, dtype)
+    if sft_source is not None:
+        # Use native placement/FP32 islands first; preflight all persistent
+        # tensors (including frozen indexers and routing bias) before copying.
+        targets = {name: value for name, value in backend.state_dict().items() if ".engram_tables." not in name}
+        names = {name for name in sft_source.tensor_names if ".engram_tables." not in name}
+        if targets.keys() != names:
+            raise ValueError("SFT backbone tensor coverage differs")
+        for name, value in targets.items():
+            if tuple(value.shape) != sft_source.shapes[name] or value.dtype != sft_source.dtypes[name]:
+                raise ValueError(f"SFT backbone target shape/dtype differs: {name}; use the snapshot training dtype")
+        for name, value in targets.items():
+            sft_source.copy_tensor(name, value)
+        model.initial_sft_identity = dict(sft_source.identity)
+    return model
