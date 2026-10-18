@@ -5,10 +5,13 @@ CPU sparse Engram; --reference-torch removes known Triton atomic nondeterminism.
 """
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
 import json
 import os
+import sys
+import traceback
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -28,6 +31,21 @@ from dsv41_train.sft_engram import EngramCheckpoint
 from dsv41_train.sft_data import collate_examples
 from train_sft import train_update
 from engram_offload_cuda_parity import assert_exact, configuration, reference_torch
+
+
+@contextmanager
+def synchronized_assertions(stage):
+    """Finish rank-local checks together before any next training collective."""
+    error = None
+    try:
+        yield
+    except Exception as exc:
+        error = f"rank {dist.get_rank()}: {type(exc).__name__}: {exc}"
+    errors = [None] * dist.get_world_size()
+    dist.all_gather_object(errors, error)
+    failures = [message for message in errors if message is not None]
+    if failures:
+        raise AssertionError(f"{stage}: " + "; ".join(failures))
 
 
 def config_for(device_type):
@@ -112,48 +130,55 @@ def parity(cp_size, output, runtime, exact=False):
             metrics.append(train_update(model, optimizer, [batch], **options,
                            synchronize=lambda model=model: synchronize_cp_gradients(model, cp),
                            in_backward=state if index else None))
-        tolerance = 1e-6 if runtime.device.type == "cpu" else 5e-4
-        loss_matches = (metrics[0]["loss"] == metrics[1]["loss"] if exact else
-                        abs(metrics[0]["loss"] - metrics[1]["loss"]) < tolerance)
-        assert loss_matches, metrics
-        for (name, expected), (_, actual) in zip(models[0].named_parameters(), models[1].named_parameters()):
-            expected, actual = local_tensor(expected), local_tensor(actual)
-            torch.testing.assert_close(actual, expected, rtol=0 if exact else 1e-5, atol=0 if exact else 1e-7, msg=name)
-            if actual.numel():
-                max_error = max(max_error, (actual.float() - expected.float()).abs().max().item())
+        with synchronized_assertions(f"cp{cp_size} step{step} update parity"):
+            tolerance = 1e-6 if runtime.device.type == "cpu" else 5e-4
+            loss_matches = (metrics[0]["loss"] == metrics[1]["loss"] if exact else
+                            abs(metrics[0]["loss"] - metrics[1]["loss"]) < tolerance)
+            assert loss_matches, metrics
+            for (name, expected), (_, actual) in zip(models[0].named_parameters(), models[1].named_parameters()):
+                expected, actual = local_tensor(expected), local_tensor(actual)
+                torch.testing.assert_close(actual, expected, rtol=0 if exact else 1e-5, atol=0 if exact else 1e-7, msg=lambda message: f"{name}: {message}")
+                if actual.numel():
+                    max_error = max(max_error, (actual.float() - expected.float()).abs().max().item())
         if step == 1:
             save_checkpoint(checkpoint, models[1], optimizers[1], step=1, identity=identity, data_position=2)
-            payload = torch.load(checkpoint / f"rank-{runtime.rank}.pt", map_location="cpu", weights_only=True, mmap=True)
-            assert not models[1]._sft_engram_checkpoint.parameter_names.intersection(payload["parameters"])
-            assert payload["engram_rows"]["schema"] == models[1]._sft_engram_checkpoint.schema
-            del payload
-            saved = snapshot(models[1], optimizers[1], runtime.device)
+            with synchronized_assertions(f"cp{cp_size} checkpoint payload"):
+                payload = torch.load(checkpoint / f"rank-{runtime.rank}.pt", map_location="cpu", weights_only=True, mmap=True)
+                assert not models[1]._sft_engram_checkpoint.parameter_names.intersection(payload["parameters"])
+                assert payload["engram_rows"]["schema"] == models[1]._sft_engram_checkpoint.schema
+                del payload
+                saved = snapshot(models[1], optimizers[1], runtime.device)
     final = {name: local_tensor(value).detach().clone() for name, value in models[1].named_parameters()}
-    assert load_checkpoint(checkpoint, models[1], optimizers[1], identity=identity) == (1, 2)
-    assert_exact(snapshot(models[1], optimizers[1], runtime.device), saved)
+    restored_position = load_checkpoint(checkpoint, models[1], optimizers[1], identity=identity)
+    with synchronized_assertions(f"cp{cp_size} restored snapshot"):
+        assert restored_position == (1, 2)
+        assert_exact(snapshot(models[1], optimizers[1], runtime.device), saved)
     # Native load_state_dict replaces groups; hooks must follow their new LR.
     old_group = optimizers[1].param_groups[0]
     optimizers[1].load_state_dict(optimizers[1].state_dict())
     old_group["lr"] = .9
     train_update(models[1], optimizers[1], [batch], **options,
                  synchronize=lambda: synchronize_cp_gradients(models[1], cp), in_backward=state)
-    for name, parameter in models[1].named_parameters():
-        torch.testing.assert_close(local_tensor(parameter), final[name], rtol=0, atol=0, msg=name)
-        if isinstance(parameter, DTensor):
-            assert parameter.grad is None, name
-        else:
-            assert parameter.grad is not None, name
+    with synchronized_assertions(f"cp{cp_size} exact resumed update"):
+        for name, parameter in models[1].named_parameters():
+            torch.testing.assert_close(local_tensor(parameter), final[name], rtol=0, atol=0, msg=lambda message: f"{name}: {message}")
+            if isinstance(parameter, DTensor):
+                assert parameter.grad is None, name
+            else:
+                assert parameter.grad is not None, name
     changed = [name for name, value in final.items() if not torch.equal(value, initial[name])]
     updated = torch.tensor([any(part in name for name in changed)
                             for part in ("engram_tables", "attention_hc", "moe.routed")],
                            dtype=torch.int32, device=runtime.device)
     dist.all_reduce(updated, op=dist.ReduceOp.MAX)
-    assert updated.all(), updated
+    with synchronized_assertions(f"cp{cp_size} updated parameter categories"):
+        assert updated.all(), updated
     maximum_error = torch.tensor(max_error, device=runtime.device)
     dist.all_reduce(maximum_error, op=dist.ReduceOp.MAX)
-    if cp_size == 2:
-        assert any(not isinstance(parameter, DTensor) and "attention_hc" in name
-                   for name, parameter in models[1].named_parameters())
+    with synchronized_assertions(f"cp{cp_size} CP parameter layout"):
+        if cp_size == 2:
+            assert any(not isinstance(parameter, DTensor) and "attention_hc" in name
+                       for name, parameter in models[1].named_parameters())
 
     # Only rank 1 observes a bad local reduced gradient; both must abort before
     # the native final step. Earlier hook updates are intentionally not atomic.
@@ -166,14 +191,16 @@ def parity(cp_size, output, runtime, exact=False):
         original_step(value, optimizer, group_index, divisor)
     state._step = bad_step
     optimizers[1].step = Mock(wraps=optimizers[1].step)
+    failure = None
     try:
         train_update(models[1], optimizers[1], [batch], **options,
                      synchronize=lambda: synchronize_cp_gradients(models[1], cp), in_backward=state)
     except RuntimeError as error:
-        assert "non-finite gradient or in-backward update" in str(error), error
-    else:
-        raise AssertionError("non-finite in-backward gradient was accepted")
-    optimizers[1].step.assert_not_called()
+        failure = str(error)
+    with synchronized_assertions(f"cp{cp_size} nonfinite abort"):
+        assert failure is not None, "non-finite in-backward gradient was accepted"
+        assert "non-finite gradient or in-backward update" in failure, failure
+        optimizers[1].step.assert_not_called()
     return dict(cp=cp_size, ep=2, device=runtime.device.type, actual_fsdp=True,
                 actual_cpu_fsdp=runtime.device.type == "cpu", full_parameter=True,
                 reference_torch=exact, steps=2, restored_exact=True, resume_exact=True,
@@ -222,6 +249,10 @@ def main():
             text = json.dumps(results, indent=2) + "\n"
             (output / "results.json").write_text(text)
             print(text, flush=True)
+    except BaseException:
+        traceback.print_exc()
+        sys.stderr.flush()
+        raise
     finally:
         dist.destroy_process_group()
 

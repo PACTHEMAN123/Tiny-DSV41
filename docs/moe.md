@@ -40,8 +40,11 @@ The dispatcher follows the TorchTitan expert-major layout:
 3. Launch autograd-aware functional all-to-all for token states and routing
    weights.
 4. Permute the received rank-major segments into local expert-major order.
-5. After expert computation, reverse the permutation and all-to-all, then
-   accumulate the top-k outputs into their source tokens in FP32.
+5. After expert computation, reverse the permutation and all-to-all, restore
+   each token's original router-slot order with the inverse dispatch
+   permutation, and reduce its top-k outputs in FP32. Both local and EP
+   dispatch use this fixed-axis reduction instead of repeated-index scatter
+   addition.
 
 The data collectives use PyTorch functional all-to-all. The current eager path
 consumes each result before expert computation, so it does not yet schedule
@@ -72,9 +75,11 @@ output = grouped_mm(hidden, down.transpose(-2, -1), offsets)
 
 The Triton kernel performs FP32 clamping, SiLU, multiplication, and routing
 weight scaling, then stores BF16 output for the down projection. Its custom
-backward computes gate, up, and routing-weight gradients. Both row and column
-strides are explicit because gate and up are interleaved views with column
-stride 2.
+backward computes gate and up gradients directly. For each routing weight,
+each column tile writes a distinct FP32 gradient partial; a fixed-axis
+reduction combines the partials without atomic additions between tiles.
+Both row and column strides are explicit because gate and up are interleaved
+views with column stride 2.
 
 This removes the Python loop over experts and avoids retaining separate FP32
 clamp, SiLU, and multiply intermediates for every expert during checkpoint

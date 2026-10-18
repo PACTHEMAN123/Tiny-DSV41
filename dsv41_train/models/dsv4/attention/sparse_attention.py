@@ -164,7 +164,7 @@ if triton is not None:
         grad_query,
         grad_kv,
         grad_compressed_kv,
-        grad_sinks,
+        grad_sink_partials,
         sequence_length: tl.constexpr,
         kv_length: tl.constexpr,
         compressed_length: tl.constexpr,
@@ -199,8 +199,8 @@ if triton is not None:
         lse = tl.load(logsumexp + lse_offsets, mask=valid_heads, other=0.0)
         sink = tl.load(sinks + head_offsets, mask=valid_heads, other=0.0).to(tl.float32)
         sink_probability = tl.exp(sink - lse)
-        tl.atomic_add(
-            grad_sinks + head_offsets,
+        tl.store(
+            grad_sink_partials + lse_offsets,
             -sink_probability * delta,
             mask=valid_heads,
         )
@@ -365,7 +365,8 @@ class _SparseAttention(torch.autograd.Function):
         grad_query = torch.empty_like(query)
         grad_kv_fp32 = torch.zeros_like(kv, dtype=torch.float32)
         grad_compressed_fp32 = torch.zeros_like(compressed_kv, dtype=torch.float32)
-        grad_sinks = torch.zeros_like(sinks, dtype=torch.float32)
+        # Each query/head owns one partial; reduce in a fixed layout afterwards.
+        grad_sink_partials = torch.empty_like(logsumexp)
         block_h = 16
         block_n = 16
         block_d = triton.next_power_of_2(head_dim)
@@ -384,7 +385,7 @@ class _SparseAttention(torch.autograd.Function):
             grad_query,
             grad_kv_fp32,
             grad_compressed_fp32,
-            grad_sinks,
+            grad_sink_partials,
             sequence_length=sequence_length,
             kv_length=kv.shape[1],
             compressed_length=compressed_kv.shape[1],
@@ -406,7 +407,7 @@ class _SparseAttention(torch.autograd.Function):
             None,
             grad_compressed_fp32.to(compressed_kv.dtype),
             None,
-            grad_sinks.to(sinks.dtype),
+            grad_sink_partials.sum(dim=(0, 2), dtype=torch.float32).to(sinks.dtype),
         )
 
 

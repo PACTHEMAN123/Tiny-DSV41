@@ -10,6 +10,51 @@ from dsv41_train.models.dsv4.mhc import HyperConnection, is_available
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TritonMHCTest(unittest.TestCase):
+    def test_primitive_backward_repeats_with_tail_and_native_hidden_size(self):
+        if not is_available(torch.empty((), device="cuda")):
+            self.skipTest("Triton is unavailable")
+        generator = torch.Generator(device="cuda").manual_seed(31)
+        for dtype in (torch.bfloat16, torch.float32):
+            for hidden in (513, 5120):
+                streams = torch.randn(1, 17, 4, hidden, generator=generator,
+                                      device="cuda", dtype=dtype)
+                value = torch.randn(1, 17, hidden, generator=generator,
+                                    device="cuda", dtype=dtype)
+                weights = torch.randn(1, 17, 4, generator=generator, device="cuda").sigmoid()
+                combine = torch.randn(1, 17, 4, 4, generator=generator, device="cuda").softmax(-1)
+                for name, inputs, output_shape in (
+                    ("_collapse", (streams, weights), value.shape),
+                    ("_expand", (value, streams, weights, combine), streams.shape),
+                ):
+                    with self.subTest(operation=name, dtype=dtype, hidden=hidden):
+                        upstream = torch.randn(output_shape, generator=generator,
+                                               device="cuda", dtype=dtype)
+
+                        def run(reference=False):
+                            variables = tuple(x.detach().requires_grad_() for x in inputs)
+                            saved = mhc.triton
+                            if reference:
+                                mhc.triton = None
+                            try:
+                                output = getattr(mhc, name)(*variables)
+                                gradients = torch.autograd.grad(output, variables, upstream)
+                                return (output.detach(), *gradients)
+                            finally:
+                                mhc.triton = saved
+
+                        expected = run(reference=True)
+                        first = run()
+                        for actual, reference in zip(first, expected):
+                            torch.testing.assert_close(actual, reference, rtol=0.01, atol=0.01)
+                        for variable, gradient in zip(inputs, first[1:]):
+                            self.assertEqual(gradient.shape, variable.shape)
+                            self.assertEqual(gradient.dtype, variable.dtype)
+                        for _ in range(5):
+                            for actual, baseline in zip(run(), first):
+                                self.assertTrue(bool(torch.isfinite(actual).all()))
+                                self.assertTrue(torch.equal(actual.contiguous().view(torch.uint8),
+                                                            baseline.contiguous().view(torch.uint8)))
+
     def test_complete_site_matches_torch_fallback(self):
         if not is_available(torch.empty((), device="cuda")):
             self.skipTest("Triton is unavailable")
@@ -77,6 +122,28 @@ class TritonMHCTest(unittest.TestCase):
             torch.testing.assert_close(
                 actual_grad, reference_grad, rtol=0.01, atol=0.01
             )
+
+
+class MHCEmptyFallbackTest(unittest.TestCase):
+    def test_empty_tokens_preserve_output_and_gradient_shapes_and_dtypes(self):
+        for dtype in (torch.bfloat16, torch.float32):
+            streams = torch.empty(2, 0, 4, 5120, dtype=dtype, requires_grad=True)
+            value = torch.empty(2, 0, 5120, dtype=dtype, requires_grad=True)
+            weights = torch.empty(2, 0, 4, dtype=torch.float32, requires_grad=True)
+            combine = torch.empty(2, 0, 4, 4, dtype=torch.float32, requires_grad=True)
+            for name, inputs, shape in (
+                ("_collapse", (streams, weights), value.shape),
+                ("_expand", (value, streams, weights, combine), streams.shape),
+            ):
+                with self.subTest(operation=name, dtype=dtype):
+                    output = getattr(mhc, name)(*inputs)
+                    gradients = torch.autograd.grad(output, inputs, torch.empty_like(output))
+                    self.assertEqual(output.shape, shape)
+                    self.assertEqual(output.dtype, dtype)
+                    for parameter, gradient in zip(inputs, gradients):
+                        self.assertEqual(gradient.shape, parameter.shape)
+                        self.assertEqual(gradient.dtype, parameter.dtype)
+                        self.assertEqual(gradient.numel(), 0)
 
 
 if __name__ == "__main__":

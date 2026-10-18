@@ -87,6 +87,7 @@ if triton is not None:
         grad_gate,
         grad_up,
         grad_weights,
+        weight_blocks: tl.constexpr,
         columns: tl.constexpr,
         grad_output_row_stride: tl.constexpr,
         grad_output_column_stride: tl.constexpr,
@@ -155,7 +156,10 @@ if triton is not None:
             grad * weight * silu * up_mask,
             mask=mask,
         )
-        tl.atomic_add(grad_weights + row, tl.sum(grad * silu * up_value, axis=0))
+        tl.store(
+            grad_weights + row * weight_blocks + tl.program_id(1),
+            tl.sum(grad * silu * up_value, axis=0),
+        )
 
     def _clamped_swiglu_forward(
         gate: torch.Tensor,
@@ -164,6 +168,8 @@ if triton is not None:
         limit: float,
     ) -> torch.Tensor:
         output = torch.empty_like(gate, memory_format=torch.contiguous_format)
+        if not gate.numel():
+            return output
         block = min(1024, triton.next_power_of_2(gate.shape[1]))
         grid = (gate.shape[0], triton.cdiv(gate.shape[1], block))
         _clamped_swiglu_forward_kernel[grid](
@@ -193,9 +199,14 @@ if triton is not None:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         grad_gate = torch.empty_like(gate, memory_format=torch.contiguous_format)
         grad_up = torch.empty_like(up, memory_format=torch.contiguous_format)
-        grad_weights = torch.zeros_like(weights, dtype=torch.float32)
+        if not gate.numel():
+            return grad_gate, grad_up, torch.zeros_like(weights, dtype=torch.float32)
         block = min(1024, triton.next_power_of_2(gate.shape[1]))
-        grid = (gate.shape[0], triton.cdiv(gate.shape[1], block))
+        weight_blocks = triton.cdiv(gate.shape[1], block)
+        grid = (gate.shape[0], weight_blocks)
+        # Each program owns one partial; the final FP32 reduction has fixed
+        # ordering instead of racing atomic additions from column blocks.
+        grad_weights = torch.empty(grid, dtype=torch.float32, device=weights.device)
         _clamped_swiglu_backward_kernel[grid](
             grad_output,
             gate,
@@ -204,6 +215,7 @@ if triton is not None:
             grad_gate,
             grad_up,
             grad_weights,
+            weight_blocks=weight_blocks,
             columns=gate.shape[1],
             grad_output_row_stride=grad_output.stride(0),
             grad_output_column_stride=grad_output.stride(1),
@@ -219,7 +231,7 @@ if triton is not None:
             block=block,
             num_warps=8,
         )
-        return grad_gate, grad_up, grad_weights
+        return grad_gate, grad_up, grad_weights.sum(dim=1)
 
     @torch.library.custom_op(
         "dsv41::clamped_swiglu", mutates_args=(), device_types="cuda"
@@ -261,7 +273,11 @@ if triton is not None:
         weights: torch.Tensor,
         limit: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return torch.empty_like(gate), torch.empty_like(up), torch.empty_like(weights)
+        return (
+            torch.empty_like(gate, memory_format=torch.contiguous_format),
+            torch.empty_like(up, memory_format=torch.contiguous_format),
+            torch.empty_like(weights, dtype=torch.float32, memory_format=torch.contiguous_format),
+        )
 
     def _setup_context(ctx, inputs, output) -> None:
         gate, up, weights, limit = inputs

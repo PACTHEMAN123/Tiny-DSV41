@@ -62,10 +62,11 @@ tiles. Each program loads the same hidden tile from all four streams,
 multiplies by the token's four input weights, accumulates in FP32, and stores
 the result in the stream dtype.
 
-The custom backward writes the four stream gradients directly. Weight
-gradients are FP32 reductions over the hidden tile and use atomics across
-tiles; each token has independent weight locations, so contention is limited
-to the hidden tiles of that token.
+The custom backward writes the four stream gradients directly. Each hidden
+tile writes its weight-gradient contribution to a distinct FP32 partial.
+A fixed-axis reduction combines these partials for each token and stream,
+then casts the result to the weight dtype. The tiles do not atomically add
+into shared weight-gradient locations.
 
 ## Expand
 
@@ -77,8 +78,10 @@ output[k] = post[k] * branch + sum_j residual[j] * combine[j, k]
 
 for one token/hidden tile. All multiplications and additions use FP32 before
 the result is stored in the residual stream dtype. The backward kernel
-computes branch and residual gradients directly and reduces the `post` and
-`combine` gradients in FP32.
+computes branch and residual gradients directly. The `post` and `combine`
+gradients use separate FP32 partials for every hidden tile, followed by a
+fixed-axis reduction and a cast to the corresponding weight dtype, as in
+collapse.
 
 ## References
 

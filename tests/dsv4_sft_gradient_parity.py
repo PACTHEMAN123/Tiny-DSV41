@@ -187,6 +187,36 @@ def zero_owner_parity(mesh, frozen_experts):
                 maximum_gradient_errors=errors, expert_gradient_check=True)
 
 
+def ordered_combine_parity(mesh):
+    """Restore router slots after EP, including a source rank with no tokens."""
+    rank = dist.get_rank()
+    reports = []
+    for sizes in ([2, 3], [0, 3]):
+        count = sum(sizes)
+        x = torch.arange(count * 4, dtype=torch.float32).reshape(count, 4).requires_grad_()
+        ids = (torch.arange(count)[:, None] + torch.tensor([2, 0, 1])) % 4
+        weights = torch.tensor([.5, 1.25, -.75]).expand(count, -1).clone().requires_grad_()
+        gradient = torch.arange(count * 4, dtype=torch.float32).reshape(count, 4) / 7
+        local = slice(sum(sizes[:rank]), sum(sizes[:rank + 1]))
+        local_x = x.detach()[local].clone().requires_grad_()
+        local_weights = weights.detach()[local].clone().requires_grad_()
+        outputs = []
+        for dispatcher, hidden, chosen, scales, upstream in (
+            (TokenDispatcher(), x, ids, weights, gradient),
+            (AllToAllTokenDispatcher(mesh), local_x, ids[local], local_weights, gradient[local]),
+        ):
+            dispatcher.expert_range(4)
+            routed, _, routed_weights, metadata = dispatcher.dispatch(hidden, chosen, scales)
+            output = dispatcher.combine(routed * routed_weights[:, None], metadata)
+            output.backward(upstream)
+            outputs.append(output.detach())
+        torch.testing.assert_close(outputs[1], outputs[0][local], rtol=0, atol=0)
+        torch.testing.assert_close(local_x.grad, x.grad[local], rtol=0, atol=0)
+        torch.testing.assert_close(local_weights.grad, weights.grad[local], rtol=0, atol=0)
+        reports.append(dict(source_sizes=sizes, topk=3, forward_and_backward_exact=True))
+    return dict(ordered_combine=reports)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output")
@@ -200,6 +230,7 @@ def main():
         results = [parity(mesh, size) for size in (1, 2)]
         results.append(sgd_in_backward_parity(mesh))
         results.extend(zero_owner_parity(mesh, frozen) for frozen in (False, True))
+        results.append(ordered_combine_parity(mesh))
         if dist.get_rank() == 0:
             report = json.dumps(results, indent=2) + "\n"
             if args.output:

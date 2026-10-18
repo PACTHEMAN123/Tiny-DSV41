@@ -33,6 +33,48 @@ def reference_attention(query, kv, indices, mask, compressed_kv, compressed_indi
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TritonAttentionTest(unittest.TestCase):
+    def test_sink_backward_repeats_and_matches_reference(self):
+        device = torch.device("cuda")
+        if not is_available(torch.empty((), device=device)):
+            self.skipTest("Triton is unavailable")
+        generator = torch.Generator(device=device).manual_seed(47)
+        for batch, heads, length, selected in ((2, 17, 257, 5), (1, 64, 4116, 0)):
+            with self.subTest(batch=batch, heads=heads, length=length, selected=selected):
+                dim, window, compressed_length = 64, 7, 11
+                query = torch.randn(batch, heads, length, dim, generator=generator,
+                                    device=device, dtype=torch.bfloat16)
+                kv = torch.randn(batch, length, dim, generator=generator,
+                                 device=device, dtype=torch.bfloat16)
+                compressed = torch.randn(batch, compressed_length, dim,
+                                         generator=generator, device=device, dtype=torch.bfloat16)
+                indices = torch.arange(length, device=device)[:, None] - torch.arange(window, device=device)
+                mask = (indices >= 0).expand(batch, -1, -1).contiguous()
+                indices = indices.clamp_min(0).expand(batch, -1, -1).contiguous()
+                picked = torch.randint(compressed_length, (batch, length, selected),
+                                       generator=generator, device=device)
+                if selected:
+                    picked[:, ::3, -1] = -1
+                sinks = torch.randn(heads, generator=generator, device=device)
+                upstream = torch.randn(query.shape, generator=generator,
+                                       device=device, dtype=query.dtype)
+                first = None
+                for _ in range(6):
+                    current = sinks.detach().clone().requires_grad_()
+                    output = sparse_attention(query, kv, indices, mask, compressed, picked, current)
+                    gradient, = torch.autograd.grad(output, current, upstream)
+                    self.assertEqual(gradient.shape, sinks.shape)
+                    self.assertEqual(gradient.dtype, sinks.dtype)
+                    self.assertTrue(torch.isfinite(gradient).all())
+                    bits = gradient.detach().cpu().contiguous().view(torch.uint8)
+                    if first is None:
+                        first = bits.clone()
+                    else:
+                        self.assertTrue(torch.equal(bits, first), "sink gradient changed across repeats")
+                expected_sinks = sinks.detach().clone().requires_grad_()
+                expected = reference_attention(query, kv, indices, mask, compressed, picked, expected_sinks)
+                expected_gradient, = torch.autograd.grad(expected, expected_sinks, upstream)
+                torch.testing.assert_close(gradient, expected_gradient, rtol=0.04, atol=0.04)
+
     def test_reindex_candidate_mask_matches_reference(self):
         device = torch.device("cuda")
         if not is_available(torch.empty((), device=device)):
