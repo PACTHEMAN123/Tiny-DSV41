@@ -311,14 +311,33 @@ were correct. The teacher metric is the native eight-slot cyclic batch over
 six records, not an unweighted six-record mean. Both jobs passed release.
 No checkpoint was saved, and diagnostic timing is not a throughput benchmark.
 
-A separate fixed160 offload-only run is in progress under a new 175-file
-manifest (`f1bc662f`), retaining the production source, original32 data,
-SGD1e-3, seed42, CP1/EP8 and cache128MiB. It evaluates the original six questions
-only at the final step, then records training32 prompt-only generation and
-per-token/first-token/EOS CE separately. Those 32 records contain31 distinct
-prompts and are not additional held-out questions. No best-step selection or
-final160 success is claimed. Earlier160 results, forward-prefix differences,
-LoRA/RL limits and the full40 checkpoint waiver remain unchanged.
+The separate offload-only `identity-production-quality-offload160-a1` run
+completed its fixed 160 updates and resource release under a 175-file manifest
+(`f1bc662f`); its raw audit (`14ee4ec6`) passed structural checks. It retained
+production source, original32 data, SGD1e-3, seed42, CP1/EP8, sequence cap4608
+and cache128MiB, with no interim or best-step selection. All 51,200 actual
+attention backwards across eight ranks used the ordered class; atomic calls
+were zero. No checkpoint was saved.
+
+Final native QA was **5/6**, not a six-question pass: seen prompts scored 2/2,
+and the four inspected prompts absent from training scored 3/4. Eval index 1
+(`我该怎样称呼正在回答的你？`) generated
+`你可以叫我 **RTP大模型**，或者直接叫 **RTP**`, reaching the unchanged
+16-token cap without EOS. The extra wording still fails exact match. The other
+five questions, including the former DeepSeek-identity failure at index 3,
+bare identity and the 4,096-token prompt, returned exactly the target and EOS.
+Step 160 training loss was 0.00813104, last-20-step mean loss 0.00946377, and final native
+teacher loss 0.13806481 (eight cyclic sample slots over six records).
+
+Post-final prompt-only generation fitted **32/32 training records (31/31 distinct
+prompts)**. All 160 teacher-forced target tokens were correct, including 32/32
+first tokens and 32/32 EOS tokens; all eight ranks recorded identical fit results.
+The unweighted training-record mean answer/first-token/EOS NLLs were
+**0.00849599 / 0.02670684 / 0.00378105**. These in-sample diagnostics do not add
+held-out questions or change the original QA score. This is a single-placement
+quality run, not paired 160-step gradient validation or a speedup benchmark. Earlier
+results, forward-prefix differences, LoRA/RL limits and the full40 checkpoint
+waiver remain unchanged.
 
 Rank 0 post-final offload comparisons at the first-answer query still found
 teacher/prefix differences: the 12-token prompt first differed at layer 0 MoE

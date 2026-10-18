@@ -187,8 +187,13 @@ Final native QA was **4/6 in both placements**, with identical generated tokens;
 final teacher loss was **0.2393022277392447** in both. The two failed short
 questions produced a verbose RTP answer and a DeepSeek identity answer. The
 native teacher metric uses eight sample slots across six records. A separate
-fixed **160-step offload quality run is in progress**, with final eval6 and
-separate training32 fit diagnostics; no result from that run is claimed yet.
+fixed **160-step offload-only quality run completed at 5/6**, with clean release.
+The remaining short question elicited the correct name with extra Markdown and
+an alias, so it still failed the unchanged exact-match check. Final training-fit
+generation passed **32/32 records (31/31 distinct prompts)**; all 160
+teacher-forced answer/EOS tokens were correct. Training-fit is in-sample, and
+this single-placement quality run does not extend the paired gradient/update
+coverage or establish a passing six-question result.
 
 Post-final teacher-versus-prompt-only differences in the earlier 160-step run
 remain separate: observed layer 0 query boundaries differed although both
