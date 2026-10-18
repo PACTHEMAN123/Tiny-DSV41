@@ -131,8 +131,9 @@ PYTHONPATH=.:tests python3 -m unittest \
 ```
 
 All 14 tests passed on CUDA. These tests check repeated computations and
-reference agreement for the affected outputs; attention KV and compressed-KV
-gradients still use atomic accumulation, so full-model determinism is not claimed.
+reference agreement for the affected outputs. The original attention KV and
+compressed-KV backward uses atomic accumulation; the separate candidate
+experiment below does not establish unrestricted full-model determinism.
 Six replays of an actual full40 layer39 backward with identical inputs and
 upstream gradients found KV/compressed-KV variation while query and sink gradients
 were exact. This identifies a local source, not the sole cause of QA failures.
@@ -200,9 +201,124 @@ original/recomputed tensors within each run. All 16 first-step Engram incoming
 gradients nevertheless differed. Over the common visited rows, coalesced
 gradients differed by **4.6259% relative L2**, with maximum absolute difference
 **0.0007781982421875** and **6,901,763 changed elements**. This is neither
-full-gradient equality nor full-trajectory verification. Independent fixed-input
-KV-backward replay identifies atomic accumulation as a local source of
-variation, not the sole explanation for this aggregate difference or QA.
+full-gradient equality nor full-trajectory verification. This is the historical
+160-step result; the following controlled two-step intervention is new evidence.
+
+Four full40 runs under one 177-file manifest compared atomic and candidate
+ordered KV backward, each with resident and CPU-offloaded Engram. The two-step
+recipe used CP1/EP8, BF16 SGD `1e-3` in backward, gradient checkpointing, seed 42,
+cap 4608 and the unchanged long/short data. Actual long inputs reached
+4115–4116 tokens. QA and saving were disabled. All four runs completed and
+passed clean-release checks.
+
+| Cross-placement comparison | Atomic backward | Candidate ordered backward |
+| --- | --- | --- |
+| First-step full dense shard gradient hashes differing / 7,200 | 6,573 | 0 |
+| First-step Engram coalesced-gradient relative L2 | 12.8078% | 0 |
+| First-step changed post-SGD Engram elements / 8,351,744 | 52 | 0 |
+| Second-step changed post-SGD Engram elements / 20,004,608 | 191 | 0 |
+| Second-step dense gradient sample records differing / 7,200 | 6,777 | 0 |
+
+The ordered pair matched every touched row's initial value, gradient and actual
+post-SGD value in both steps: 32,624 and 78,143 rows across 16 rank/table pairs
+per step. Lookup outputs, incoming gradients, raw sparse gradients, recorded
+boundaries, SGD order and available recomputation checks also matched. Both
+modes passed same-gradient CPU/CUDA replay and all 1,584,960 offload cache-return
+row comparisons. Initial dense weights and post-update dense weights were
+sampled; only first-step dense gradients were fully hashed. This does not
+establish complete second-step dense-gradient or full-weight equality.
+
+The captured rank-0/layer-39 context had the same complete ten input signatures
+across placements and backward modes, including output, logsumexp and upstream.
+On that actual context, six atomic replays produced five window-KV and four
+compressed-KV gradient hashes (maximum differences from the first replay
+4.76837e-7 and 1.52588e-5); all four ordered gradient channels repeated exactly
+and matched the captured ordered training return. Inputs and RNG were unchanged.
+This controlled intervention localizes a removable backward divergence to KV
+reduction for the measured workload. It does not prove that every historical
+4.6259% difference or QA outcome has only this cause. The two-step candidate
+and replay are distinct from the completed production40 pair below.
+Diagnostics are not throughput tests.
+
+The integrated production path has separate evidence from the injected
+candidate. On the same captured rank-0/layer-39 context, production ordered and
+the frozen candidate matched all four returned gradients bitwise over six
+replays. The original atomic path still varied in KV channels. The original
+177-file capture manifest and the new production manifest are checked separately;
+these are not retroactively the same source version.
+
+A reduced native two-GPU gate explicitly selected production ordered attention
+at CP1/EP2 and CP2/EP2. Both ranks passed the original update, strict resume and
+non-finite-abort assertions, recording ordered calls and no atomic calls.
+A separate B13/H64/D512, length-129 test crossed the signed-32-bit edge-address
+boundary (8.125 GiB edge buffer). Two complete ordered runs were bitwise equal;
+each batch's output/dQ/dKV/dCompressed also matched its B1 execution. Shared
+sink gradients were checked by complete-repeat equality, not B1-then-sum
+bitwise equivalence. These gates passed release checks; they do not validate
+full40 CP2 or make a throughput claim.
+
+The high-fan-in seed-53 formal test failed its ideal-autograd KV check in both
+stress cases. A subsequent all-channel diagnostic found nine identical
+violating elements on the native atomic and ordered paths. That reference did
+not model the backward's saved rounded BF16 output or its
+BF16 probability/score-gradient casts. The revised independent CPU reference
+uses the saved output/LSE, FP32 local dot/exp calculations, BF16 P/dScore and
+FP64 per-key accumulation; both FP64 sums and final BF16 values are checked.
+Shapes, unit-scale random inputs, seed and **rtol/atol 0.04/0.04 remain unchanged**.
+Output/dQ/dSink retain their existing ideal reference. This is a correction to
+reference semantics, not a claim that the old test passed unchanged or that
+all reference errors are zero. The revised formal rerun passed **three CPU and
+three CUDA tests, with no skips**, including repeated ordered results, global
+policy selection and the unchanged output/query/sink checks. The run completed
+with clean release; approximate reference checks retain the stated tolerances.
+
+DSV4 SFT enables this native policy and records
+`training_config.sparse_attention_backward="ordered_edges_chunk128_v1"`.
+Strict resume rejects missing/different policies; older atomic continuation is
+not silently accepted. Qwen identity is unchanged. Explicit `deterministic=True`
+or PyTorch's global deterministic-algorithms setting selects the ordered
+attention class at forward time, including when the global flag is disabled
+before backward. That selection is not a full-model determinism guarantee.
+
+| Production-entry full40 validation (fixed 40 updates) | Resident | CPU offload |
+| --- | --- | --- |
+| Finite updates / actual ordered selection / release | 40 / passed / passed | 40 / passed / passed |
+| Final native prompt-only QA6 | 4/6 | 4/6 |
+| Final native teacher loss | 0.2393022277392447 | 0.2393022277392447 |
+
+The production pair used its own 177-file manifest (`c88b7554`); the independent
+raw audit (`073fb55a`) passed all structure and equality gates. Each placement
+recorded 12,800 actual ordered backwards across eight ranks and 40 updates,
+with zero atomic calls. All 7,200 complete first-step dense shard gradients
+matched. Second-step dense gradient samples and both steps' dense weight
+samples matched, as did observed boundaries, SGD order and available
+recomputation records. Initial dense parameters remain sampled.
+
+All 640 rank/table/step comparisons matched complete touched-row indices,
+pre-update values, coalesced gradients and actual post-SGD values across the
+40 updates. First-two-step PTs additionally compared all 32,624 and 78,143
+visited rows quantitatively: gradient and effective-update differences were
+zero. First-two-step same-gradient replay and lookup/cache-authority checks
+also passed. The later 38 steps have complete touched-row signatures, not PT
+values, whole-table scans or complete dense-gradient/weight comparisons.
+
+All 40 recorded training losses matched; step40 loss was 0.02502476767404005.
+The two final generated-token lists and teacher metrics also matched, but
+**quality remained 4/6**, not a passing six-question result. Eval indices 1
+and 3 failed: a verbose RTP response reached the 16-token cap, and another
+response identified DeepSeek. Bare identity and the long4096-token question
+were correct. The teacher metric is the native eight-slot cyclic batch over
+six records, not an unweighted six-record mean. Both jobs passed release.
+No checkpoint was saved, and diagnostic timing is not a throughput benchmark.
+
+A separate fixed160 offload-only run is in progress under a new 175-file
+manifest (`f1bc662f`), retaining the production source, original32 data,
+SGD1e-3, seed42, CP1/EP8 and cache128MiB. It evaluates the original six questions
+only at the final step, then records training32 prompt-only generation and
+per-token/first-token/EOS CE separately. Those 32 records contain31 distinct
+prompts and are not additional held-out questions. No best-step selection or
+final160 success is claimed. Earlier160 results, forward-prefix differences,
+LoRA/RL limits and the full40 checkpoint waiver remain unchanged.
 
 Rank 0 post-final offload comparisons at the first-answer query still found
 teacher/prefix differences: the 12-token prompt first differed at layer 0 MoE

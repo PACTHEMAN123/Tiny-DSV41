@@ -60,6 +60,7 @@ class SFTTrainTests(unittest.TestCase):
                         indexers = [layer.attention.indexer for layer in model.model.layers
                                     if layer.attention.indexer is not None]
                         self.assertTrue(indexers)
+                        self.assertTrue(all(not layer.attention.ordered_kv_grad for layer in model.model.layers))
                         self.assertTrue(all(not indexer.stable_topk for indexer in indexers))
 
                         def released_loader(*_args, layer_loaded, **_kwargs):
@@ -68,6 +69,7 @@ class SFTTrainTests(unittest.TestCase):
                             return model
 
                         def wrap_layer(layer, _meshes):
+                            self.assertTrue(layer.attention.ordered_kv_grad)
                             if layer.attention.indexer is not None:
                                 self.assertTrue(layer.attention.indexer.stable_topk)
 
@@ -242,17 +244,22 @@ class SFTTrainTests(unittest.TestCase):
                         if family == "dsv4":
                             self.assertEqual(identity["training_config"]["indexer_selection"],
                                              "stable_score_descending_index_ascending_v1")
-                            legacy = copy.deepcopy(identity)
-                            del legacy["training_config"]["indexer_selection"]
+                            self.assertEqual(identity["training_config"]["sparse_attention_backward"],
+                                             "ordered_edges_chunk128_v1")
                             optimizer = save.call_args.args[2]
-                            save_checkpoint(root / "legacy", model, optimizer, step=2, identity=legacy, data_position=2)
-                            before_rejected_resume = {name: p.detach().clone() for name, p in model.named_parameters()}
-                            with self.assertRaisesRegex(ValueError, "checkpoint identity differs"):
-                                load_checkpoint(root / "legacy", model, optimizer, identity=identity)
-                            for name, parameter in model.named_parameters():
-                                torch.testing.assert_close(parameter, before_rejected_resume[name], rtol=0, atol=0)
+                            for missing_policy in ("indexer_selection", "sparse_attention_backward"):
+                                legacy = copy.deepcopy(identity)
+                                del legacy["training_config"][missing_policy]
+                                legacy_path = root / ("legacy-" + missing_policy)
+                                save_checkpoint(legacy_path, model, optimizer, step=2, identity=legacy, data_position=2)
+                                before_rejected_resume = {name: p.detach().clone() for name, p in model.named_parameters()}
+                                with self.assertRaisesRegex(ValueError, "checkpoint identity differs"):
+                                    load_checkpoint(legacy_path, model, optimizer, identity=identity)
+                                for name, parameter in model.named_parameters():
+                                    torch.testing.assert_close(parameter, before_rejected_resume[name], rtol=0, atol=0)
                         else:
                             self.assertNotIn("indexer_selection", identity["training_config"])
+                            self.assertNotIn("sparse_attention_backward", identity["training_config"])
                             if mode == "full":
                                 self.assertEqual(identity["training_config"], {
                                     "family": "qwen", "mode": "full", "num_layers": None, "batch_size": 1,

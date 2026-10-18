@@ -361,6 +361,7 @@ class CSA2Attention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.dropout = config.attention_dropout
+        self.ordered_kv_grad = False
         self.rotary = rotary
         self.q_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = RMSNorm(config.q_lora_rank, config.rms_norm_eps)
@@ -488,6 +489,7 @@ class CSA2Attention(nn.Module):
                 compressed_kv,
                 compressed_indices,
                 sinks,
+                deterministic=self.ordered_kv_grad,
             ).transpose(1, 2).contiguous()
 
         rows = torch.arange(query.shape[0], device=query.device).view(-1, 1, 1)

@@ -124,7 +124,8 @@ a 128 MiB cache per rank.
 | Native selective output-head FP32 master, global LR `1e-4` | Not run | 0/6 |
 | Stable SFT indexer selection, BF16 SGD, LR `1e-3` | **6/6** | **6/6** |
 
-The latest stable-indexer pair completed **160 finite updates per run** and
+The completed stable-indexer pair below predates the KV-backward candidate. It
+completed **160 finite updates per run** and
 clean resource release, with both final scores **6/6**: the original five
 questions scored 5/5 and the seen bare prompt scored 1/1. Offload scored 6/6
 at every 20-step evaluation; resident scored 4/6 at step 20 and 6/6 from step
@@ -152,12 +153,48 @@ relative L2 difference was **4.6259%**, with maximum absolute difference
 **0.0007781982421875**. These are not identical training trajectories, and the
 first-two-step checks do not cover every training gradient or update.
 
-Post-final offload teacher-versus-prompt-only diagnostics still found numerical
-differences at observed layer 0 query boundaries, although both first-token
-predictions were correct. These observations and the independently observed
-KV-gradient atomic-reduction variation described below do not isolate a unique
-cause of either the paired gradient differences or the QA improvement. The six
-questions remain an inspected development set, and the training-prompt results
+A subsequent controlled four-run test used the same full40 model, source
+manifest, data, seed and two-step observer, switching only KV backward mode and
+Engram placement/cache. The original atomic pair had **12.8078%** first-step
+Engram-gradient relative L2 difference. The candidate ordered KV backward made
+all **7,200 first-step dense parameter-shard gradient hashes** equal across
+placements. All touched Engram row values before/after SGD and coalesced
+gradients were exact in both steps: **32,624** and **78,143** row comparisons.
+Second-step dense gradient samples and dense weight samples also matched;
+these were bounded samples, not complete dense-state scans.
+
+Six replays of the same captured rank-0/layer-39 context produced five window-KV
+and four compressed-KV gradient hashes with the original atomic path, but one
+hash per channel with the ordered candidate. This intervention identifies and
+removes the observed backward divergence in the tested two-step workload.
+It does not prove all future trajectories bitwise equal. Those candidate runs
+disabled QA and saving; the separate production-entry results follow.
+
+The integrated production backward matched the candidate's four returned
+gradients bitwise over six replays of that same captured context. Reduced native
+CP1/EP2 and CP2/EP2 update/resume gates and a batch-13 address-boundary gate also
+passed. The production-entry resident/offload pair then completed **40 finite
+updates per placement**, with actual ordered attention selected and clean release.
+All **7,200 complete first-step dense-gradient hashes** matched. Second-step
+dense gradient/weight samples also matched; these remain bounded observations.
+Across all 40 steps, **640 rank/table/step comparisons** matched complete touched
+Engram row indices, pre-update values, gradients and actual post-SGD values.
+The first two steps additionally passed quantitative PT comparisons with zero
+difference. This validates the measured gradient/update consistency, not every
+dense state or an unrestricted bitwise training trajectory.
+
+Final native QA was **4/6 in both placements**, with identical generated tokens;
+final teacher loss was **0.2393022277392447** in both. The two failed short
+questions produced a verbose RTP answer and a DeepSeek identity answer. The
+native teacher metric uses eight sample slots across six records. A separate
+fixed **160-step offload quality run is in progress**, with final eval6 and
+separate training32 fit diagnostics; no result from that run is claimed yet.
+
+Post-final teacher-versus-prompt-only differences in the earlier 160-step run
+remain separate: observed layer 0 query boundaries differed although both
+first-token predictions were correct. A backward-only fix does not resolve
+that forward comparison or establish a cause for the QA improvement. The six
+questions remain an inspected development set, and training-prompt results
 are in-sample.
 
 The earlier recipes completed training and resource release but retained the
@@ -203,6 +240,21 @@ It does not make all floating-point operations independent of sequence shape. Th
 policy is part of checkpoint identity; strict SFT resume rejects older DSV4
 checkpoints without this field. Qwen checkpoint identity is unchanged.
 
+DSV4 full and LoRA SFT also enable native ordered sparse-attention KV backward
+before wrapping layers. Each edge retains the native Tensor Core formula;
+128-query chunks use fixed-order reductions instead of shared floating-point
+KV atomics. Checkpoints record
+`training_config.sparse_attention_backward = "ordered_edges_chunk128_v1"`.
+Strict resume rejects a missing or different policy, including older atomic
+checkpoints; it does not silently change their continuation semantics. Qwen's
+path and checkpoint identity are unchanged.
+
+The low-level `sparse_attention(..., deterministic=True)` option selects this
+path. `torch.use_deterministic_algorithms(True)` also selects it, even when the
+local option is false. Selection is fixed at forward time, so disabling the
+global setting before backward cannot switch that graph back to atomics.
+This controls the attention reduction path, not every operation in the model.
+
 For this DSV4 SGD path, add
 `--sgd-fp32-master-parameter lm_head.weight` to retain small updates in an FP32
 master before copying back to the BF16 parameter. The option requires
@@ -230,9 +282,10 @@ After replacing unordered MoE, mHC and sink reductions, 14 CUDA regression tests
 passed. Native Triton execution at both topologies restored state and reproduced
 the next update exactly; ordinary versus in-backward SGD had zero maximum update
 difference. These checks validate the distributed update contract, not
-the released full model's memory footprint or bitwise continuation. Attention
-KV and compressed-KV gradients still use atomic accumulation and show repeat
-differences. See `docs/testing.md` for the native recovery command.
+the released full model's memory footprint or bitwise continuation. The original attention
+KV/compressed-KV backward uses atomic accumulation; the two-step ordered
+candidate results above are separate from these reduced-model tests. See
+`docs/testing.md` for the native recovery command.
 
 For DSV4, `--engram-offload` keeps each rank's Engram row shard on CPU while
 preserving the native hash and distributed lookup. Full SFT updates these rows
