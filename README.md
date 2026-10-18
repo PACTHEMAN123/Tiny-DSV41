@@ -111,21 +111,33 @@ question and this bare prompt are seen training prompts; the other four
 evaluation prompts remain unseen in training. Their results are fixed
 development checks, not a blind generalization benchmark.
 
-In an instrumented 160-step run of the original 40-layer model on eight B300s
-with the full-SFT settings above, the resident control finished at **5/5 on the
-original questions and 1/1 on bare `你是谁`**. CPU offload with a 128 MiB cache
-per rank finished at **4/5 and 1/1**, respectively: the remaining assistant-name
-variant generated `RTP大包`. The resident control scored 6/6 at every 20-step
-check. Offload reached 6/6 at several intermediate checks, but scored 5/6 at
-steps 120 and 160. Its failed answer token was also wrong under teacher forcing;
-a low mean token loss did not imply a correct complete answer.
+Recorded full40 identity checks on eight B300s used the same 32 training records
+and six development questions. The table reports the prescribed final step,
+not the best intermediate score. Offload used a 128 MiB cache per rank.
 
-Given the same actual gradients, first-two-step CPU/CUDA coalescing and SGD
-replays were exact. All 1,584,960 checked cache-return row occurrences matched
-authoritative CPU values. Paired first-step snapshots matched all 32,624 visited
-initial rows, and the first lookup outputs matched, but incoming gradients
+| 160-step recipe | Resident final | CPU-offload final |
+| --- | --- | --- |
+| Historical BF16 SGD, LR `1e-3`, source `8fab9c7` | 6/6 | 5/6 |
+| Ordered-reduction fixes, BF16 SGD, LR `1e-3` | 5/6 | 4/6 |
+| Private output-head FP32-master diagnostic, global LR `1e-3` | Not run | 3/6 |
+| Native selective output-head FP32 master, global LR `1e-4` | Not run | 0/6 |
+
+These runs completed their training and resource-release checks, but **final
+answer quality remains unresolved**. The latest native run's mean training CE
+over its last 20 steps was 1.42382; falling loss did not produce correct answers.
+Source, update precision and learning rate differ between rows, so this table
+does not establish a causal quality gain from any one change. A fixed 640-step
+native-master run is in progress; no final result is available yet.
+
+In the historical `8fab9c7` pair, given the same actual gradients, first-two-step
+CPU/CUDA coalescing and SGD replays were exact. All 1,584,960 checked cache-return
+row occurrences matched authoritative CPU values. Paired first-step snapshots
+matched all 32,624 visited initial rows, and the first lookup outputs matched,
+but incoming gradients
 already differed; coalesced-gradient relative L2 difference was 0.008879.
 These checks do not establish identical full-model training trajectories.
+The newer ordered-reduction pair also passed all six same-gradient Engram replay
+stages and complete cache-return comparisons for its first two updates.
 The expanded data and longer training are not a matched-budget comparison with
 the earlier 20-step experiment. The default SGD-hook correction below does not
 explain that experiment's quality gap: both earlier variants explicitly used
@@ -142,13 +154,36 @@ the last checkpoint. This reduces gradient storage, but does not establish that
 the full released model fits: activations, collective buffers and checkpoint
 storage still need separate measurement.
 
+For this DSV4 SGD path, add
+`--sgd-fp32-master-parameter lm_head.weight` to retain small updates in an FP32
+master before copying back to the BF16 parameter. The option requires
+`--optimizer-in-backward --gradient-accumulation-steps 1`, accepts exact trainable BF16
+DTensor names, and can be repeated for additional parameters. It is disabled
+by default. Persistent storage increases by four bytes per selected local
+element: the released model's `lm_head.weight` adds **315.625 MiB per rank**
+when sharded across eight GPUs; temporary buffers are additional.
+
+Native SFT checkpoints save these masters and require the same selection and
+topology on resume. Missing or incompatible master state is rejected before
+loading model tensors. SFT-to-RL initialization reads the BF16 model weights;
+it does not transfer master residuals or resume the SFT optimizer. The option
+changes update precision and is not a demonstrated QA improvement. Validation
+passed 24 CPU checks and a two-GPU checkpoint gate using new model/optimizer
+objects in the same processes. See `docs/testing.md` for commands and scope.
+
 Using deterministic Torch reference kernels on CUDA, a reduced full-parameter
 BF16 model with FP32 precision islands, CPU Engram and real FSDP2 passed ordinary
 versus in-backward SGD comparison at CP1/EP2 and CP2/EP2. Parameter updates and
 sparse-checkpoint continuation were exact; a non-finite gradient on one rank
 aborted both ranks before the final SGD step. Native-kernel strict checkpoint
-replay has not passed. These checks validate the distributed update contract,
-not the released full model's memory footprint.
+replay initially failed on an attention sink weight after exact state loading.
+After replacing unordered MoE, mHC and sink reductions, 14 CUDA regression tests
+passed. Native Triton execution at both topologies restored state and reproduced
+the next update exactly; ordinary versus in-backward SGD had zero maximum update
+difference. These checks validate the distributed update contract, not
+the released full model's memory footprint or bitwise continuation. Attention
+KV and compressed-KV gradients still use atomic accumulation and show repeat
+differences. See `docs/testing.md` for the native recovery command.
 
 For DSV4, `--engram-offload` keeps each rank's Engram row shard on CPU while
 preserving the native hash and distributed lookup. Full SFT updates these rows

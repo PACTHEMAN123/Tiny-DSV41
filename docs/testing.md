@@ -39,6 +39,20 @@ suppression of adapter/Engram bundle exports, and resume followed by an update
 without creating another checkpoint. Tokenizer/model loading and CUDA telemetry
 are fixtures; actual tiny training and checkpoint save/load still run.
 
+Selective FP32 SGD masters and checkpoint compatibility have 24 passing CPU
+checks across these suites:
+
+```bash
+PYTHONPATH=.:tests python3 -m unittest test_sgd_fp32_master test_optim test_train_sft -v
+PYTHONPATH=. python3 -m unittest discover -s tests -p 'test_sft_master_checkpoint.py' -v
+PYTHONPATH=. python3 -m unittest discover -s tests -p 'test_sft_checkpoint.py' -v
+```
+
+They cover accumulated sub-BF16 updates, unchanged default SGD, exact parameter
+selection, restored master state, invalid-state rejection before mutation,
+ordinary optimizer compatibility, and SFT-to-RL weight initialization without
+resuming the SFT optimizer.
+
 The optional short/long identity fixture, answer labels and native greedy
 generation have 12 focused CPU checks, verified locally and on Linux:
 
@@ -107,6 +121,66 @@ PYTHONPATH=.:tests python3 -m torch.distributed.run \
 ```
 
 ## GPU distributed checks
+
+The ordered-reduction regressions cover MoE combine, SwiGLU router-weight
+gradients, mHC mixing-weight gradients and attention sink gradients:
+
+```bash
+PYTHONPATH=.:tests python3 -m unittest \
+  test_moe_dispatch test_triton_moe test_triton_mhc test_triton_attention -v
+```
+
+All 14 tests passed on CUDA. These tests check repeated computations and
+reference agreement for the affected outputs; attention KV and compressed-KV
+gradients still use atomic accumulation, so full-model determinism is not claimed.
+Six replays of an actual full40 layer39 backward with identical inputs and
+upstream gradients found KV/compressed-KV variation while query and sink gradients
+were exact. This identifies a local source, not the sole cause of QA failures.
+The distributed combine check, including a rank with no source tokens, is part
+of `tests/dsv4_sft_gradient_parity.py`.
+
+Native-kernel full-SFT update and sparse-checkpoint recovery can be checked with:
+
+```bash
+PYTHONPATH=.:tests CUDA_VISIBLE_DEVICES=0,1 \
+python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
+  tests/dsv4_sft_in_backward.py --device cuda --output runs/sft-native-resume
+```
+
+On the reduced BF16/FP32 model, CP1/EP2 and CP2/EP2 both restored state exactly
+and reproduced the next update exactly after the ordered-reduction fixes.
+The ordinary and in-backward SGD update difference was zero. The test also
+checks updated Engram rows, checkpoint payloads and a global non-finite abort.
+Rank-local assertions are synchronized before the next collective so a failed
+comparison reports its numerical error instead of leaving a peer waiting.
+This is native Triton execution, without `--reference-torch`; it does not
+establish bitwise recovery of the released 40-layer model.
+
+A two-GPU selective-master checkpoint check also passed:
+
+```bash
+PYTHONPATH=. CUDA_VISIBLE_DEVICES=0,1 \
+python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
+  tests/test_sft_master_checkpoint.py --cuda-dir runs/sft-master-resume
+```
+
+Use a new output directory. This runs actual BF16 FSDP2 forward/backward,
+preserves sub-BF16 residuals, and restores into newly created model, optimizer
+and hooks in the same processes. Parameters, FP32 master and RNG state match
+exactly, as does the next update. Corrupt master metadata on one rank is
+rejected on both ranks before live state changes. This is not a separate-process
+restart or a full-model quality test.
+
+Released-model quality remains a separate, unresolved check. The historical
+`8fab9c7` full40 pair finished at resident 6/6 and offload 5/6; after the ordered
+reductions, the fixed 160-step pair finished at 5/6 and 4/6. The private output-head
+master diagnostic at global LR `1e-3` finished at 3/6. The native selective-master
+offload run at global LR `1e-4` completed 160 finite updates and clean release but
+finished at **0/6**, with last-20-step mean training CE 1.42382. These are final
+scores on an inspected development set, not best-step selection or a controlled
+claim that precision changes improve quality. The new fixed 640-step run is
+still in progress. See the README for the recipe comparison; kernel and
+checkpoint passes do not replace its final QA result.
 
 Four-rank SFT checks cover full training and LoRA with trainable CPU Engram,
 CP2/EP2, two-rank expert FSDP groups, and unequal supervised token counts:
