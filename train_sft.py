@@ -39,6 +39,8 @@ def parse_args(argv=None):
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--optimizer", choices=("sgd", "adamw"))
     parser.add_argument("--optimizer-in-backward", action="store_true", help="DSV4 only: update FSDP shards during backward with plain SGD and one microbatch")
+    parser.add_argument("--sgd-fp32-master-parameter", action="append", default=[], dest="sgd_fp32_master_parameters",
+                        help="Exact trainable BF16 DTensor name to keep an FP32 SGD master for; repeat to select more; requires optimizer-in-backward")
     parser.add_argument("--cp-size", type=int, default=1)
     parser.add_argument("--ep-size", type=int, default=1)
     parser.add_argument("--lora-rank", type=int, default=8)
@@ -104,6 +106,13 @@ def validate_args(args, world_size):
             raise ValueError("optimizer-in-backward requires DSV4 and SGD")
         if args.gradient_accumulation_steps != 1:
             raise ValueError("optimizer-in-backward requires gradient-accumulation-steps=1")
+    if args.sgd_fp32_master_parameters:
+        if not args.optimizer_in_backward:
+            raise ValueError("sgd-fp32-master-parameter requires optimizer-in-backward")
+        if (len(set(args.sgd_fp32_master_parameters)) != len(args.sgd_fp32_master_parameters)
+                or any(not name or name != name.strip() for name in args.sgd_fp32_master_parameters)):
+            raise ValueError("sgd-fp32-master-parameter requires unique exact nonempty names")
+        args.sgd_fp32_master_parameters = sorted(args.sgd_fp32_master_parameters)
     if (args.train_engram or (args.engram_offload and args.mode == "full")) and args.optimizer != "sgd":
         raise ValueError("trainable offloaded Engram or LoRA with trainable Engram requires SGD")
 
@@ -290,6 +299,8 @@ def train(args, runtime):
     )}
     identity["training_config"].update({key: True for key in ("engram_offload", "train_engram", "optimizer_in_backward")
                                         if getattr(args, key)})
+    if args.sgd_fp32_master_parameters:
+        identity["training_config"]["sgd_fp32_master_parameters"] = args.sgd_fp32_master_parameters
     identity["training_config"].update(world_size=runtime.world_size, enable_thinking=False,
                                        lora=asdict(lora_config(args)) if args.mode == "lora" else None)
     # JSON-normalize tuples for portable identity metadata and strict resume checks.
@@ -302,6 +313,9 @@ def train(args, runtime):
                                load_peak_allocated_gib=torch.cuda.max_memory_allocated(runtime.device) / 2**30,
                                load_peak_reserved_gib=torch.cuda.max_memory_reserved(runtime.device) / 2**30)
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if args.sgd_fp32_master_parameters:
+        from dsv41_train.optim import sgd_parameter_groups
+        parameters = sgd_parameter_groups(model, args.sgd_fp32_master_parameters)
     optimizer_type = torch.optim.SGD if args.optimizer == "sgd" else torch.optim.AdamW
     optimizer = optimizer_type(parameters, lr=args.learning_rate, weight_decay=0, foreach=False)
     in_backward = None

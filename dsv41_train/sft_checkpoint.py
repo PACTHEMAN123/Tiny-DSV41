@@ -78,6 +78,13 @@ def _optimizer_spec(optimizer, parameters):
     for group in optimizer.param_groups:
         if any(id(p) not in names for p in group["params"]):
             raise ValueError("optimizer must contain only trainable model parameters")
+        master = group.get("fp32_master", False)
+        if type(master) is not bool or (master and (
+                type(optimizer) is not torch.optim.SGD
+                or any(group.get(key, 0) for key in ("momentum", "dampening", "weight_decay", "nesterov",
+                                                     "maximize", "differentiable", "foreach", "fused"))
+                or any(not isinstance(p, DTensor) or p.dtype != torch.bfloat16 for p in group["params"]))):
+            raise ValueError("FP32 master checkpoints require plain SGD with BF16 DTensor parameters")
         groups.append({**{key: _json(value) for key, value in group.items() if key != "params"},
                        "params": [names[id(p)] for p in group["params"]]})
     flat = [name for group in groups for name in group["params"]]
@@ -112,9 +119,14 @@ def _drain(model):
 
 def _encode_state(optimizer, parameters):
     states = {}
+    groups = {id(p): group for group in optimizer.param_groups for p in group["params"]}
     for name, p in parameters.items():
+        fields, group = optimizer.state.get(p, {}), groups[id(p)]
+        _validate_fields(fields, optimizer, group, name)
+        if group.get("fp32_master", False):
+            _validate_master(fields["master_weight"], _local(p).detach(), name)
         state = {}
-        for key, value in optimizer.state.get(p, {}).items():
+        for key, value in fields.items():
             if not isinstance(value, torch.Tensor):
                 raise ValueError(f"unsupported optimizer state {name}.{key}")
             state[key] = {"layout": _layout(value), "value": _local(value).detach()}
@@ -128,7 +140,35 @@ def _validate_tensor(value, layout, name):
         raise ValueError(f"invalid tensor payload: {name}")
 
 
-def _decode_state(encoded, optimizer, parameters, *, materialize):
+def _validate_fields(fields, optimizer, group, name):
+    master = group.get("fp32_master", False)
+    expected = ({"master_weight"} if master else {"momentum_buffer"} if group["momentum"] else set()) if type(optimizer) is torch.optim.SGD else (
+        {"step", "exp_avg", "exp_avg_sq"} | ({"max_exp_avg_sq"} if group["amsgrad"] else set()))
+    if (fields or master) and fields.keys() != expected:
+        raise ValueError(f"invalid optimizer fields: {name}")
+
+
+def _validate_master(master, weight, name):
+    if (not isinstance(master, torch.Tensor) or isinstance(master, DTensor) or master.is_meta
+            or master.layout != torch.strided or master.requires_grad or master.dtype != torch.float32
+            or master.shape != weight.shape or master.device != weight.device or weight.dtype != torch.bfloat16):
+        raise ValueError(f"invalid FP32 master tensor: {name}")
+    # Bound comparison/cast temporaries even for noncontiguous or very wide shards.
+    def check(value, reference):
+        if value.numel() <= 2**20:
+            if (not bool(torch.isfinite(value).all()) or not bool(torch.isfinite(reference).all())
+                    or not torch.equal(value.to(torch.bfloat16), reference)):
+                raise ValueError(f"FP32 master is non-finite or differs from BF16 parameter: {name}")
+            return
+        axis = next(i for i, size in enumerate(value.shape) if size > 1)
+        width = max(1, 2**20 // (value.numel() // value.shape[axis]))
+        for start in range(0, value.shape[axis], width):
+            count = min(width, value.shape[axis] - start)
+            check(value.narrow(axis, start, count), reference.narrow(axis, start, count))
+    check(master, weight)
+
+
+def _decode_state(encoded, optimizer, parameters, *, parameter_values, materialize):
     if encoded.keys() != parameters.keys():
         raise ValueError("optimizer parameter names differ")
     groups = {id(p): group for group in optimizer.param_groups for p in group["params"]}
@@ -136,15 +176,19 @@ def _decode_state(encoded, optimizer, parameters, *, materialize):
     for name, parameter in parameters.items():
         fields = encoded[name]
         group = groups[id(parameter)]
-        expected = ({"momentum_buffer"} if group["momentum"] else set()) if type(optimizer) is torch.optim.SGD else (
-            {"step", "exp_avg", "exp_avg_sq"} | ({"max_exp_avg_sq"} if group["amsgrad"] else set()))
-        if fields and fields.keys() != expected:
-            raise ValueError(f"invalid optimizer fields: {name}")
+        _validate_fields(fields, optimizer, group, name)
         state = {}
         for key, record in fields.items():
             value, layout = record["value"], record["layout"]
             _validate_tensor(value, layout, f"{name}.{key}")
-            if key == "step":
+            if key == "master_weight":
+                expected = {**_layout(_local(parameter)), "dtype": "torch.float32"}
+                if set(record) != {"value", "layout"} or layout != expected or name not in parameter_values:
+                    raise ValueError(f"FP32 master layout differs: {name}")
+                _validate_master(value, parameter_values[name], name)
+                if materialize:
+                    state[key] = value.to(_local(parameter).device, copy=True)
+            elif key == "step":
                 device = str(_local(parameter).device) if group.get("capturable") or group.get("fused") else "cpu"
                 if value.ndim != 0 or value.dtype not in (torch.float32, torch.float64) or "mesh" in layout or layout["device"] != device:
                     raise ValueError(f"invalid optimizer step: {name}")
@@ -181,6 +225,8 @@ def save_checkpoint(path, model, optimizer, *, step, identity, data_position):
             raise ValueError("identity must describe the original base and training configuration")
         _drain(model)
         schema = _schema(model, optimizer)
+        parameters, buffers = _tensors(model)
+        encoded_state = _encode_state(optimizer, parameters)
     except Exception as exc:
         error = f"rank {rank}: {exc}"
     _collect({"error": error})
@@ -191,12 +237,11 @@ def save_checkpoint(path, model, optimizer, *, step, identity, data_position):
         error = str(exc)
     _collect({"error": error})
     try:
-        parameters, buffers = _tensors(model)
         manager = getattr(model, "_sft_engram_checkpoint", None)
         excluded = manager.parameter_names if manager is not None else ()
         payload = {"parameters": {name: _local(p).detach() for name, p in parameters.items() if name not in excluded},
                    "buffers": {name: _local(b).detach() for name, b in buffers.items()},
-                   "optimizer": _encode_state(optimizer, parameters), "data_position": data_position,
+                   "optimizer": encoded_state, "data_position": data_position,
                    "cpu_rng": torch.get_rng_state(),
                    "cuda_rng": {device: torch.cuda.get_rng_state(device) for device in schema["cuda_devices"]}}
         if manager is not None:
@@ -269,7 +314,8 @@ def load_checkpoint(path, model, optimizer, *, identity):
                 _validate_tensor(value, schema[section][name], name)
         if manager is not None:
             manager.validate(payload["engram_rows"])
-        _decode_state(payload["optimizer"], optimizer, parameters, materialize=False)
+        _decode_state(payload["optimizer"], optimizer, parameters,
+                      parameter_values=payload["parameters"], materialize=False)
         torch.Generator().set_state(payload["cpu_rng"])
         if payload["cuda_rng"].keys() != set(schema["cuda_devices"]):
             raise ValueError("CUDA RNG devices differ")
@@ -287,7 +333,8 @@ def load_checkpoint(path, model, optimizer, *, identity):
         for parameter in parameters.values():
             parameter.grad = None
         optimizer.state.clear()
-        optimizer.state.update(_decode_state(payload["optimizer"], optimizer, parameters, materialize=True))
+        optimizer.state.update(_decode_state(payload["optimizer"], optimizer, parameters,
+                                           parameter_values=payload["parameters"], materialize=True))
         if manager is not None:
             manager.load_state_dict(payload["engram_rows"])
         for module in model.modules():

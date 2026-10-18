@@ -248,6 +248,16 @@ class SFTTrainTests(unittest.TestCase):
             self.assertFalse(cached.optimizer_in_backward)
             enabled = base + ["--mode", "full", "--optimizer-in-backward"]
             validate_args(parse_args(enabled), 1)
+            self.assertEqual(parse_args(enabled).sgd_fp32_master_parameters, [])
+            selected = parse_args(enabled + ["--sgd-fp32-master-parameter", "lm_head.weight",
+                                             "--sgd-fp32-master-parameter", "model.embedding.weight"])
+            validate_args(selected, 1)
+            self.assertEqual(selected.sgd_fp32_master_parameters, ["lm_head.weight", "model.embedding.weight"])
+            for command, message in ((base + ["--sgd-fp32-master-parameter", "lm_head.weight"], "requires optimizer-in-backward"),
+                                      (enabled + ["--sgd-fp32-master-parameter", ""], "unique exact"),
+                                      (enabled + ["--sgd-fp32-master-parameter", "lm_head.weight"] * 2, "unique exact")):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_args(parse_args(command), 1)
             for options, message in ((["--gradient-accumulation-steps", "2"], "accumulation"),
                                      (["--optimizer", "adamw"], "requires DSV4 and SGD")):
                 with self.assertRaisesRegex(ValueError, message):
