@@ -111,9 +111,10 @@ question and this bare prompt are seen training prompts; the other four
 evaluation prompts remain unseen in training. Their results are fixed
 development checks, not a blind generalization benchmark.
 
-Recorded full40 identity checks on eight B300s used the same 32 training records
-and six development questions. The table reports the prescribed final step,
-not the best intermediate score. Offload used a 128 MiB cache per rank.
+Recorded full40 identity checks on eight B300s (reported by the driver as L20D)
+used the same 32 training records and six development questions. The table
+reports the prescribed final step, not the best intermediate score. Offload used
+a 128 MiB cache per rank.
 
 | 160-step recipe | Resident final | CPU-offload final |
 | --- | --- | --- |
@@ -121,17 +122,54 @@ not the best intermediate score. Offload used a 128 MiB cache per rank.
 | Ordered-reduction fixes, BF16 SGD, LR `1e-3` | 5/6 | 4/6 |
 | Private output-head FP32-master diagnostic, global LR `1e-3` | Not run | 3/6 |
 | Native selective output-head FP32 master, global LR `1e-4` | Not run | 0/6 |
+| Stable SFT indexer selection, BF16 SGD, LR `1e-3` | **6/6** | **6/6** |
 
-These runs completed their training and resource-release checks, but **final
-answer quality remains unresolved**. A subsequent fixed 640-step native-master
+The latest stable-indexer pair completed **160 finite updates per run** and
+clean resource release, with both final scores **6/6**: the original five
+questions scored 5/5 and the seen bare prompt scored 1/1. Offload scored 6/6
+at every 20-step evaluation; resident scored 4/6 at step 20 and 6/6 from step
+40 through 160. Both post-final prompt-only checks matched **32/32 training
+records (31 distinct prompts)** and teacher forcing predicted **160/160 answer
+tokens**, including 32/32 first tokens and EOS tokens. Both used full40,
+CP1/EP8, BF16 SGD `1e-3`, gradient checkpointing, the same 32-record long/short
+mixture, no FP32 master and `--no-save`.
+
+The observed simultaneous eight-GPU NVML memory peak within the matched training
+windows fell from **1,714.064 GiB resident to 1,348.826 GiB offloaded**, a
+**365.238 GiB (21.31%)** reduction in total device memory, not just table storage.
+These sampled windows include diagnostic observers and the first-step trace;
+they are not an uninstrumented performance benchmark, and sampling can miss
+shorter peaks.
+
+First-two-step checks passed all six same-gradient Engram replay stages and
+all **1,584,960 cache-return row occurrences** against authoritative CPU rows.
+Across the pair, 7,408 bounded initial-parameter sample records and all 32,624
+first-step visited table rows matched. All 8,480 recorded original-forward
+tensors matched by hash, the SGD update order matched, and available
+original/recomputed tensors matched within each run. Nevertheless, all 16
+first-step Engram incoming-gradient comparisons differed; coalesced-gradient
+relative L2 difference was **4.6259%**, with maximum absolute difference
+**0.0007781982421875**. These are not identical training trajectories, and the
+first-two-step checks do not cover every training gradient or update.
+
+Post-final offload teacher-versus-prompt-only diagnostics still found numerical
+differences at observed layer 0 query boundaries, although both first-token
+predictions were correct. These observations and the independently observed
+KV-gradient atomic-reduction variation described below do not isolate a unique
+cause of either the paired gradient differences or the QA improvement. The six
+questions remain an inspected development set, and the training-prompt results
+are in-sample.
+
+The earlier recipes completed training and resource release but retained the
+final quality failures shown above. A subsequent fixed 640-step native-master
 offload run at global LR `1e-4` finished at **3/6**, with last-20-step mean
 training CE 0.11082. Post-final prompt-only generation matched **31/32 training
 records (30/31 distinct prompts)**: all 16 long records and 15/16 short records.
 The two exact training prompts in eval6 passed; the four unseen development
 prompts scored 1/4. These fitting results do not establish robust generalization.
 Source, update precision, learning rate and step count differ between experiments,
-so they do not isolate a causal quality gain. These runs predate the SFT stable
-indexer selection change; its full-model quality validation is pending.
+so they do not isolate a causal quality gain. These historical runs predate the
+SFT stable-indexer result above; their negative results remain part of the record.
 
 In the historical `8fab9c7` pair, given the same actual gradients, first-two-step
 CPU/CUDA coalescing and SGD replays were exact. All 1,584,960 checked cache-return

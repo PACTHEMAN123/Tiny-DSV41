@@ -171,9 +171,50 @@ exactly, as does the next update. Corrupt master metadata on one rank is
 rejected on both ranks before live state changes. This is not a separate-process
 restart or a full-model quality test.
 
-Released-model quality remains a separate, unresolved check. The historical
-`8fab9c7` full40 pair finished at resident 6/6 and offload 5/6; after the ordered
-reductions, the fixed 160-step pair finished at 5/6 and 4/6. The private output-head
+Released-model quality is evaluated separately from the component checks. The
+latest stable-indexer full40 resident/CPU-offload pair on eight B300s (driver
+name L20D) completed 160 finite updates per run and clean release. Both final
+scores were **6/6** (original five questions 5/5, seen bare prompt 1/1). Offload
+scored 6/6 at every 20-step evaluation; resident scored 4/6 at step 20 and 6/6
+at steps 40 through 160. Both post-final train-fit checks scored **32/32
+prompt-only generations (31 distinct prompts)** and **160/160 teacher-forced
+answer tokens**, including 32/32 first and EOS tokens. Both used the same
+32-record mixture, CP1/EP8, BF16 SGD `1e-3`, gradient checkpointing, no FP32
+master and no checkpoint saving; offload used a 128 MiB Engram cache per rank.
+Four examples per update were long (at least 4096 actual tokens) and four were
+short.
+
+The simultaneous eight-GPU NVML peak observed inside training-update windows
+was **1,714.064453125 GiB resident versus 1,348.826171875 GiB offloaded**:
+**365.23828125 GiB (21.3083%)** less total device memory. Windows span the earliest
+rank's update begin through the latest rank's update end, excluding interim QA
+gaps but including diagnostic observers and the first-step trace. NVML samples
+can miss shorter peaks; this is not an uninstrumented performance benchmark.
+Both runs finished with two all-eight-GPU clean-release observations.
+
+All six same-gradient Engram replay stages and all 1,584,960 cache-return row
+occurrences passed for the first two updates. Across the pair, all 7,408 bounded
+initial-parameter sample records, 32,624 first-step visited table rows and 8,480
+recorded original-forward tensors matched. SGD order matched, as did available
+original/recomputed tensors within each run. All 16 first-step Engram incoming
+gradients nevertheless differed. Over the common visited rows, coalesced
+gradients differed by **4.6259% relative L2**, with maximum absolute difference
+**0.0007781982421875** and **6,901,763 changed elements**. This is neither
+full-gradient equality nor full-trajectory verification. Independent fixed-input
+KV-backward replay identifies atomic accumulation as a local source of
+variation, not the sole explanation for this aggregate difference or QA.
+
+Rank 0 post-final offload comparisons at the first-answer query still found
+teacher/prefix differences: the 12-token prompt first differed at layer 0 MoE
+output, and the 4096-token prompt at layer 0 output. Final logit maximum absolute
+differences were 2.40625 and 2.5625, with the correct first-token top1 in both
+modes. These are observed boundaries, not a unique causal explanation. QA6 is
+an inspected development set; train-fit is in-sample, and these runs do not
+exercise full-model checkpoint persistence or prove bitwise equivalence.
+
+Historical negative results are retained. The `8fab9c7` full40 pair finished at
+resident 6/6 and offload 5/6; after the ordered reductions, the fixed 160-step
+pair finished at 5/6 and 4/6. The private output-head
 master diagnostic at global LR `1e-3` finished at 3/6. The native selective-master
 offload run at global LR `1e-4` completed 160 finite updates and clean release but
 finished at **0/6**, with last-20-step mean training CE 1.42382. These are final
@@ -196,8 +237,19 @@ matrices of `[4608, 2304]` and `[4608, 4608]`, stable selection took median
 0.4193 ms and 1.3516 ms, versus 0.2108 ms and 0.3428 ms for default top-k, over
 ten measured repetitions after three warmups. Incremental allocated peaks were
 122.52 MiB and 650 MiB, versus 33.87 MiB for default selection. These are
-selection-only measurements, not whole-model performance. Full-model quality
-validation of this change is pending. See the README for recipe boundaries.
+selection-only measurements, not whole-model performance. The completed
+full-model resident/offload results are described above; they do not turn these
+selection-only timings into an end-to-end speed claim.
+See the README for recipe boundaries.
+
+A separate short-prefix B300 check used 12-to-17 and 6-to-8 candidate widths,
+the actual `min(512, width)` selection count, and invalid-index sentinels.
+Default selection reordered visible candidates in four of six selection cases;
+stable selection preserved their order in all six. Both methods nevertheless
+produced exactly equal BF16 outputs in the two native scorer/attention cases.
+Changing future content at fixed shape also left the observed scores and
+attention outputs unchanged. This reproduces the ordering issue, but does not
+establish it as the cause of the full-model answer failures.
 
 Four-rank SFT checks cover full training and LoRA with trainable CPU Engram,
 CP2/EP2, two-rank expert FSDP groups, and unequal supervised token counts:
