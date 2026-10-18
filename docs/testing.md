@@ -178,9 +178,26 @@ master diagnostic at global LR `1e-3` finished at 3/6. The native selective-mast
 offload run at global LR `1e-4` completed 160 finite updates and clean release but
 finished at **0/6**, with last-20-step mean training CE 1.42382. These are final
 scores on an inspected development set, not best-step selection or a controlled
-claim that precision changes improve quality. The new fixed 640-step run is
-still in progress. See the README for the recipe comparison; kernel and
-checkpoint passes do not replace its final QA result.
+claim that precision changes improve quality. The subsequent fixed 640-step
+native-master offload run completed with clean release and finished at **3/6**
+(last-20-step mean training CE 0.11082). Post-final training-prompt generation
+scored 31/32 records, or 30/31 distinct prompts; eval6 scored 2/2 on exact seen
+prompts and 1/4 on unseen development prompts. All eight ranks recorded identical
+train-fit teacher scores in this run. Sampled head-master arithmetic and
+first-two-step Engram replay/cache checks passed; these limited numerical checks
+do not establish full-trajectory equivalence or answer quality.
+
+The SFT stable-indexer change is separately covered by loader and checkpoint
+regressions in `tests/test_train_sft.py`. On one B300, six synthetic selection
+cases and ten native scorer/attention cases passed. Both default and stable
+selection preserved the tested prefixes on this CUDA backend; the CPU ordering
+counterexamples did not reproduce in these GPU cases. On prebuilt FP32 score
+matrices of `[4608, 2304]` and `[4608, 4608]`, stable selection took median
+0.4193 ms and 1.3516 ms, versus 0.2108 ms and 0.3428 ms for default top-k, over
+ten measured repetitions after three warmups. Incremental allocated peaks were
+122.52 MiB and 650 MiB, versus 33.87 MiB for default selection. These are
+selection-only measurements, not whole-model performance. Full-model quality
+validation of this change is pending. See the README for recipe boundaries.
 
 Four-rank SFT checks cover full training and LoRA with trainable CPU Engram,
 CP2/EP2, two-rank expert FSDP groups, and unequal supervised token counts:

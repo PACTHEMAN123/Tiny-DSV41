@@ -123,11 +123,15 @@ not the best intermediate score. Offload used a 128 MiB cache per rank.
 | Native selective output-head FP32 master, global LR `1e-4` | Not run | 0/6 |
 
 These runs completed their training and resource-release checks, but **final
-answer quality remains unresolved**. The latest native run's mean training CE
-over its last 20 steps was 1.42382; falling loss did not produce correct answers.
-Source, update precision and learning rate differ between rows, so this table
-does not establish a causal quality gain from any one change. A fixed 640-step
-native-master run is in progress; no final result is available yet.
+answer quality remains unresolved**. A subsequent fixed 640-step native-master
+offload run at global LR `1e-4` finished at **3/6**, with last-20-step mean
+training CE 0.11082. Post-final prompt-only generation matched **31/32 training
+records (30/31 distinct prompts)**: all 16 long records and 15/16 short records.
+The two exact training prompts in eval6 passed; the four unseen development
+prompts scored 1/4. These fitting results do not establish robust generalization.
+Source, update precision, learning rate and step count differ between experiments,
+so they do not isolate a causal quality gain. These runs predate the SFT stable
+indexer selection change; its full-model quality validation is pending.
 
 In the historical `8fab9c7` pair, given the same actual gradients, first-two-step
 CPU/CUDA coalescing and SGD replays were exact. All 1,584,960 checked cache-return
@@ -153,6 +157,13 @@ the run on every rank; earlier shard updates are not rolled back, so resume from
 the last checkpoint. This reduces gradient storage, but does not establish that
 the full released model fits: activations, collective buffers and checkpoint
 storage still need separate measurement.
+
+DSV4 SFT uses the same stable sparse-indexer selection as native RL: descending
+score, then ascending index for ties. For unchanged visible scores, this keeps
+selection order and tied membership invariant to appended invisible candidates.
+It does not make all floating-point operations independent of sequence shape. The selection
+policy is part of checkpoint identity; strict SFT resume rejects older DSV4
+checkpoints without this field. Qwen checkpoint identity is unchanged.
 
 For this DSV4 SGD path, add
 `--sgd-fp32-master-parameter lm_head.weight` to retain small updates in an FP32

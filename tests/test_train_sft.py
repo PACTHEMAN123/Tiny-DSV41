@@ -18,7 +18,7 @@ from dsv41_train.models.qwen import Qwen3MoeForCausalLM
 from dsv41_train.runtime import Runtime
 from dsv41_train.sft_data import collate_examples
 from qwen_helpers import tiny_config
-from train_sft import evaluate, make_batches, parse_args, sft_loss, train, train_update, validate_args
+from train_sft import evaluate, load_model, make_batches, parse_args, sft_loss, train, train_update, validate_args
 
 
 def small_model(family):
@@ -44,6 +44,45 @@ class SFTTrainTests(unittest.TestCase):
         torch.set_num_threads(1)
         torch.manual_seed(31)
         self.runtime = Runtime(torch.device("cpu"))
+
+    def test_native_loaders_set_sft_indexer_policy_before_wrapping(self):
+        for family in ("dsv4", "qwen"):
+            for mode in ("full", "lora"):
+                with self.subTest(family=family, mode=mode), ExitStack() as stack:
+                    model = small_model(family)
+                    args = parse_args(["--model-path", "unused", "--data", "unused", "--output-dir", "unused",
+                                       "--family", family, "--mode", mode])
+                    args.optimizer, args.num_layers = "sgd", model.config.num_hidden_layers
+                    meshes = SimpleNamespace(engram=None)
+                    prefix = f"dsv41_train.models.{family}"
+                    stack.enter_context(patch(prefix + ".parallel.build_parallelism", return_value=(meshes, None, None)))
+                    if family == "dsv4":
+                        indexers = [layer.attention.indexer for layer in model.model.layers
+                                    if layer.attention.indexer is not None]
+                        self.assertTrue(indexers)
+                        self.assertTrue(all(not indexer.stable_topk for indexer in indexers))
+
+                        def released_loader(*_args, layer_loaded, **_kwargs):
+                            for layer in model.model.layers:
+                                layer_loaded(layer)
+                            return model
+
+                        def wrap_layer(layer, _meshes):
+                            if layer.attention.indexer is not None:
+                                self.assertTrue(layer.attention.indexer.stable_topk)
+
+                        loader = stack.enter_context(patch(prefix + ".load_dsv41_backbone_window", side_effect=released_loader))
+                        wrapped = stack.enter_context(patch(prefix + ".parallel.apply_fsdp2_layer", side_effect=wrap_layer))
+                        stack.enter_context(patch(prefix + ".parallel.apply_fsdp2_root"))
+                    else:
+                        loader = stack.enter_context(patch(prefix + ".load_qwen3_moe", return_value=model))
+                        wrapped = stack.enter_context(patch(prefix + ".parallel.apply_fsdp2"))
+                        stack.enter_context(patch(prefix + ".parallel.ParallelParameters.collect",
+                                                  return_value=SimpleNamespace(synchronize=lambda cp: None)))
+                    loaded, _ = load_model(args, self.runtime)
+                    self.assertIs(loaded, model)
+                    loader.assert_called_once()
+                    self.assertEqual(wrapped.call_count, len(model.model.layers) if family == "dsv4" else 1)
 
     def test_native_family_losses_are_shifted_answer_ce_without_router_aux(self):
         batch = collate_examples(examples(), pad_token_id=0)
@@ -145,7 +184,7 @@ class SFTTrainTests(unittest.TestCase):
         for family, mode, options in (("qwen", "full", []), ("qwen", "full", ["--save-every", "1"]),
                                       ("qwen", "full", ["--no-save"]), ("qwen", "lora", []),
                                       ("qwen", "lora", ["--no-save"]), ("dsv4", "lora", ["--no-save"]),
-                                      ("dsv4", "full", ["--no-save"]),
+                                      ("dsv4", "full", []), ("dsv4", "full", ["--no-save"]),
                                       ("dsv4", "full", ["--no-save", "--train-engram"])):
             with self.subTest(family=family, mode=mode, options=options), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -199,6 +238,27 @@ class SFTTrainTests(unittest.TestCase):
                         self.assertEqual((output / "adapter.pt").is_file(), mode == "lora")
                         checkpoint = output / "checkpoint-00000002"
                         self.assertTrue((checkpoint / "manifest.json").is_file())
+                        identity = json.loads((checkpoint / "manifest.json").read_text())["identity"]
+                        if family == "dsv4":
+                            self.assertEqual(identity["training_config"]["indexer_selection"],
+                                             "stable_score_descending_index_ascending_v1")
+                            legacy = copy.deepcopy(identity)
+                            del legacy["training_config"]["indexer_selection"]
+                            optimizer = save.call_args.args[2]
+                            save_checkpoint(root / "legacy", model, optimizer, step=2, identity=legacy, data_position=2)
+                            before_rejected_resume = {name: p.detach().clone() for name, p in model.named_parameters()}
+                            with self.assertRaisesRegex(ValueError, "checkpoint identity differs"):
+                                load_checkpoint(root / "legacy", model, optimizer, identity=identity)
+                            for name, parameter in model.named_parameters():
+                                torch.testing.assert_close(parameter, before_rejected_resume[name], rtol=0, atol=0)
+                        else:
+                            self.assertNotIn("indexer_selection", identity["training_config"])
+                            if mode == "full":
+                                self.assertEqual(identity["training_config"], {
+                                    "family": "qwen", "mode": "full", "num_layers": None, "batch_size": 1,
+                                    "gradient_accumulation_steps": 1, "seq_len": 16, "learning_rate": 1e-4,
+                                    "optimizer": "sgd", "cp_size": 1, "ep_size": 1, "seed": 42,
+                                    "gradient_checkpointing": False, "world_size": 1, "enable_thinking": False, "lora": None})
                         load = stack.enter_context(patch("dsv41_train.sft_checkpoint.load_checkpoint", wraps=load_checkpoint))
                         resumed = train(parse_args(command + ["--save-every", "0", "--no-save", "--resume", str(checkpoint),
                                                               "--steps", "3", "--output-dir", str(root / "resumed")]), self.runtime)

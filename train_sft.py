@@ -136,6 +136,8 @@ def load_model(args, runtime):
         meshes, cp, dispatcher = build_parallelism(args.cp_size, args.ep_size, runtime.device.type)
 
         def layer_loaded(layer):
+            if layer.attention.indexer is not None:
+                layer.attention.indexer.stable_topk = True
             if config is not None:
                 inject_lora(layer, config)
             apply_fsdp2_layer(layer, meshes)
@@ -303,6 +305,8 @@ def train(args, runtime):
         identity["training_config"]["sgd_fp32_master_parameters"] = args.sgd_fp32_master_parameters
     identity["training_config"].update(world_size=runtime.world_size, enable_thinking=False,
                                        lora=asdict(lora_config(args)) if args.mode == "lora" else None)
+    if args.family == "dsv4":
+        identity["training_config"]["indexer_selection"] = "stable_score_descending_index_ascending_v1"
     # JSON-normalize tuples for portable identity metadata and strict resume checks.
     identity = json.loads(json.dumps(identity))
     torch.cuda.reset_peak_memory_stats(runtime.device)
