@@ -3,6 +3,7 @@ import sys
 import tempfile
 import types
 import unittest
+import warnings
 from pathlib import Path
 from unittest.mock import patch
 
@@ -159,9 +160,13 @@ class DataRewardTests(unittest.TestCase):
                 load_jsonl(path, tokenizer=encoder, max_prompt_tokens=2)
             with path.open("a") as handle:
                 handle.write(json.dumps({"prompt_ids": [1]}) + "\n")
-            with self.assertWarnsRegex(UserWarning, "skipped"):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", UserWarning)
                 records = load_jsonl(path, tokenizer=encoder, max_prompt_tokens=2,
                                      length_policy="skip")
+            self.assertEqual(len(caught), 1)
+            self.assertTrue(issubclass(caught[0].category, UserWarning))
+            self.assertRegex(str(caught[0].message), "skipped")
             self.assertEqual([r.prompt_ids for r in records], [[1]])
             with self.assertRaisesRegex(ValueError, "exactly one"):
                 PromptRecord.from_mapping({"prompt_ids": [1], "prompt": "ambiguous"}, tokenizer=encoder)

@@ -28,7 +28,7 @@ Rollout transport and lifecycle checks:
 ```bash
 python3 -m unittest discover -s tests -p 'test_generic_vllm_rl.py' -v
 python3 -m unittest discover -s tests -p 'test_vllm_controller.py' -v
-python3 -m unittest discover -s tests/rollout_terminal -p 'test_automatic_artifacts.py' -v
+python3 -m unittest discover -s tests/rollout_terminal -t tests -p 'test_automatic_artifacts.py' -v
 node --test tests/rollout_terminal/test_relay_artifacts.mjs
 ```
 

@@ -157,9 +157,11 @@ class TrainingFileRelayTests(unittest.IsolatedAsyncioTestCase):
     async def test_browser_hook_captures_actual_tokens_before_harbor_action_parsing(self):
         contract = training_contract()
         identity = "d" * 32
+        expected_acks = []
         class Relay:
             request_ids = []
-            def __init__(self, *args): pass
+            def __init__(self, *args, expected_policy_ack):
+                expected_acks.append(expected_policy_ack)
             async def generate(self, payload, timeout, request_id=None):
                 self.request_ids.append(request_id or identity)
                 return completion(payload, self.request_ids[-1], contract)
@@ -169,6 +171,8 @@ class TrainingFileRelayTests(unittest.IsolatedAsyncioTestCase):
             with patch("rollout_manager.terminal_bench.harbor_filerelay_agent.AsyncFileRelay", Relay):
                 relay = transport.harbor_relay(root)
                 await relay.generate(request(), 360, request_id=identity)
+            self.assertEqual(expected_acks, [{key: getattr(contract.policy, key)
+                                             for key in ("version", "digest", "lineage")}])
             self.assertEqual(transport.training_traces[0].request_id, identity)
             saved = json.loads((root / (identity + ".training.json")).read_text())
             self.assertEqual(saved["action_token_ids"], [30, 40])
