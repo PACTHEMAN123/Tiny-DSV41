@@ -149,9 +149,10 @@ if triton is not None:
         streams,
         weights,
         grad_streams,
-        grad_weights,
+        grad_weight_partials,
         rows,
         hidden: tl.constexpr,
+        parts: tl.constexpr,
         block: tl.constexpr,
     ):
         row = tl.program_id(0)
@@ -170,8 +171,8 @@ if triton is not None:
                 gradient * weight,
                 mask=mask,
             )
-            tl.atomic_add(
-                grad_weights + row * 4 + stream,
+            tl.store(
+                grad_weight_partials + (row * 4 + stream) * parts + tl.program_id(1),
                 tl.sum(gradient * value.to(tl.float32), axis=0),
                 mask=row < rows,
             )
@@ -218,10 +219,11 @@ if triton is not None:
         residual_weights,
         grad_value,
         grad_residual,
-        grad_output_weights,
-        grad_residual_weights,
+        grad_output_weight_partials,
+        grad_residual_weight_partials,
         rows,
         hidden: tl.constexpr,
+        parts: tl.constexpr,
         block: tl.constexpr,
     ):
         row = tl.program_id(0)
@@ -258,30 +260,31 @@ if triton is not None:
                 residual_base + source * hidden, mask=mask, other=0.0
             ).to(tl.float32)
             for target in tl.static_range(4):
-                tl.atomic_add(
-                    grad_residual_weights + row * 16 + source * 4 + target,
+                tl.store(
+                    grad_residual_weight_partials
+                    + (row * 16 + source * 4 + target) * parts + tl.program_id(1),
                     tl.sum(residual_value * gradients[target], axis=0),
                     mask=row < rows,
                 )
 
         branch = branch.to(tl.float32)
-        tl.atomic_add(
-            grad_output_weights + row * 4,
+        tl.store(
+            grad_output_weight_partials + (row * 4) * parts + tl.program_id(1),
             tl.sum(branch * grad0, axis=0),
             mask=row < rows,
         )
-        tl.atomic_add(
-            grad_output_weights + row * 4 + 1,
+        tl.store(
+            grad_output_weight_partials + (row * 4 + 1) * parts + tl.program_id(1),
             tl.sum(branch * grad1, axis=0),
             mask=row < rows,
         )
-        tl.atomic_add(
-            grad_output_weights + row * 4 + 2,
+        tl.store(
+            grad_output_weight_partials + (row * 4 + 2) * parts + tl.program_id(1),
             tl.sum(branch * grad2, axis=0),
             mask=row < rows,
         )
-        tl.atomic_add(
-            grad_output_weights + row * 4 + 3,
+        tl.store(
+            grad_output_weight_partials + (row * 4 + 3) * parts + tl.program_id(1),
             tl.sum(branch * grad3, axis=0),
             mask=row < rows,
         )
@@ -377,19 +380,23 @@ class _Collapse(torch.autograd.Function):
         rows, _, hidden = streams.shape
         grad_output = grad_output.contiguous().view(rows, hidden)
         grad_streams = torch.empty_like(streams)
-        grad_weights = torch.zeros_like(weights)
         block = 256
-        _collapse_backward_kernel[(rows, triton.cdiv(hidden, block))](
+        parts = triton.cdiv(hidden, block)
+        # One FP32 slot per CTA; reduce the fixed final dimension after launch.
+        partials = torch.empty((rows, 4, parts), device=streams.device, dtype=torch.float32)
+        _collapse_backward_kernel[(rows, parts)](
             grad_output,
             streams,
             weights,
             grad_streams,
-            grad_weights,
+            partials,
             rows,
             hidden=hidden,
+            parts=parts,
             block=block,
             num_warps=8,
         )
+        grad_weights = partials.sum(-1, dtype=torch.float32).to(weights.dtype)
         return grad_streams.view(*ctx.leading, 4, hidden), grad_weights.view(*ctx.leading, 4)
 
 
@@ -426,10 +433,11 @@ class _Expand(torch.autograd.Function):
         grad_output = grad_output.contiguous().view(rows, 4, hidden)
         grad_value = torch.empty_like(value)
         grad_residual = torch.empty_like(residual)
-        grad_output_weights = torch.zeros_like(output_weights)
-        grad_residual_weights = torch.zeros_like(residual_weights)
         block = 256
-        _expand_backward_kernel[(rows, triton.cdiv(hidden, block))](
+        parts = triton.cdiv(hidden, block)
+        output_partials = torch.empty((rows, 4, parts), device=value.device, dtype=torch.float32)
+        residual_partials = torch.empty((rows, 16, parts), device=value.device, dtype=torch.float32)
+        _expand_backward_kernel[(rows, parts)](
             grad_output,
             value,
             residual,
@@ -437,13 +445,16 @@ class _Expand(torch.autograd.Function):
             residual_weights,
             grad_value,
             grad_residual,
-            grad_output_weights,
-            grad_residual_weights,
+            output_partials,
+            residual_partials,
             rows,
             hidden=hidden,
+            parts=parts,
             block=block,
             num_warps=8,
         )
+        grad_output_weights = output_partials.sum(-1, dtype=torch.float32).to(output_weights.dtype)
+        grad_residual_weights = residual_partials.sum(-1, dtype=torch.float32).to(residual_weights.dtype)
         return (
             grad_value.view(*ctx.leading, hidden),
             grad_residual.view(*ctx.leading, 4, hidden),

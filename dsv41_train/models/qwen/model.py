@@ -221,7 +221,13 @@ class Qwen3MoeExperts(nn.Module):
             selected_experts,
             weights,
         )
-        output = torch.zeros_like(hidden)
+        if hidden.shape[0] == 0:
+            anchor = self.gate_up_proj.flatten()[0] + self.down_proj.flatten()[0]
+            # Keep both dispatch backwards live on empty owners, including
+            # frozen experts, and materialize zero local expert gradients.
+            output = hidden + weights.sum().to(hidden.dtype) * 0 + anchor.to(hidden.dtype) * 0
+        else:
+            output = torch.zeros_like(hidden)
         for expert_id in selected_experts.unique():
             token_id = torch.where(selected_experts == expert_id)[0]
             current = hidden[token_id]

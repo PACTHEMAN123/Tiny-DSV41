@@ -164,7 +164,13 @@ if triton is not None:
         grad_query,
         grad_kv,
         grad_compressed_kv,
-        grad_sinks,
+        grad_sink_partials,
+        edge_values,
+        chunk_start,
+        chunk_length: tl.constexpr,
+        chunk_capacity: tl.constexpr,
+        head_blocks: tl.constexpr,
+        ORDERED_KV: tl.constexpr,
         sequence_length: tl.constexpr,
         kv_length: tl.constexpr,
         compressed_length: tl.constexpr,
@@ -179,8 +185,13 @@ if triton is not None:
     ):
         sequence_row = tl.program_id(0)
         head_block = tl.program_id(1)
-        batch = sequence_row // sequence_length
-        sequence = sequence_row - batch * sequence_length
+        if ORDERED_KV:
+            batch = sequence_row // chunk_length
+            local_sequence = sequence_row - batch * chunk_length
+            sequence = chunk_start + local_sequence
+        else:
+            batch = sequence_row // sequence_length
+            sequence = sequence_row - batch * sequence_length
         head_offsets = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
         dim_offsets = tl.arange(0, BLOCK_D)
         valid_heads = head_offsets < heads
@@ -199,8 +210,8 @@ if triton is not None:
         lse = tl.load(logsumexp + lse_offsets, mask=valid_heads, other=0.0)
         sink = tl.load(sinks + head_offsets, mask=valid_heads, other=0.0).to(tl.float32)
         sink_probability = tl.exp(sink - lse)
-        tl.atomic_add(
-            grad_sinks + head_offsets,
+        tl.store(
+            grad_sink_partials + lse_offsets,
             -sink_probability * delta,
             mask=valid_heads,
         )
@@ -242,11 +253,23 @@ if triton is not None:
             dq += tl.dot(grad_scores.to(values.dtype), values) * scale
             grad_values = tl.dot(tl.trans(probabilities.to(do.dtype)), do)
             grad_values += tl.dot(tl.trans(grad_scores.to(q.dtype)), q) * scale
-            tl.atomic_add(
-                grad_kv + kv_offsets,
-                grad_values,
-                mask=candidate_valid[:, None] & valid_dims[None, :],
-            )
+            if ORDERED_KV:
+                edge_offsets = (
+                    (((batch.to(tl.int64) * chunk_capacity + local_sequence) * (window + selected)
+                      + 0 + candidate_offsets[:, None]) * head_blocks + head_block)
+                    * head_dim + dim_offsets[None, :]
+                )
+                tl.store(
+                    edge_values + edge_offsets,
+                    grad_values,
+                    mask=candidate_valid[:, None] & valid_dims[None, :],
+                )
+            else:
+                tl.atomic_add(
+                    grad_kv + kv_offsets,
+                    grad_values,
+                    mask=candidate_valid[:, None] & valid_dims[None, :],
+                )
 
         for start in range(0, selected, BLOCK_N):
             candidate_offsets = start + tl.arange(0, BLOCK_N)
@@ -279,11 +302,23 @@ if triton is not None:
             dq += tl.dot(grad_scores.to(values.dtype), values) * scale
             grad_values = tl.dot(tl.trans(probabilities.to(do.dtype)), do)
             grad_values += tl.dot(tl.trans(grad_scores.to(q.dtype)), q) * scale
-            tl.atomic_add(
-                grad_compressed_kv + kv_offsets,
-                grad_values,
-                mask=candidate_valid[:, None] & valid_dims[None, :],
-            )
+            if ORDERED_KV:
+                edge_offsets = (
+                    (((batch.to(tl.int64) * chunk_capacity + local_sequence) * (window + selected)
+                      + window + candidate_offsets[:, None]) * head_blocks + head_block)
+                    * head_dim + dim_offsets[None, :]
+                )
+                tl.store(
+                    edge_values + edge_offsets,
+                    grad_values,
+                    mask=candidate_valid[:, None] & valid_dims[None, :],
+                )
+            else:
+                tl.atomic_add(
+                    grad_compressed_kv + kv_offsets,
+                    grad_values,
+                    mask=candidate_valid[:, None] & valid_dims[None, :],
+                )
 
         tl.store(grad_query + query_offsets, dq, mask=tensor_mask)
 
@@ -365,7 +400,8 @@ class _SparseAttention(torch.autograd.Function):
         grad_query = torch.empty_like(query)
         grad_kv_fp32 = torch.zeros_like(kv, dtype=torch.float32)
         grad_compressed_fp32 = torch.zeros_like(compressed_kv, dtype=torch.float32)
-        grad_sinks = torch.zeros_like(sinks, dtype=torch.float32)
+        # Each query/head owns one partial; reduce in a fixed layout afterwards.
+        grad_sink_partials = torch.empty_like(logsumexp)
         block_h = 16
         block_n = 16
         block_d = triton.next_power_of_2(head_dim)
@@ -384,7 +420,13 @@ class _SparseAttention(torch.autograd.Function):
             grad_query,
             grad_kv_fp32,
             grad_compressed_fp32,
-            grad_sinks,
+            grad_sink_partials,
+            None,
+            chunk_start=0,
+            chunk_length=sequence_length,
+            chunk_capacity=sequence_length,
+            head_blocks=triton.cdiv(heads, block_h),
+            ORDERED_KV=False,
             sequence_length=sequence_length,
             kv_length=kv.shape[1],
             compressed_length=compressed_kv.shape[1],
@@ -406,8 +448,20 @@ class _SparseAttention(torch.autograd.Function):
             None,
             grad_compressed_fp32.to(compressed_kv.dtype),
             None,
-            grad_sinks.to(sinks.dtype),
+            grad_sink_partials.sum(dim=(0, 2), dtype=torch.float32).to(sinks.dtype),
         )
+
+
+class _OrderedSparseAttention(torch.autograd.Function):
+    # The chosen autograd class fixes the policy at forward time, including when
+    # the caller changes the global deterministic setting before backward.
+    forward = staticmethod(_SparseAttention.forward)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        from .ordered_kv import ordered_backward
+
+        return ordered_backward(ctx, grad_output)
 
 
 def sparse_attention(
@@ -418,8 +472,10 @@ def sparse_attention(
     compressed_kv: torch.Tensor | None,
     compressed_indices: torch.Tensor | None,
     sinks: torch.Tensor,
+    *,
+    deterministic: bool = False,
 ) -> torch.Tensor:
-    """Apply fused sparse attention without materializing score tensors."""
+    """Apply sparse attention; optionally use fixed-order KV-gradient reductions."""
 
     if triton is None:
         raise RuntimeError("Triton attention requires Triton")
@@ -447,7 +503,12 @@ def sparse_attention(
     if compressed_indices.shape[:2] != (batch, sequence_length):
         raise ValueError("compressed indices do not match query dimensions")
 
-    return _SparseAttention.apply(
+    function = (
+        _OrderedSparseAttention
+        if deterministic or torch.are_deterministic_algorithms_enabled()
+        else _SparseAttention
+    )
+    return function.apply(
         query.contiguous(),
         kv.contiguous(),
         window_indices.to(torch.int32).contiguous(),

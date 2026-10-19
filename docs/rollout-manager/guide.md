@@ -2,9 +2,8 @@
 
 New RL runs use vLLM for rollout inference and native PyTorch for learning.
 The current vLLM training adapter supports flat, unquantized Qwen3 MoE in
-BF16 with `lm_head` training. DeepSeek vLLM activation is not supported and
-fails before learner allocation; `--rollout-engine native-pytorch` explicitly
-selects the legacy compatibility route.
+BF16 with `lm_head` training. DeepSeek vLLM LoRA uses the separate [distributed learner/service](../distributed-deepseek-grpo.md).
+`--rollout-engine native-pytorch` explicitly selects local native compatibility.
 
 ## Environment and ownership
 
@@ -25,7 +24,7 @@ Base dependencies are in `pyproject.toml`, including Transformers
 `>=4.57.6,<6` and `tomli` on Python 3.10. The `rollout-vllm` extra pins
 vLLM 0.31.0, whose Transformers requirement narrows that range to
 `>=5.10.4,<5.18`; inspect the actual serving environment before installation.
-The measured actor used Transformers 5.17.0. The Harbor executor uses Python 3.12
+The Harbor executor uses Python 3.12
 or newer and the pinned `rollout-terminal` extra. Provision those dependencies
 in the existing executor environment; a containerized GPU machine does not
 imply host Docker or Pouch privileges.
@@ -38,7 +37,7 @@ disjoint learner/actor GPU UUIDs explicitly; the backend checks physical
 identity before model allocation. Preserve unrelated processes. Use new private
 output directories, and do not start a second actor or relay over a live run.
 
-For the qualified 30B Qwen profile, one dedicated actor GPU needs room for the
+For the 30B Qwen profile, one dedicated actor GPU needs room for the
 model, the fixed 32 GiB KV cache and graph allocations. The learner needs its
 own GPU allocation for the frozen backbone, 311,164,928 head parameters and
 optimizer state. Full mounted context is preserved; fitting a short prompt
@@ -55,7 +54,7 @@ and `ACTOR_GPU_UUID` to the inspected free devices. Choose a new `RUN_DIR`.
 CUDA_VISIBLE_DEVICES="$LEARNER_GPU_UUID,$ACTOR_GPU_UUID" \
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
 python -m dsv41_train.rl.train \
-  --model-dir /mnt/fuse/Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --model-dir /path/to/Qwen3-30B-A3B-Instruct-2507 \
   --data examples/rl/qwen-diagnostic-train.jsonl \
   --config examples/rl/qwen-head.json \
   --max-steps 1 --output-dir "$RUN_DIR/training"
@@ -64,7 +63,7 @@ python -m dsv41_train.rl.train \
 For task training, supply a disjoint train/evaluation dataset and a reward
 function through the existing RL data interface. Token JSONL uses
 `prompt_ids`; text JSONL uses `messages` or `prompt`, with the model's mounted
-tokenizer/chat template. See the existing [RL text-data description](../../README.md#text-data-task-rewards-and-evaluation)
+tokenizer/chat template. See the existing [RL text-data description](../rl.md#text-data-task-rewards-and-evaluation)
 for examples. Do not replace the mounted tokenizer or drop prior tool messages
 to fit a context limit. Length violations follow the configured error/skip
 policy, never silent history truncation.
@@ -99,7 +98,7 @@ Resume with the original model/data/config identities:
 CUDA_VISIBLE_DEVICES="$LEARNER_GPU_UUID,$ACTOR_GPU_UUID" \
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 python -m dsv41_train.rl.train \
-  --model-dir /mnt/fuse/Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --model-dir /path/to/Qwen3-30B-A3B-Instruct-2507 \
   --data examples/rl/qwen-diagnostic-train.jsonl \
   --config examples/rl/qwen-head.json \
   --resume "$RUN_DIR/training/step-00000001.pt" \
@@ -133,7 +132,7 @@ Prepare a versioned CPU workflow config with these relationships:
 | `terminal_bench.serving_profile` | `vllm-training-v1` |
 | `terminal_bench.execution_profile` | `training` |
 | `terminal_bench.relay_root` | This run's existing CPU relay root |
-| `terminal_bench.agent_max_turns` | Explicit optional 1..1024; default 128; quick experiment used 16 |
+| `terminal_bench.agent_max_turns` | Explicit optional 1..1024; default 128 |
 
 Keep the original 360-second generation deadline, 30-second shell deadline
 and task/verifier budgets. Tool calls per turn are uncapped. Multi-turn is
@@ -162,7 +161,7 @@ leave `training`, `group-0` and `evaluation-1` absent.
 CUDA_VISIBLE_DEVICES="$LEARNER_GPU_UUID,$ACTOR_GPU_UUID" \
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
 python -m examples.rl.terminalbench_vllm_a \
-  --model-dir /mnt/fuse/Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --model-dir /path/to/Qwen3-30B-A3B-Instruct-2507 \
   --capsule "$A_RUN/cpu-public-capsule.json" \
   --task-ids sparql-university --group-size 8 \
   --agent-max-turns 16 \
@@ -258,12 +257,12 @@ A pending phase claim after a crash is never automatically relaunched. A
 terminal exclusion remains evidence and stops admission without inventing
 reward zero. The fresh singleton evaluation is not another training update.
 
-## Inspect completion and recover safely
+## Completion and recovery
 
 Retain generation `.sampled.json` receipts, exact raw relay request/response
 records, `.training.json` turn evidence, original verifier/cleanup results,
 group seals, import receipts, learner metrics, policy artifacts, activation
-readback, stage timings and final owned-process shutdown receipts. Confirm:
+readback and owned-process shutdown receipts. Confirm:
 
 1. Every group member has original eligible verifier reward, complete action
    evidence and cleanup; all turns bind the same behavior policy.
@@ -290,7 +289,7 @@ v0 and consumes the already eligible sealed group exclusively; it does not
 resample or relabel it. After a committed step, do not use that recovery mode
 to repeat optimization.
 
-## Local checks and measurement scope
+## Local checks
 
 Run focused contracts before hardware tests:
 
@@ -305,8 +304,5 @@ The Terminal-Bench A wrapper's mounted qualification checks actual graph
 capture/replay, actor/learner head identity, 128 real sampled tokens and a
 finite native replay gradient without optimizing. It reports cross-engine
 probability differences honestly; it does not gate them on false equality.
-Fixture tests are not CUDA or live benchmark qualification. A short public
-decode rate is not task throughput, and a zero-gradient step is not a learner
-throughput estimate for nonzero objectives. See the
-[implementation report](implementation.md) for the completed measured cycle
-and its limitations.
+Fixture tests do not validate full-model GPU capacity or task quality. See the
+[lifecycle contract](implementation.md) for policy and delivery guarantees.

@@ -20,6 +20,8 @@ class DispatchMetadata:
     rank_major_order: torch.Tensor | None = None
     send_splits: list[int] | None = None
     recv_splits: list[int] | None = None
+    topk: int = 1
+    inverse_order: torch.Tensor | None = None
 
 
 class TokenDispatcher:
@@ -47,17 +49,18 @@ class TokenDispatcher:
         order = torch.argsort(flat_ids, stable=True)
         token_indices = torch.div(order, topk, rounding_mode="floor")
         counts = torch.bincount(flat_ids, minlength=self.num_experts).to(torch.int32)
-        metadata = DispatchMetadata(hidden.shape[0], token_indices)
+        metadata = DispatchMetadata(
+            hidden.shape[0], token_indices, topk=topk, inverse_order=torch.argsort(order)
+        )
         return hidden[token_indices], counts, weights.reshape(-1)[order], metadata
 
     def combine(self, hidden: torch.Tensor, metadata: DispatchMetadata) -> torch.Tensor:
-        output = torch.zeros(
-            metadata.token_count,
-            hidden.shape[-1],
-            device=hidden.device,
-            dtype=torch.float32,
-        )
-        return output.index_add(0, metadata.token_indices, hidden.float())
+        assert metadata.inverse_order is not None
+        # Restore each token's router-slot order before reducing; repeated-index
+        # scatter addition can otherwise sum expert contributions in any order.
+        return hidden[metadata.inverse_order].reshape(
+            metadata.token_count, metadata.topk, hidden.shape[-1]
+        ).sum(dim=1, dtype=torch.float32)
 
 
 class AllToAllTokenDispatcher(TokenDispatcher):
@@ -121,6 +124,8 @@ class AllToAllTokenDispatcher(TokenDispatcher):
             rank_major_order=torch.argsort(expert_order),
             send_splits=send_splits,
             recv_splits=recv_splits,
+            topk=topk,
+            inverse_order=torch.argsort(order),
         )
         return (
             routed_hidden[expert_order],
@@ -138,13 +143,7 @@ class AllToAllTokenDispatcher(TokenDispatcher):
             metadata.send_splits,
             metadata.recv_splits,
         )
-        output = torch.zeros(
-            metadata.token_count,
-            returned.shape[-1],
-            device=returned.device,
-            dtype=torch.float32,
-        )
-        return output.index_add(0, metadata.token_indices, returned.float())
+        return super().combine(returned, metadata)
 
     @staticmethod
     def _expert_major_order(counts: torch.Tensor, total: int) -> torch.Tensor:

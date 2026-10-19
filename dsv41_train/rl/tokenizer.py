@@ -275,11 +275,30 @@ class ModelTokenizer:
         return self._encode_template(messages, tools=tools, **options)
 
 
-    def _encode_template(self, messages, **template_kwargs):
+    def encode_completion(self, messages: list[dict], answer: str, *,
+                          chat_template_kwargs: dict | None = None) -> tuple[list[int], list[int]]:
+        """Return generation prompt and completed conversation IDs for text SFT.
+
+        Both use the checkpoint template. A template or tokenization boundary
+        that changes the prompt when the answer is appended is rejected rather
+        than silently assigning incorrect response labels.
+        """
+        if not isinstance(answer, str) or not answer.strip():
+            raise ValueError("answer must be a nonempty string")
+        prompt_ids = self.encode_conversation(messages, chat_template_kwargs=chat_template_kwargs)
+        completed = [*messages, {"role": "assistant", "content": answer}]
+        full_ids = self._encode_template(
+            completed, add_generation_prompt=False, **(chat_template_kwargs or {}),
+        )
+        if full_ids[:len(prompt_ids)] != prompt_ids:
+            raise ValueError("completed conversation does not preserve the generation prompt token prefix")
+        return prompt_ids, full_ids
+
+    def _encode_template(self, messages, *, add_generation_prompt=True, **template_kwargs):
         try:
             ids = self._tokenizer.apply_chat_template(
                 messages, chat_template=self._template_source, tokenize=True,
-                add_generation_prompt=True, padding=False, truncation=False,
+                add_generation_prompt=add_generation_prompt, padding=False, truncation=False,
                 return_dict=False, **template_kwargs,
             )
         except (TemplateError, TypeError, ValueError) as error:

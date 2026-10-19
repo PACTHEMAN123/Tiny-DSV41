@@ -19,7 +19,6 @@ dependencies = [
 [project.optional-dependencies]
 rollout-vllm = ["vllm==0.31.0"]
 rollout-datasets = ["pyarrow>=15"]
-rollout-report = ["matplotlib>=3.7"]
 rollout-terminal = ["harbor @ git+https://github.com/harbor-framework/harbor.git@3c82380859d187957cfd5cd64802b076d9779550 ; python_version >= '3.12'"]
 
 [project.scripts]
@@ -30,6 +29,7 @@ include = ["dsv41_train*", "rollout_manager*"]
 
 [tool.setuptools.package-data]
 dsv41_train = ["models/*/*.json"]
+"dsv41_train.rl" = ["_native_runtime/*/source-manifest.json", "_native_runtime/README.md"]
 rollout_manager = ["data/*.json"]
 "rollout_manager.terminal_bench" = ["data/*.json"]
 "rollout_manager.terminal_bench.browser_relay" = ["relay.html"]

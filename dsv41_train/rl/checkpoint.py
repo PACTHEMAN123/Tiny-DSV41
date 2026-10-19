@@ -27,6 +27,21 @@ def file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def add_engram_identity(identity, config):
+    if config.train_engram or config.initial_engram_delta is not None:
+        identity["engram"] = {"trainable": config.train_engram, "dtype": config.dtype,
+            "seed": config.seed, "optimizer": config.optimizer,
+            "initial_delta_sha256": file_sha256(config.initial_engram_delta)
+                if config.initial_engram_delta is not None else None}
+    return identity
+
+
+def add_sft_identity(identity, source):
+    if source is not None:
+        identity["initial_sft_checkpoint"] = dict(source.identity)
+    return identity
+
+
 def atomic_save(payload: dict, destination: str | Path) -> None:
     """Readers see a complete old or new file, never a partially written snapshot."""
     destination = Path(destination)
@@ -45,15 +60,40 @@ def atomic_save(payload: dict, destination: str | Path) -> None:
 
 
 def policy_state(model) -> dict:
-    return {
+    state = {
         "trainable": model.trainable_state_dict(),
         "frozen": model.frozen_state_dict(include_engram=False),
     }
+    if getattr(model, "lora_metadata", None) is not None:
+        state.update(adapter_format=1, adapter=model.lora_metadata)
+    if getattr(model, "engram_state", None) is not None:
+        state["engram_delta"] = model.engram_state.state_dict()
+    if getattr(model, "initial_sft_identity", None) is not None:
+        state["initial_sft_checkpoint"] = model.initial_sft_identity
+    return state
 
 
 def load_policy(model, state: dict) -> None:
+    if state.get("initial_sft_checkpoint") != getattr(model, "initial_sft_identity", None):
+        raise ValueError("policy initial SFT checkpoint identity differs")
+    engram = getattr(model, "engram_state", None)
+    if (engram is not None) != ("engram_delta" in state):
+        raise ValueError("policy Engram delta presence differs from the configured baseline")
+    if engram is not None:
+        engram.validate(state["engram_delta"])
+    metadata = getattr(model, "lora_metadata", None)
+    if metadata is not None or "adapter_format" in state:
+        required = {"trainable", "frozen", "adapter_format", "adapter"}
+        if (not required.issubset(state)
+                or state.keys() - required - {"version", "lineage", "identity", "sampling", "engram_delta"}
+                or state["adapter_format"] != 1 or metadata is None or state["adapter"] != metadata):
+            raise ValueError("LoRA policy configuration or initial adapter identity differs")
+        if state["frozen"]:
+            raise ValueError("LoRA policy artifacts must not include frozen base weights")
     model.load_trainable_state_dict(state["trainable"])
     model.load_frozen_state_dict(state["frozen"], include_engram=False)
+    if engram is not None:
+        engram.load_state_dict(state["engram_delta"])
     model.assert_engram_invariants()
 
 
@@ -66,6 +106,10 @@ def publish_policy_artifact(model, version: int, directory: str | Path, *,
     """Stage immutable weights; a consumer must explicitly activate this artifact."""
     if type(version) is not int or version < 0 or not isinstance(lineage, str) or not lineage:
         raise ValueError("policy artifact requires a nonnegative version and run lineage")
+    if getattr(model, "lora_metadata", None) is not None and identity.get("lora") != model.lora_metadata:
+        raise ValueError("policy publication LoRA identity differs from loaded model")
+    if identity.get("initial_sft_checkpoint") != getattr(model, "initial_sft_identity", None):
+        raise ValueError("policy publication initial SFT checkpoint identity differs")
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     payload = {"version": version, "lineage": lineage, "identity": identity,
@@ -126,6 +170,15 @@ def run_identity(model_dir: str | Path, data_path: str | Path, random_init: bool
         identity["text_assets_sha256"] = assets
     if eval_data_path is not None:
         identity["eval_data_sha256"] = hashlib.sha256(Path(eval_data_path).read_bytes()).hexdigest()
+    return identity
+
+
+def add_lora_identity(identity, config, model_config):
+    """Bind the initial SFT adapter and random-base seed to every policy version."""
+    if config.trainable_scope == "lora":
+        from .family import lora_metadata, policy_lora_config
+        identity.update(trainable_scope="lora", initialization_seed=config.seed,
+                        lora=lora_metadata(policy_lora_config(config, model_config), config.initial_adapter))
     return identity
 
 
@@ -203,7 +256,7 @@ def load_training_checkpoint(path, model, optimizer, config, identity) -> dict:
     validate_identity(state["identity"], identity)
     mutable = {"max_steps", "output_dir", "checkpoint_interval", "worker_timeout_seconds",
                "learner_devices", "rollout_devices", "num_threads", "engram_offload",
-               "eval_interval", "log_samples_per_step", "gradient_checkpointing"}
+               "eval_interval", "log_samples_per_step", "gradient_checkpointing", "engram_cache_mib"}
     current = json.loads(json.dumps(config.to_dict()))
     previous = json.loads(json.dumps(checkpoint_config(state["config"], model.config,
         rollout_engine=state["identity"].get("rollout_engine")).to_dict()))
