@@ -9,8 +9,9 @@ and adapter export. This entry point is separate from the local RL manager.
 
 - Complete DeepSeek V4.1 decoder backbone; frozen learner weights materialized
   in BF16, with layerwise loading and activation checkpointing.
-- Query `attention.q_a` LoRA only: rank 8, alpha 8, dropout 0. AdamW updates
-  adapters with zero weight decay. Engram tables remain frozen.
+- Query `attention.q_a` LoRA: configurable rank, alpha and backbone layer
+  selection, defaulting to rank 8, alpha 8 on all layers. Dropout stays zero.
+  AdamW updates adapters with zero weight decay. Engram tables remain frozen.
 - A complete G32 rollout is enqueued while scheduling is paused, then scheduling
   resumes after all requests are admitted. Prefill can still use multiple chunks;
   learner microbatching is configured separately.
@@ -82,6 +83,42 @@ python3 -m torch.distributed.run \
   --rollout-correction decoupled-token-tis --rollout-is-cap 2 \
   --disable-prefetch --kl-beta 0
 ```
+
+## Adapter configuration
+
+Pass the same adapter flags to the rollout service and both learner launches:
+
+```bash
+--lora-rank 16 --lora-alpha 32 --lora-layers 0,1,2,3
+```
+
+`--lora-rank` accepts 8, 16, 32, 64 or 128. `--lora-alpha` is positive and finite;
+the adapter contribution is scaled by `alpha / rank`. `--lora-layers` accepts
+`all` (the default) or distinct, comma-separated, zero-based layer indices.
+The service rejects a learner configuration that differs from its own before
+starting an actor. Adapter publication also validates the configured tensor
+inventory, rank and alpha. Settings remain fixed for the service's lifetime.
+
+vLLM folds `alpha / rank` into BF16 adapter B weights; the native learner applies
+it after the adapter projection. These can round differently, so the initial
+log-probability admission check and the selected rollout correction still apply.
+
+The supported target is the attention query down-projection, `attention.q_a`
+in the learner and `attn.wq_a` in vLLM. Other projections and nonzero dropout
+are not exposed by this distributed runner. The base model stays frozen.
+
+For the mounted 5120-to-1280 projection, the number of trainable parameters is
+`selected_layers * rank * (5120 + 1280)`:
+
+| Configuration | Trainable parameters |
+| --- | ---: |
+| Rank 8, all 40 layers (experiment default) | 2,048,000 |
+| Rank 16, all 40 layers | 4,096,000 |
+| Rank 16, layers 0,1,2,3 | 409,600 |
+
+The run summary records the effective adapter configuration and parameter count.
+Larger ranks increase adapter, optimizer and serving memory; CPU regression
+coverage does not establish capacity on the deployed GPUs.
 
 ## Batching and objective
 

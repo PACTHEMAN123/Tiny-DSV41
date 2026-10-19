@@ -25,6 +25,7 @@ from .algorithm import (decoupled_token_tis_loss, group_advantages, grpo_loss,
                         response_log_probs, response_log_probs_batch)
 from .gsm8k import DATASET_REVISION, formatting_correct, prepare_data, wilson_interval
 from .learner_batch_planner import parse_learner_batch_shapes, plan_learner_microbatches
+from .lora_config import DistributedLoRAConfig, SUPPORTED_LORA_RANKS, parse_lora_layers
 from .lora_export import export_q_a_update
 from .native_lora import (adapter_snapshot, default_native_source, gradient_norm,
                           load_distributed_learner, reference_base, verify_optimizer_step)
@@ -311,6 +312,14 @@ def train_group(model, optimizer, gradient_policy, results, advantages, args, up
 def run(args):
     """Train query adapters, synchronize every update, and compare held-out scores."""
     parse_learner_batch_shapes(args.learner_batch_shapes)
+    layers = getattr(args, "lora_layers", None)
+    if isinstance(layers, str):
+        layers = parse_lora_layers(layers)
+    lora_config = DistributedLoRAConfig(rank=getattr(args, "lora_rank", 8),
+        alpha=getattr(args, "lora_alpha", 8.0), layers=layers)
+    # This deployment loads all 40 layers; reject invalid selection before CUDA,
+    # distributed initialization, or a remote rollout process can be started.
+    lora_config.selected_layers(40)
     correction = validate_correction_configuration(args)
     if (not 1 <= args.updates <= args.max_groups <= 7473 or args.group_size != 32
             or not 1 <= args.eval_questions <= 1319
@@ -329,7 +338,8 @@ def run(args):
     rank = int(os.environ.get("RANK", "0"))
     output = Path(args.output_dir).resolve()
     started = time.monotonic()
-    summary = {"status": "started", "optimizer_updates": 0, "acknowledged_updates": 0}
+    summary = {"status": "started", "optimizer_updates": 0, "acknowledged_updates": 0,
+               "adapter_configuration": lora_config.to_dict()}
     client = model = executor = None
     output_created = False
     try:
@@ -342,24 +352,33 @@ def run(args):
             device_id=torch.device("cuda", int(os.environ["LOCAL_RANK"])))
         rank_zero_call(lambda: output.mkdir(mode=0o700, parents=True, exist_ok=False))
         output_created = rank == 0
-        model, optimizer, gradients, runtime, native = load_distributed_learner(
-            args.model_dir, args.native_source, seed=args.seed)
-        for group in optimizer.param_groups:
-            group["lr"] = args.learning_rate
         identity = {key: hashlib.sha256((Path(args.model_dir) / name).read_bytes()).hexdigest()
             for key, name in (("config_sha256", "config.json"), ("index_sha256", "model.safetensors.index.json"))}
         identities = [None] * dist.get_world_size()
-        dist.all_gather_object(identities, {"base": identity, "native": native, "data": data,
-            "torch": torch.__version__, "configuration": semantic_configuration(args)})
+        dist.all_gather_object(identities, {"base": identity, "data": data,
+            "torch": torch.__version__, "configuration": semantic_configuration(args),
+            "lora_config": lora_config.to_dict()})
         if any(item != identities[0] for item in identities):
-            raise ValueError("learner ranks differ in source, data, base identity, Torch, or configuration")
+            raise ValueError("learner ranks differ in data, base identity, Torch, or configuration")
         lineage = rank_zero_call(lambda: "gsm8k-grpo-" + uuid.uuid4().hex)
         if rank == 0:
             client = RemoteLoRAClient(args.rollout_host, args.rollout_port, token, timeout=7200)
             executor = ThreadPoolExecutor(max_workers=1)
-        startup = rank_zero_call(lambda: client.initialize())
+        startup = rank_zero_call(lambda: client.initialize(lora_config=lora_config.to_dict()))
         if startup["base_identity"] != identity:
             raise ValueError("rollout and learner mounted metadata identities differ")
+        if DistributedLoRAConfig.from_dict(startup["lora_config"]) != lora_config:
+            raise ValueError("rollout and learner LoRA configurations differ")
+        model, optimizer, gradients, runtime, native = load_distributed_learner(
+            args.model_dir, args.native_source, seed=args.seed, lora_config=lora_config)
+        sources = [None] * dist.get_world_size()
+        dist.all_gather_object(sources, native)
+        if any(item != sources[0] for item in sources):
+            raise ValueError("learner ranks differ in native source")
+        for group in optimizer.param_groups:
+            group["lr"] = args.learning_rate
+        summary["trainable_parameter_count"] = lora_config.parameter_count(
+            model.config.hidden_size, model.config.q_lora_rank, model.config.num_hidden_layers)
 
         def activate(version):
             packet = export_q_a_update(model, version=version, lineage=lineage,
@@ -482,6 +501,10 @@ def main():
     parser.add_argument("--learner-microbatch-size", type=int, choices=range(1, 33), default=4)
     parser.add_argument("--learner-batch-shapes", default=None,
                         help="explicit capacity-qualified B:T cells, e.g. 4:2047,8:1023; no OOM fallback")
+    parser.add_argument("--lora-rank", type=int, choices=SUPPORTED_LORA_RANKS, default=8)
+    parser.add_argument("--lora-alpha", type=float, default=8.0)
+    parser.add_argument("--lora-layers", type=parse_lora_layers, default=None, metavar="all|CSV",
+                        help="zero-based query projection layer indices; default: all layers")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-prompt-tokens", type=int, default=256)
     parser.add_argument("--max-new-tokens", type=int, default=256)

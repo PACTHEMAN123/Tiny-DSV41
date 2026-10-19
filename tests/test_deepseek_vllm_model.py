@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from dsv41_train.rl.lora_config import DistributedLoRAConfig
 
 from rollout_manager.backends.deepseek_v41_lora import (
     LORA_ARCHITECTURE, PACKED_MODULES_MAPPING, lora_target_modules, register_deepseek_v41_lora,
@@ -27,6 +28,7 @@ class DeepseekLoRAContractTests(unittest.TestCase):
             parallel_config=types.SimpleNamespace(pipeline_parallel_size=1),
             speculative_config=None,
             model_config=types.SimpleNamespace(hf_config=self.text),
+            additional_config={"rollout_manager_lora": DistributedLoRAConfig().to_dict()},
         )
 
     def test_exact_scope_and_both_config_layouts(self):
@@ -40,6 +42,24 @@ class DeepseekLoRAContractTests(unittest.TestCase):
             self.config.lora_config.target_modules = targets
             with self.assertRaises(ValueError):
                 validate_deployment(self.config)
+
+    def test_configured_subset_rank_and_exact_inventory(self):
+        profile = DistributedLoRAConfig(rank=16, alpha=32, layers=(1,))
+        self.config.additional_config["rollout_manager_lora"] = profile.to_dict()
+        self.config.lora_config.target_modules = lora_target_modules(self.text, profile)
+        self.config.lora_config.max_lora_rank = profile.rank
+        validate_deployment(self.config)
+        tensors = {self.module + ".lora_A.weight": torch.ones(16, 16, dtype=torch.bfloat16),
+                   self.module + ".lora_B.weight": torch.ones(8, 16, dtype=torch.bfloat16)}
+        self.assertEqual(validate_adapter_tensors(tensors, self.text, lora_config=profile),
+                         (self.module,))
+        for changed in (DistributedLoRAConfig(rank=8, layers=(1,)),
+                        DistributedLoRAConfig(rank=16, layers=(0,))):
+            with self.subTest(profile=changed), self.assertRaises(ValueError):
+                validate_adapter_tensors(tensors, self.text, lora_config=changed)
+        with self.assertRaisesRegex(ValueError, "overflows"):
+            validate_adapter_tensors(tensors, self.text,
+                                     lora_config=DistributedLoRAConfig(16, 1e41, (1,)))
 
     def test_installed_target_filter_excludes_standalone_engram_wkv(self):
         try:

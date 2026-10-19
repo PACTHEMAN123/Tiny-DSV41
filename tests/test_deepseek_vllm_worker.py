@@ -6,13 +6,14 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from dsv41_train.rl.lora_config import DistributedLoRAConfig
 
 
 class CPUWrapper:
-    def __init__(self):
+    def __init__(self, rank=8):
         self.tp_size, self.n_slices = 1, 2
-        self.lora_a_stacked = tuple(torch.zeros(2, 1, 8, 16, dtype=torch.bfloat16) for _ in range(2))
-        self.lora_b_stacked = tuple(torch.zeros(2, 1, output, 8, dtype=torch.bfloat16) for output in (8, 4))
+        self.lora_a_stacked = tuple(torch.zeros(2, 1, rank, 16, dtype=torch.bfloat16) for _ in range(2))
+        self.lora_b_stacked = tuple(torch.zeros(2, 1, output, rank, dtype=torch.bfloat16) for output in (8, 4))
 
 
 class DeepseekWorkerReadbackTests(unittest.TestCase):
@@ -68,6 +69,24 @@ class DeepseekWorkerReadbackTests(unittest.TestCase):
         self.manager.modules[self.names[0]] = type("UnexpectedSubclass", (CPUWrapper,), {})()
         with self.assertRaisesRegex(RuntimeError, "layout"):
             self.verify(self.manager, self.tensors, 7, self.text)
+
+    def test_configured_rank_subset_and_nonunit_alpha_readback(self):
+        profile = DistributedLoRAConfig(rank=16, alpha=24, layers=(1,))
+        wrapper = CPUWrapper(rank=16)
+        manager = types.SimpleNamespace(lora_index_to_id=[None, 7],
+                                        modules={self.names[1]: wrapper})
+        a = torch.arange(256).reshape(16, 16).to(torch.bfloat16) / 16
+        b = torch.arange(128).reshape(8, 16).to(torch.bfloat16) / 10
+        tensors = {self.source + ".lora_A.weight": a, self.source + ".lora_B.weight": b}
+        wrapper.lora_a_stacked[0][1, 0].copy_(a)
+        wrapper.lora_b_stacked[0][1, 0].copy_(b * 1.5)
+        receipt = self.verify(manager, tensors, 7, self.text, profile)
+        self.assertEqual(receipt["target_count"], 1)
+        for scale in (1.0, 2.25):
+            with self.subTest(scale=scale):
+                wrapper.lora_b_stacked[0][1, 0].copy_(b * scale)
+                with self.assertRaisesRegex(RuntimeError, "received tensor"):
+                    self.verify(manager, tensors, 7, self.text, profile)
 
 
 if __name__ == "__main__":

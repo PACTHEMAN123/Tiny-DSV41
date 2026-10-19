@@ -9,9 +9,11 @@ from .vllm_lora_ipc import configure_lora_ipc
 configure_lora_ipc()
 
 from .deepseek_v41_lora import (
-    LORA_ALPHA, LORA_RANK, LORA_TARGET_MODULE, register_deepseek_v41_lora,
-    text_dimensions, validate_adapter_tensors,
+    deployment_lora_config, lora_target_modules,
+    register_deepseek_v41_lora, text_dimensions, validate_adapter_manifest,
+    validate_adapter_tensors,
 )
+from dsv41_train.rl.lora_config import DistributedLoRAConfig
 from .vllm_lora_transport import policy_ack, unpack_update
 
 
@@ -26,19 +28,19 @@ def _no_checkpoint_loader(*args, **kwargs):
     raise RuntimeError("in-memory LoRA cache miss; checkpoint loading is forbidden")
 
 
-def verify_readback(manager, tensors, adapter_id, text_config):
+def verify_readback(manager, tensors, adapter_id, text_config, lora_config=None):
     """Check both packed slices, padding and every untouched target on this rank."""
     import torch
     from vllm.lora.layers.column_parallel_linear import MergedColumnParallelLinearWithLoRA
 
-    adapted = validate_adapter_tensors(tensors, text_config)
-    hidden, q_rank, head_dim, layers = text_dimensions(text_config)
+    profile = lora_config or DistributedLoRAConfig()
+    adapted = validate_adapter_tensors(tensors, text_config, lora_config=lora_config)
+    hidden, q_rank, head_dim, _ = text_dimensions(text_config)
     slots = [i for i, value in enumerate(manager.lora_index_to_id) if value == adapter_id]
     if len(slots) != 1:
         raise RuntimeError("adapter has no unique active GPU slot")
     slot = slots[0]
-    expected_names = {f"language_model.model.layers.{i}.attn.{LORA_TARGET_MODULE}"
-                      for i in range(layers)}
+    expected_names = set(lora_target_modules(text_config, profile))
     if set(manager.modules) != expected_names:
         raise RuntimeError("actual LoRA wrappers differ from the narrow DeepSeek profile")
     for name in sorted(expected_names):
@@ -51,18 +53,21 @@ def verify_readback(manager, tensors, adapter_id, text_config):
         a = tensors.get(source + ".lora_A.weight")
         b = tensors.get(source + ".lora_B.weight")
         for part, output in enumerate((q_rank, head_dim)):
-            for side, buffers, shape in (("A", module.lora_a_stacked, (LORA_RANK, hidden)),
-                                          ("B", module.lora_b_stacked, (output, LORA_RANK))):
+            for side, buffers, shape in (("A", module.lora_a_stacked, (profile.rank, hidden)),
+                                          ("B", module.lora_b_stacked, (output, profile.rank))):
                 actual = buffers[part][slot, 0].detach().cpu().contiguous()
                 if tuple(actual.shape) != shape or actual.dtype != torch.bfloat16:
                     raise RuntimeError("actual LoRA GPU buffer shape/dtype changed")
                 wanted = a if side == "A" else b
+                if wanted is not None and side == "B":
+                    # vLLM folds alpha/rank into BF16 B in LoRALayerWeights.optimize.
+                    wanted = wanted * (profile.alpha / profile.rank)
                 if part == 1 or wanted is None:
                     if torch.count_nonzero(actual).item() != 0:
                         raise RuntimeError("untouched DeepSeek LoRA buffer is nonzero")
                 elif not torch.equal(actual, wanted):
                     raise RuntimeError("actual LoRA GPU buffer differs from received tensor")
-    return {"adapted_modules": list(adapted), "target_count": layers, "slot": slot}
+    return {"adapted_modules": list(adapted), "target_count": len(expected_names), "slot": slot}
 
 
 
@@ -83,6 +88,7 @@ class DeepseekLoRAExtension:
         return worker_manager, manager, {**process_identity(), "device": str(device),
             "device_uuid": str(props.uuid), "device_name": props.name,
             "base_identity": base_identity(self.vllm_config.model_config.model),
+            "lora_config": deployment_lora_config(self.vllm_config).to_dict(),
             "checkpoint_loader_disabled": True}
 
     def rollout_manager_lora_call(self, operation, manifest=None, payload=None):
@@ -101,10 +107,10 @@ class DeepseekLoRAExtension:
         tensors = unpack_update(manifest, payload)
         if manifest["base_identity"] != receipt["base_identity"]:
             raise ValueError("LoRA base model identity differs from mounted worker assets")
-        if manifest["peft"] != {"r": LORA_RANK, "lora_alpha": LORA_ALPHA,
-                                "target_modules": ["wq_a"]}:
-            raise ValueError("unsupported DeepSeek LoRA PEFT configuration")
-        validate_adapter_tensors(tensors, self.vllm_config.model_config.hf_config)
+        profile = deployment_lora_config(self.vllm_config)
+        validate_adapter_manifest(manifest, self.vllm_config.model_config.hf_config, profile)
+        validate_adapter_tensors(tensors, self.vllm_config.model_config.hf_config,
+                                 lora_config=profile)
         previous = getattr(self, "_direct_lora_manifest", None)
         if previous is not None and (manifest["version"] != previous["version"] + 1
                 or manifest["adapter_id"] <= previous["adapter_id"]
@@ -125,7 +131,7 @@ class DeepseekLoRAExtension:
             manager.activate_adapter(adapter.id)
             manager.pin_adapter(adapter.id)
             verify_readback(manager, tensors, adapter.id,
-                                       self.vllm_config.model_config.hf_config)
+                            self.vllm_config.model_config.hf_config, profile)
         except BaseException:
             self._direct_lora_failed = True
             raise

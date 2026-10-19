@@ -239,11 +239,14 @@ class LoRAActorEngine(ActorEngine):
         from .deepseek_v41_lora import (
             lora_target_modules, register_deepseek_v41_lora,
         )
+        from dsv41_train.rl.lora_config import DistributedLoRAConfig
         if vllm.__version__ != "0.31.0" or vllm.envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
             raise RuntimeError("direct LoRA actor requires the inspected secure vLLM 0.31.0 runtime")
         from .vllm_batch_admission import qualify_admission_runtime
         qualify_admission_runtime(vllm, LLM)
         self.bootstrap = bootstrap
+        self.lora_config = DistributedLoRAConfig.from_dict(bootstrap["lora_config"])
+        self.text_config = json.loads((Path(bootstrap["model_dir"]) / "config.json").read_text())
         self.ack = self.activation = self.adapter_request = None
         self.failed = False
         self._used_adapter_ids = set()
@@ -255,9 +258,10 @@ class LoRAActorEngine(ActorEngine):
             max_model_len=bootstrap["max_model_len"], max_num_seqs=bootstrap["max_num_seqs"],
             limit_mm_per_prompt={"image": 0},
             enable_prefix_caching=False, enforce_eager=False, logprobs_mode="processed_logprobs",
-            enable_lora=True, max_loras=1, max_cpu_loras=2, max_lora_rank=8,
+            enable_lora=True, max_loras=1, max_cpu_loras=2, max_lora_rank=self.lora_config.rank,
             lora_dtype="bfloat16", lora_target_modules=lora_target_modules(
-                json.loads((Path(bootstrap["model_dir"]) / "config.json").read_text())),
+                self.text_config, self.lora_config),
+            additional_config={"rollout_manager_lora": self.lora_config.to_dict()},
             fully_sharded_loras=False,
             worker_extension_cls=self.worker_extension, disable_log_stats=False,
             distributed_executor_backend="mp")
@@ -281,6 +285,8 @@ class LoRAActorEngine(ActorEngine):
         for worker in workers:
             if worker.get("base_identity") != self.bootstrap["base_identity"]:
                 raise RuntimeError("direct LoRA worker mounted base identity differs")
+            if worker.get("lora_config") != self.lora_config.to_dict():
+                raise RuntimeError("direct LoRA worker configuration differs from the actor")
             if manifest is not None and (worker.get("policy_ack") != policy_ack(manifest)
                     or worker.get("adapter_id") != manifest["adapter_id"]
                     or worker.get("readback_digest") != manifest["digest"]):
@@ -294,6 +300,7 @@ class LoRAActorEngine(ActorEngine):
         return {"serving_profile": "deepseek-lora-v1", "version": "0.31.0",
             "tensor_parallel_size": self.bootstrap["tensor_parallel_size"], "workers": self.workers,
             "base_identity": self.bootstrap["base_identity"], "loaded_policy_ack": self.ack,
+            "lora_config": self.lora_config.to_dict(),
             "adapter_id": self.activation["adapter_id"] if self.activation else None,
             "max_model_len": self.bootstrap["max_model_len"], "max_num_seqs": self.bootstrap["max_num_seqs"]}
 
@@ -315,15 +322,16 @@ class LoRAActorEngine(ActorEngine):
     def load_lora(self, manifest, payload):
         from vllm.lora.request import LoRARequest
         from .vllm_lora_transport import policy_ack, validate_update
+        from .deepseek_v41_lora import validate_adapter_manifest
         try:
             if self.failed:
                 raise RuntimeError("direct LoRA actor is permanently failed until close")
             validate_update(manifest, payload)
+            validate_adapter_manifest(manifest, self.text_config, self.lora_config)
             expected_version = 0 if self.ack is None else self.ack["version"] + 1
             if (manifest["version"] != expected_version or manifest["adapter_id"] in self._used_adapter_ids
                     or self.ack is not None and manifest["lineage"] != self.ack["lineage"]
-                    or manifest["base_identity"] != self.bootstrap["base_identity"]
-                    or manifest["peft"] != {"r": 8, "lora_alpha": 8, "target_modules": ["wq_a"]}):
+                    or manifest["base_identity"] != self.bootstrap["base_identity"]):
                 raise ValueError("direct LoRA policy must advance one version with an unused ID and identical base/profile")
             receipts = self.llm.collective_rpc(self.worker_rpc,
                 args=("load_lora", manifest, payload), timeout=300)

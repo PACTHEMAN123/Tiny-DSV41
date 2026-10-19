@@ -4,9 +4,11 @@ import io
 import socket
 import struct
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from dsv41_train.rl.lora_config import DistributedLoRAConfig
 from rollout_manager.backends import vllm_lora_remote as rpc
 from rollout_manager.backends.vllm_lora_transport import policy_ack
 from test_deepseek_vllm_transport import update
@@ -14,6 +16,7 @@ from test_deepseek_vllm_transport import update
 
 class FakeController:
     def __init__(self):
+        self.config = SimpleNamespace(lora_config=DistributedLoRAConfig())
         self._state, self.ack, self.activation_receipts = "new", None, None
         self.base_identity = {"config_sha256": "a" * 64, "index_sha256": "b" * 64}
         self.calls, self.updates, self.timeout_checks = [], [], 0
@@ -102,13 +105,44 @@ class RemoteLoRATests(unittest.TestCase):
         self.redirect.__exit__(None, None, None)
 
     def activate(self):
-        self.client.initialize()
+        initialized = self.client.initialize()
+        self.assertEqual(initialized["lora_config"], {"rank": 8, "alpha": 8.0, "layers": None})
         manifest, payload, _ = update(base_identity=self.controller.base_identity)
         receipt = self.client.activate(manifest, payload)
         self.assertEqual(receipt["ack"], policy_ack(manifest))
         self.assertEqual(receipt["activation_receipts"], self.controller.activation_receipts)
         self.assertEqual(self.controller.updates, [(manifest, payload)])
         self.client.resume()
+
+    def test_matching_custom_configuration_is_acknowledged(self):
+        profile = DistributedLoRAConfig(rank=16, alpha=32, layers=(0, 2))
+        self.controller.config.lora_config = profile
+        initialized = self.client.initialize(lora_config=profile.to_dict())
+        self.assertEqual(initialized["lora_config"], profile.to_dict())
+        self.assertEqual(self.controller.calls, ["start"])
+
+    def test_configuration_mismatch_is_rejected_before_actor_start(self):
+        profile = DistributedLoRAConfig(rank=16, alpha=32, layers=(0, 2))
+        with self.assertRaisesRegex(RuntimeError, "LoRA configurations differ"):
+            self.client.initialize(lora_config=profile.to_dict())
+        self.assertEqual(self.controller.calls, [])
+        self.assertEqual(self.controller._state, "new")
+        self.assertTrue(self.client.failed)
+        self.assertTrue(self.server.failed)
+
+    def test_missing_or_inconsistent_initialize_acknowledgement_latches_failure(self):
+        for value in (None, {"rank": 16, "alpha": 8, "layers": None},
+                      {"rank": 8, "alpha": 8}):
+            with self.subTest(config=value):
+                result = {"base_identity": self.controller.base_identity}
+                if value is not None:
+                    result["lora_config"] = value
+                client = self.new_client()
+                with patch.object(client, "_call", return_value=result):
+                    with self.assertRaisesRegex(RuntimeError, "invalid LoRA configuration"):
+                        client.initialize()
+                self.assertTrue(client.failed)
+                self.assertIsNone(client.base_identity)
 
     def test_real_socket_tensor_activation_group32_and_concurrent_status(self):
         self.activate()

@@ -12,11 +12,12 @@ import time
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
+from dsv41_train.rl.lora_config import DistributedLoRAConfig
 
 from rollout_manager.backends.vllm_actor import LoRAActorEngine
 from rollout_manager.backends.vllm_controller import OwnedVLLMActor
 from rollout_manager.backends.vllm_lora_controller import LoRARolloutConfig, VLLMLoRAController
-from rollout_manager.backends.vllm_lora_transport import policy_ack
+from rollout_manager.backends.vllm_lora_transport import pack_update, policy_ack
 from test_deepseek_vllm_transport import update
 
 
@@ -106,9 +107,11 @@ class LoRAIPCPathTests(unittest.TestCase):
                 os.chdir(old_cwd)
 
 
-def workers(base, manifest=None):
+def workers(base, manifest=None, lora_config=None):
     return [{"pid": index + 1, "start_ticks": 1, "cmdline_sha256": "fixture", "device_uuid": f"GPU-{index}",
-             "base_identity": base, "policy_ack": policy_ack(manifest) if manifest else None,
+             "base_identity": base,
+             "lora_config": (lora_config or DistributedLoRAConfig().to_dict()),
+             "policy_ack": policy_ack(manifest) if manifest else None,
              "adapter_id": manifest["adapter_id"] if manifest else None,
              "readback_digest": manifest["digest"] if manifest else None} for index in range(2)]
 
@@ -125,7 +128,9 @@ class FakeActor:
 
     def stats(self):
         return {"serving_profile": "deepseek-lora-v1", "base_identity": self.bootstrap["base_identity"],
-                "tensor_parallel_size": 2, "workers": workers(self.bootstrap["base_identity"], self.manifest),
+                "lora_config": self.bootstrap["lora_config"],
+                "tensor_parallel_size": 2, "workers": workers(
+                    self.bootstrap["base_identity"], self.manifest, self.bootstrap["lora_config"]),
                 "loaded_policy_ack": policy_ack(self.manifest) if self.manifest else None,
                 "adapter_id": self.manifest["adapter_id"] if self.manifest else None}
 
@@ -133,7 +138,8 @@ class FakeActor:
         if operation == "load_lora":
             self.manifest = copy.deepcopy(tensor_update[0])
             result = {"ack": policy_ack(self.manifest), "adapter_id": self.manifest["adapter_id"],
-                      "activation_receipts": workers(self.bootstrap["base_identity"], self.manifest), "engine": self.stats()}
+                      "activation_receipts": workers(self.bootstrap["base_identity"], self.manifest,
+                                                     self.bootstrap["lora_config"]), "engine": self.stats()}
             if self.bad_worker:
                 result["activation_receipts"][1]["readback_digest"] = "wrong"
             return result
@@ -162,7 +168,8 @@ class LoRAControllerTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        (self.root / "config.json").write_text(json.dumps({"model_type": "deepseek_v41", "eos_token_id": 1}))
+        (self.root / "config.json").write_text(json.dumps({"model_type": "deepseek_v41", "eos_token_id": 1,
+            "hidden_size": 4, "q_lora_rank": 2, "head_dim": 4, "num_hidden_layers": 1}))
         (self.root / "model.safetensors.index.json").write_text("{}")
         self.config = LoRARolloutConfig(deadline_unix=time.time() + 600, rollout_devices=("cuda:0", "cuda:1"))
         self.mock = patch("rollout_manager.backends.vllm_lora_controller.OwnedVLLMActor", FakeActor)
@@ -195,6 +202,31 @@ class LoRAControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.controller._state, "failed")
         with self.assertRaises(RuntimeError):
             await self.controller.resume()
+
+    async def test_custom_profile_requires_matching_peft_and_exact_layer_inventory(self):
+        import torch
+        profile = DistributedLoRAConfig(rank=16, alpha=24, layers=(0,))
+        config = LoRARolloutConfig(rollout_devices=self.config.rollout_devices, lora_config=profile)
+        controller = VLLMLoRAController(self.root, config, work_dir=self.root / "custom")
+        self.addAsyncCleanup(controller.close)
+        receipt = await controller.start()
+        self.assertEqual(receipt["lora_config"], profile.to_dict())
+        tensors = {"language_model.model.layers.0.attn.wq_a.lora_A.weight":
+                   torch.ones(16, 4, dtype=torch.bfloat16),
+                   "language_model.model.layers.0.attn.wq_a.lora_B.weight":
+                   torch.ones(2, 16, dtype=torch.bfloat16)}
+        def packed(values, alpha=24):
+            return pack_update(values, version=0, lineage="configured", adapter_id=1,
+                peft={"r": 16, "lora_alpha": alpha, "target_modules": ["wq_a"]},
+                base_identity=controller.base_identity)
+        with self.assertRaisesRegex(ValueError, "PEFT"):
+            await controller.activate(*packed(tensors, alpha=16))
+        with self.assertRaisesRegex(ValueError, "configured query layers"):
+            await controller.activate(*packed({next(iter(tensors)): next(iter(tensors.values()))}))
+        self.assertIsNone(controller.actor.manifest)
+        self.assertEqual(controller._state, "paused")
+        await controller.activate(*packed(tensors))
+        self.assertEqual(controller.ack["version"], 0)
 
     async def test_pause_waits_for_inference_before_next_activation(self):
         await self.controller.activate(*update(base_identity=self.controller.base_identity)[:2])
@@ -247,7 +279,8 @@ class LoRAActorBindingTests(unittest.TestCase):
         from rollout_manager.backends.deepseek_v41_lora import lora_target_modules
         text = dict(hidden_size=16, q_lora_rank=8, head_dim=4, num_hidden_layers=2)
         base = {"config_sha256": "a" * 64, "index_sha256": "b" * 64}
-        receipts = [{"pid": i + 1, "device_uuid": f"GPU-{i}", "base_identity": base}
+        receipts = [{"pid": i + 1, "device_uuid": f"GPU-{i}", "base_identity": base,
+                     "lora_config": DistributedLoRAConfig().to_dict()}
                     for i in range(8)]
         calls, registered = [], {}
         class SyncMPClient:
@@ -276,7 +309,8 @@ class LoRAActorBindingTests(unittest.TestCase):
             (root / "config.json").write_text(json.dumps(mounted_config))
             bootstrap = {"model_dir": str(root), "tensor_parallel_size": 8, "seed": 42,
                          "gpu_memory_utilization": .85, "max_model_len": 512,
-                         "max_num_seqs": 32, "base_identity": base}
+                         "max_num_seqs": 32, "base_identity": base,
+                         "lora_config": DistributedLoRAConfig().to_dict()}
             with patch.dict(sys.modules, {"vllm": vllm, "vllm.envs": envs,
                                          "vllm.v1.engine.core_client": core_client}), \
                     patch("rollout_manager.backends.vllm_lora_triton.configure_lora_triton_source"), \
@@ -287,11 +321,25 @@ class LoRAActorBindingTests(unittest.TestCase):
                 self.assertTrue(calls[0]["enable_lora"])
                 self.assertFalse(calls[0]["skip_tokenizer_init"])
                 self.assertEqual(calls[0]["lora_target_modules"], lora_target_modules(text))
+                self.assertEqual(calls[0]["max_lora_rank"], 8)
+                self.assertEqual(calls[0]["additional_config"],
+                                 {"rollout_manager_lora": bootstrap["lora_config"]})
                 self.assertEqual(calls[0]["tensor_parallel_size"], 8)
                 self.assertEqual(calls[0]["limit_mm_per_prompt"], {"image": 0})
                 self.assertNotIn("quantization", calls[0])
                 self.assertNotIn("hf_overrides", calls[0])
                 self.assertEqual(json.loads((root / "config.json").read_text()), mounted_config)
+                profile = DistributedLoRAConfig(rank=16, alpha=24, layers=(1,))
+                bootstrap["lora_config"] = profile.to_dict()
+                for worker in receipts:
+                    worker["lora_config"] = profile.to_dict()
+                configured = LoRAActorEngine(bootstrap)
+                self.assertEqual(configured.lora_config, profile)
+                self.assertEqual(calls[-1]["max_lora_rank"], 16)
+                self.assertEqual(calls[-1]["lora_target_modules"],
+                                 ["language_model.model.layers.1.attn.fused_wqa_wkv"])
+                self.assertEqual(calls[-1]["additional_config"],
+                                 {"rollout_manager_lora": profile.to_dict()})
                 receipts.pop()
                 with self.assertRaisesRegex(RuntimeError, "every TP worker"):
                     LoRAActorEngine(bootstrap)
@@ -337,6 +385,8 @@ class LoRAActorBindingTests(unittest.TestCase):
         engine = LoRAActorEngine.__new__(LoRAActorEngine)
         engine.bootstrap = {"tensor_parallel_size": 2, "base_identity": manifest["base_identity"],
                             "max_model_len": 512, "max_num_seqs": 1, "eos_token_ids": [1]}
+        engine.lora_config = DistributedLoRAConfig()
+        engine.text_config = dict(hidden_size=4, q_lora_rank=2, head_dim=4, num_hidden_layers=1)
         engine.ack = engine.activation = engine.adapter_request = None
         engine.failed, engine._used_adapter_ids = False, set()
         dispatched = []

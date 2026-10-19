@@ -12,6 +12,8 @@ from pathlib import Path
 import re
 import threading
 import time
+from dsv41_train.rl.lora_config import DistributedLoRAConfig
+from .deepseek_v41_lora import text_dimensions, validate_adapter_manifest
 from .pytorch_controller import _owned_thread
 from .vllm_controller import OwnedVLLMActor
 from .vllm_lora_transport import policy_ack, validate_update
@@ -27,8 +29,11 @@ class LoRARolloutConfig:
     gpu_memory_utilization: float = 0.85
     seed: int = 42
     dtype: str = "bfloat16"
+    lora_config: DistributedLoRAConfig = DistributedLoRAConfig()
 
     def validate(self):
+        if not isinstance(self.lora_config, DistributedLoRAConfig):
+            raise ValueError("LoRA rollout requires an immutable DistributedLoRAConfig")
         if self.deadline_unix is not None and (
             type(self.deadline_unix) not in (int, float)
             or not math.isfinite(self.deadline_unix)
@@ -81,6 +86,8 @@ class VLLMLoRAController:
         values = json.loads((self.model_dir / "config.json").read_text())
         if values.get("model_type") != "deepseek_v41":
             raise ValueError("direct LoRA rollout requires the mounted DeepSeek V4.1 model")
+        self.text_config = values
+        config.lora_config.selected_layers(text_dimensions(values)[3])
         self.base_identity = {
             key: hashlib.sha256((self.model_dir / name).read_bytes()).hexdigest()
             for key, name in (
@@ -120,6 +127,7 @@ class VLLMLoRAController:
             engine.get("serving_profile") != "deepseek-lora-v1"
             or engine.get("base_identity") != self.base_identity
             or engine.get("tensor_parallel_size") != len(self.config.rollout_devices)
+            or engine.get("lora_config") != self.config.lora_config.to_dict()
         ):
             raise RuntimeError("LoRA actor receipt differs from the requested mounted deployment")
         workers = engine.get("workers", [])
@@ -128,6 +136,8 @@ class VLLMLoRAController:
             len(workers) != len(self.config.rollout_devices)
             or any((not value for value in uuids))
             or len(set(uuids)) != len(uuids)
+            or any(worker.get("lora_config") != self.config.lora_config.to_dict()
+                   for worker in workers)
         ):
             raise RuntimeError(
                 "LoRA actor receipt lacks distinct complete TP worker acknowledgements"
@@ -168,6 +178,7 @@ class VLLMLoRAController:
             "tensor_parallel_size": len(self.config.rollout_devices),
             "gpu_memory_utilization": self.config.gpu_memory_utilization,
             "base_identity": self.base_identity,
+            "lora_config": self.config.lora_config.to_dict(),
         }
         try:
             self.actor = OwnedVLLMActor(
@@ -228,6 +239,7 @@ class VLLMLoRAController:
     async def activate(self, manifest, payload):
         manifest = copy.deepcopy(manifest)
         validate_update(manifest, payload)
+        validate_adapter_manifest(manifest, self.text_config, self.config.lora_config)
         async with self._control_lock:
             with self._condition:
                 if self._state != "paused" or self._active:
@@ -238,7 +250,6 @@ class VLLMLoRAController:
                     or manifest["adapter_id"] in self._used_adapter_ids
                     or (self.ack is not None and manifest["lineage"] != self.ack["lineage"])
                     or (manifest["base_identity"] != self.base_identity)
-                    or (manifest["peft"] != {"r": 8, "lora_alpha": 8, "target_modules": ["wq_a"]})
                 ):
                     raise ValueError(
                         "LoRA policy requires the next version, unused ID, and unchanged base/profile"

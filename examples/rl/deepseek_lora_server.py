@@ -12,6 +12,7 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 from rollout_manager.backends.vllm_lora_controller import LoRARolloutConfig, VLLMLoRAController
 from rollout_manager.backends.vllm_lora_remote import RemoteLoRAServer
+from dsv41_train.rl.lora_config import DistributedLoRAConfig, SUPPORTED_LORA_RANKS, parse_lora_layers
 
 
 def main():
@@ -26,14 +27,24 @@ def main():
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--lora-rank", type=int, choices=SUPPORTED_LORA_RANKS, default=8)
+    parser.add_argument("--lora-alpha", type=float, default=8)
+    parser.add_argument("--lora-layers", default="all",
+                        help="'all' or comma-separated zero-based backbone layer indices")
     parser.add_argument("--operation-timeout-seconds", type=int, default=7200)
     args = parser.parse_args()
+    try:
+        lora_config = DistributedLoRAConfig(args.lora_rank, args.lora_alpha,
+                                           parse_lora_layers(args.lora_layers))
+    except ValueError as error:
+        parser.error(str(error))
     token = os.environ.pop(args.token_env, None)
     if token is None:
         parser.error("the configured RPC token environment variable is missing")
     config = LoRARolloutConfig(operation_timeout_seconds=args.operation_timeout_seconds,
         rollout_devices=tuple("cuda:" + item for item in args.gpus.split(",")),
-        max_model_len=args.max_model_len, max_num_seqs=args.max_num_seqs, seed=args.seed)
+        max_model_len=args.max_model_len, max_num_seqs=args.max_num_seqs, seed=args.seed,
+        lora_config=lora_config)
     controller = VLLMLoRAController(args.model_dir, config, work_dir=args.work_dir)
     with RemoteLoRAServer((args.bind, args.port), token, controller,
                          io_timeout=args.operation_timeout_seconds) as server:

@@ -18,6 +18,8 @@ import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
+from .lora_config import DistributedLoRAConfig
+
 
 PINNED_NATIVE_MANIFEST_SHA256 = "bc9e596346214196d1210606f93224532567ac2c12a373d23982ecfb85004324"
 
@@ -117,7 +119,36 @@ def scoring_model_class(base_class):
     return ResponseScoringModel
 
 
-def load_distributed_learner(model_dir, source_root=None, *, seed=42, ep_size=16):
+def query_lora_materializer(materializer_class, meshes, native_lora, lora_config, num_layers):
+    """Install chosen adapters after loading each layer, before its FSDP wrap.
+
+    The pinned checkpoint reader calls this boundary for every complete layer.
+    Keeping selection here preserves that reader and its base-weight math.
+    """
+    selected = set(lora_config.selected_layers(num_layers))
+    config = native_lora.LoRAConfig(lora_config.rank, lora_config.alpha, 0, ("attention.q_a",))
+
+    class QueryLoRAMaterializer(materializer_class):
+        def prepare(self, model, *, dtype, device, direct):
+            if direct:
+                raise ValueError("query LoRA requires layerwise model loading")
+            model.requires_grad_(False)
+            super().prepare(model, dtype=dtype, device=device, direct=direct)
+
+        def layer_loaded(self, layer):
+            if layer.layer_id in selected:
+                native_lora.inject_lora(layer, config)
+            super().layer_loaded(layer)
+
+    return QueryLoRAMaterializer(meshes)
+
+
+def load_distributed_learner(model_dir, source_root=None, *, seed=42, ep_size=16,
+                             lora_config=None):
+    lora_config = DistributedLoRAConfig() if lora_config is None else lora_config
+    if not isinstance(lora_config, DistributedLoRAConfig):
+        raise ValueError("learner LoRA configuration must be DistributedLoRAConfig")
+    lora_config.selected_layers(40)
     native, provenance = import_native(source_root)
     runtime = native("runtime").initialize_runtime("cuda", require_distributed=True)
     if runtime.world_size != 16 or ep_size != 16:
@@ -129,6 +160,7 @@ def load_distributed_learner(model_dir, source_root=None, *, seed=42, ep_size=16
         raise ValueError("the learner must load the full mounted DeepSeek V4.1 backbone")
     if config.attention_dropout:
         raise ValueError("GRPO requires attention dropout zero")
+    selected_layers = lora_config.selected_layers(config.num_hidden_layers)
     meshes, cp, dispatcher = native("models.dsv4.parallel").build_parallelism(cp=1, ep=ep_size)
     materializer_class = native("models.dsv4.materialize").FSDPMaterializer
     loader = native("models.dsv4.checkpoint")
@@ -138,17 +170,20 @@ def load_distributed_learner(model_dir, source_root=None, *, seed=42, ep_size=16
         model = loader.load_dsv41_backbone_window(model_dir, num_layers=40,
             device=runtime.device, dtype=torch.bfloat16, context_parallel=cp,
             token_dispatcher=dispatcher, engram_mesh=meshes.engram,
-            lora_config=native("lora").LoRAConfig(8, 8, 0, ("attention.q_a",)),
             cache_quantization="hf",
             load_policy=native("loading").LoadPolicy("layerwise", staging_bytes=128 * 1024**2),
-            materializer=materializer_class(meshes))
+            materializer=query_lora_materializer(materializer_class, meshes, native("lora"),
+                lora_config, config.num_hidden_layers))
     finally:
         loader.DeepSeekV41ForCausalLM = original_class
     model.gradient_checkpointing_enable()
     model.train()
+    model.distributed_lora_config = lora_config
     adapters = list(native("lora").adapter_parameters(model))
-    if len(adapters) != 80 or sum(p.numel() for p in adapters) != 2_048_000:
-        raise ValueError("native query adapter inventory differs from the full 40-layer profile")
+    expected_count = lora_config.parameter_count(config.hidden_size, config.q_lora_rank,
+                                                config.num_hidden_layers)
+    if len(adapters) != 2 * len(selected_layers) or sum(p.numel() for p in adapters) != expected_count:
+        raise ValueError("native query adapter inventory differs from its configured profile")
     optimizer = torch.optim.AdamW(adapters, lr=1e-4, weight_decay=0, foreach=False)
     gradient_policy = native("models.dsv4.policies").GradientPolicy(model, meshes, fsdp=True)
     return model, optimizer, gradient_policy, runtime, provenance

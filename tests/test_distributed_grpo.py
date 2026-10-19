@@ -188,6 +188,14 @@ class DistributedGRPOTests(unittest.TestCase):
                     run(invalid)
                 load.assert_not_called()
 
+    def test_invalid_adapter_profile_fails_before_model_loading(self):
+        for setting in ({"lora_rank": 7}, {"lora_alpha": float("nan")}, {"lora_layers": "40"}):
+            args = types.SimpleNamespace(learner_batch_shapes=None, **setting)
+            with self.subTest(setting=setting), patch("dsv41_train.rl.distributed_grpo.ModelTokenizer") as load:
+                with self.assertRaises(ValueError):
+                    run(args)
+                load.assert_not_called()
+
     def test_rank_zero_io_error_is_a_broadcast_error_not_a_reward(self):
         with patch("dsv41_train.rl.distributed_grpo.dist.get_rank", return_value=0), \
                 patch("dsv41_train.rl.distributed_grpo.dist.broadcast_object_list") as broadcast:

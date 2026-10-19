@@ -11,12 +11,13 @@ import re
 
 import torch
 
+from dsv41_train.rl.lora_config import DistributedLoRAConfig, SUPPORTED_LORA_RANKS
+
 # Keep the mounted architecture: vLLM uses this name to construct and validate
 # EngramConfig before model loading. Only this process's class registry changes.
 LORA_ARCHITECTURE = "DeepseekV41ForCausalLM"
 LORA_TARGET_MODULE = "fused_wqa_wkv"
 LORA_RANK = 8
-LORA_ALPHA = 8
 # Preserve the installed text model's full packing metadata for base quantization.
 # These mappings do not admit adapter targets; validate_deployment and the tensor
 # key guard below enforce the narrower query-only scope independently.
@@ -49,21 +50,35 @@ def text_dimensions(config) -> tuple[int, int, int, int]:
     return values
 
 
-def lora_target_modules(config) -> list[str]:
+def lora_target_modules(config, lora_config=DistributedLoRAConfig()) -> list[str]:
     """Use whole runtime paths: packed-child suffix matching also admits Engram.wkv."""
     layers = text_dimensions(config)[3]
     return [f"language_model.model.layers.{layer}.attn.{LORA_TARGET_MODULE}"
-            for layer in range(layers)]
+            for layer in lora_config.selected_layers(layers)]
+
+
+def deployment_lora_config(vllm_config) -> DistributedLoRAConfig:
+    """Read the immutable adapter scope passed from actor to every worker."""
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, Mapping) or "rollout_manager_lora" not in additional:
+        raise ValueError("DeepSeek LoRA requires its immutable rollout configuration")
+    return DistributedLoRAConfig.from_dict(additional["rollout_manager_lora"])
+
+
+def peft_config(lora_config: DistributedLoRAConfig) -> dict:
+    return {"r": lora_config.rank, "lora_alpha": lora_config.alpha,
+            "target_modules": ["wq_a"]}
 
 
 def validate_deployment(vllm_config) -> None:
     """Reject unsupported scopes before constructing the base model."""
     config = vllm_config.lora_config
-    targets = lora_target_modules(vllm_config.model_config.hf_config)
+    profile = deployment_lora_config(vllm_config)
+    targets = lora_target_modules(vllm_config.model_config.hf_config, profile)
     if config is None or config.target_modules != targets:
         raise ValueError("DeepSeek LoRA requires exact backbone attention target_modules")
-    if config.max_lora_rank != LORA_RANK or config.lora_dtype != torch.bfloat16:
-        raise ValueError("DeepSeek LoRA requires rank 8 and BF16 adapters")
+    if config.max_lora_rank != profile.rank or config.lora_dtype != torch.bfloat16:
+        raise ValueError("DeepSeek LoRA requires the configured rank and BF16 adapters")
     if config.fully_sharded_loras or config.enable_tower_connector_lora:
         raise ValueError("DeepSeek LoRA supports unsharded text adapters only")
     if vllm_config.parallel_config.pipeline_parallel_size != 1:
@@ -73,16 +88,38 @@ def validate_deployment(vllm_config) -> None:
     text_dimensions(vllm_config.model_config.hf_config)
 
 
-def validate_adapter_tensors(tensors, text_config, rank=LORA_RANK) -> tuple[str, ...]:
+def validate_adapter_manifest(manifest, text_config, lora_config) -> None:
+    """Require every configured query pair before dispatching a tensor payload."""
+    if manifest["peft"] != peft_config(lora_config):
+        raise ValueError("DeepSeek LoRA PEFT configuration differs from the rollout configuration")
+    hidden, q_rank, _, layers = text_dimensions(text_config)
+    expected = {
+        f"language_model.model.layers.{layer}.attn.wq_a.lora_{side}.weight": shape
+        for layer in lora_config.selected_layers(layers)
+        for side, shape in (("A", [lora_config.rank, hidden]), ("B", [q_rank, lora_config.rank]))
+    }
+    actual = {item["name"]: item for item in manifest["tensors"]}
+    if set(actual) != set(expected) or any(
+        actual[name]["shape"] != shape or actual[name]["dtype"] != "bfloat16"
+        for name, shape in expected.items()
+    ):
+        raise ValueError("DeepSeek LoRA payload differs from the configured query layers and rank")
+
+
+def validate_adapter_tensors(
+    tensors, text_config, rank=LORA_RANK, *, lora_config=None,
+) -> tuple[str, ...]:
     """Validate CPU BF16 pairs and return exact adapter-visible module names.
 
     Tensor keys intentionally use vLLM's runtime namespace and no PEFT prefix;
     callers must pass weights_mapper=None to LoRAModel.from_lora_tensors.
-    A subset of backbone layers is allowed. No KV, MTP, vision, or expert key
-    is admitted, and no missing or malformed tensor is silently ignored.
+    With ``lora_config``, every configured layer is required exactly. Without
+    it this lower-level helper accepts any complete query-only subset. No KV,
+    MTP, vision, expert or malformed tensor is silently ignored.
     """
-    if rank != LORA_RANK or not tensors:
-        raise ValueError("DeepSeek LoRA requires a nonempty rank-8 adapter")
+    rank = lora_config.rank if lora_config is not None else rank
+    if type(rank) is not int or rank not in SUPPORTED_LORA_RANKS or not tensors:
+        raise ValueError("DeepSeek LoRA requires a nonempty adapter with a supported rank")
     hidden, q_rank, _, layers = text_dimensions(text_config)
     pairs = {}
     for name, tensor in tensors.items():
@@ -96,9 +133,18 @@ def validate_adapter_tensors(tensors, text_config, rank=LORA_RANK) -> tuple[str,
             raise ValueError(f"{name} must be a CPU BF16 tensor")
         if not torch.isfinite(tensor).all().item():
             raise ValueError(f"{name} contains nonfinite values")
+        if lora_config is not None and match[2] == "B" and not torch.isfinite(
+            tensor * (lora_config.alpha / rank)
+        ).all().item():
+            raise ValueError(f"{name} overflows BF16 after LoRA alpha/rank scaling")
         pairs.setdefault(name.rsplit(".lora_", 1)[0], set()).add(match[2])
     if any(sides != {"A", "B"} for sides in pairs.values()):
         raise ValueError("Every adapted DeepSeek layer requires both A and B")
+    if lora_config is not None:
+        expected = {f"language_model.model.layers.{layer}.attn.wq_a"
+                    for layer in lora_config.selected_layers(layers)}
+        if set(pairs) != expected:
+            raise ValueError("DeepSeek LoRA tensors differ from the configured query layers")
     return tuple(sorted(pairs))
 
 

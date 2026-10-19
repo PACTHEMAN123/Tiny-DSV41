@@ -18,6 +18,7 @@ import socketserver
 import struct
 import sys
 import threading
+from dsv41_train.rl.lora_config import DistributedLoRAConfig
 from .vllm_lora_transport import _read_exact, receive_update, send_update
 
 MAX_JSON_BYTES = 32 * 1024 * 1024
@@ -143,9 +144,18 @@ class RemoteLoRAClient:
                 self.failed = True
                 raise
 
-    def initialize(self):
-        result = self._call("initialize")
-        self.base_identity = result["base_identity"]
+    def initialize(self, *, lora_config=None):
+        profile = (DistributedLoRAConfig() if lora_config is None
+                   else DistributedLoRAConfig.from_dict(lora_config))
+        result = self._call("initialize", {"lora_config": profile.to_dict()})
+        try:
+            returned = DistributedLoRAConfig.from_dict(result["lora_config"])
+            if returned != profile:
+                raise ValueError("rollout LoRA configuration differs from the learner profile")
+            self.base_identity = result["base_identity"]
+        except (KeyError, TypeError, ValueError) as error:
+            self.failed = True
+            raise RuntimeError("remote initialize returned an invalid LoRA configuration") from error
         return result
 
     def status(self):
@@ -269,6 +279,7 @@ class RemoteLoRAServer(socketserver.ThreadingTCPServer):
             "failed": self.failed or state == "failed",
             "policy_ack": copy.deepcopy(self.controller.ack),
             "base_identity": copy.deepcopy(self.controller.base_identity),
+            "lora_config": self.controller.config.lora_config.to_dict(),
             "activation_receipts": copy.deepcopy(self.controller.activation_receipts),
             "engine_receipt": (
                 self.controller.engine_receipt()
@@ -295,11 +306,16 @@ class RemoteLoRAServer(socketserver.ThreadingTCPServer):
                 return await asyncio.to_thread(
                     self.controller.sample_batch, _specs(arguments["specs"])
                 )
-            if arguments:
-                raise ValueError("this RPC operation accepts no JSON arguments")
             if operation == "initialize":
+                if set(arguments) != {"lora_config"}:
+                    raise ValueError("initialize requires the learner LoRA configuration")
+                profile = DistributedLoRAConfig.from_dict(arguments["lora_config"])
+                if profile != self.controller.config.lora_config:
+                    raise ValueError("learner and rollout LoRA configurations differ")
                 await self.controller.start()
                 return self._status()
+            if arguments:
+                raise ValueError("this RPC operation accepts no JSON arguments")
             if operation == "activate" and update is not None:
                 ack = await self.controller.activate(*update)
                 return {
