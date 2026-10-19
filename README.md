@@ -193,7 +193,16 @@ an alias, so it still failed the unchanged exact-match check. Final training-fit
 generation passed **32/32 records (31/31 distinct prompts)**; all 160
 teacher-forced answer/EOS tokens were correct. Training-fit is in-sample, and
 this single-placement quality run does not extend the paired gradient/update
-coverage or establish a passing six-question result.
+coverage or establish a passing result on the original six prompts.
+
+An unchanged-source 160-step replay then tested the prespecified instruction
+`只输出完整模型名称，不要解释或简称。`. Original prompts remained **5/6**
+at both 16- and 64-token caps; instruction-appended prompts passed **6/6**
+with exactly the target tokens and EOS at both caps. All 12 short/long-cap
+prefix comparisons matched. At 64 tokens the remaining original answer ended
+normally but kept its extra wording and alias. This supports output-format
+sensitivity for that question; the original 5/6 score remains unchanged, and
+these inspected prompts do not establish broader generalization.
 
 Post-final teacher-versus-prompt-only differences in the earlier 160-step run
 remain separate: observed layer 0 query boundaries differed although both

@@ -339,6 +339,38 @@ quality run, not paired 160-step gradient validation or a speedup benchmark. Ear
 results, forward-prefix differences, LoRA/RL limits and the full40 checkpoint
 waiver remain unchanged.
 
+A same-source fixed160 replay, `identity-format-contrast160-a2`, completed on
+the same eight B300s with clean release. Its 177-file manifest (`cdd36b06`)
+retains all 175 historical source/data hashes; raw audit `551eae71` verifies
+the unchanged native eval6 and train32 checks, followed by three predeclared
+prompt-format contrasts. The only added instruction was
+`只输出完整模型名称，不要解释或简称。`, appended to the final user message
+before applying the checkpoint chat template; no answer text was added.
+
+| Prompt | New-token cap | Text exact | Target tokens + EOS exact | Hit cap without EOS |
+| --- | --- | --- | --- | --- |
+| Original six questions | 16 | 5/6 | 5/6 | 1/6 |
+| Original six questions | 64 | 5/6 | 5/6 | 0/6 |
+| Same questions + format instruction | 16 | 6/6 | 6/6 | 0/6 |
+| Same questions + format instruction | 64 | 6/6 | 6/6 | 0/6 |
+
+All 12 cap-prefix comparisons matched. The remaining original question at
+64 tokens answered `你可以叫我 **RTP大模型**，或者直接叫 **RTP** 也行，怎么顺口怎么来就好～`
+and then EOS (27 generated tokens including EOS). Thus a longer allowance
+removed truncation but did not make its extra wording pass exact match. With
+the explicit format instruction, every question returned only `RTP大模型`
+and EOS. This supports a response-style difference when output format is
+unspecified for this question; the new prompt scores do not replace the
+original 5/6 or establish broader generalization.
+
+All 160 recorded training losses, the original six final generated-token lists
+and native teacher loss exactly reproduced the previous quality160 run. This
+is observed metric/output repeatability, not full-state or full-trajectory
+bitwise equality. Training fit remained 32/32; no production fix or new
+checkpoint was introduced. Attempt a1 failed before any update while ranks
+waited 600 seconds for NCCL after uneven checkpoint loading, then passed
+release checks; a2 was an unchanged-source retry, not a revised training recipe.
+
 Rank 0 post-final offload comparisons at the first-answer query still found
 teacher/prefix differences: the 12-token prompt first differed at layer 0 MoE
 output, and the 4096-token prompt at layer 0 output. Final logit maximum absolute
