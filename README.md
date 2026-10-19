@@ -46,6 +46,11 @@ a prefix. Use `--family qwen` for Qwen and `--mode full` for full-parameter SFT.
 See [SFT configuration and checkpoints](docs/sft.md) for Engram offload,
 optimizer constraints, generation evaluation and resume.
 
+On eight B300s, a fixed-source full40 SFT ABBA benchmark reduced sampled total
+GPU memory **21.22%** (1711.625 → 1348.480 GiB), with **3.05%** more native
+update time. See [protocol and measurement
+scope](docs/testing.md#full40-sft-engram-offload-benchmark).
+
 ## Reinforcement learning
 
 Choose the entry point that matches the training and serving scope:
