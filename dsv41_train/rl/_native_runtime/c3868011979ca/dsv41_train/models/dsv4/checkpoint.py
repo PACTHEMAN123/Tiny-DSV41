@@ -1,0 +1,408 @@
+"""Load the released DeepSeek V4.1 checkpoint with PyTorch and the stdlib."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from dataclasses import replace
+from pathlib import Path
+
+import torch
+
+from ...dispatch import TokenDispatcher
+from ...lora import LoRAConfig, inject_lora, load_adapter_state, read_adapter, validate_adapter_layout
+from ...parallel import ContextParallel
+from .config import DeepSeekV41Config
+from .model import (
+    DecoderLayer,
+    DeepSeekV41ForCausalLM,
+    NgramHash,
+    RotaryEmbedding,
+    build_compressed_token_map,
+)
+
+try:
+    from torch.distributed.device_mesh import DeviceMesh
+except ImportError:  # pragma: no cover - only needed for older PyTorch type checking
+    DeviceMesh = object
+
+
+from ...loading import ShardedSafeTensorReader
+from ...loading import LoadPolicy, ParameterMaterializer, WeightSource
+from ...layout import local_tensor, local_slice
+from .engram import EngramPolicy
+from .weights import layer_sources
+from ...loading.quantization import dequantize_fp4_rows, dequantize_fp8_blocks, dequantize_fp8_rows
+
+
+def _prefix_config(folder: Path, num_layers: int) -> DeepSeekV41Config:
+    full = DeepSeekV41Config.from_json(folder / "config.json")
+    if not 1 <= num_layers <= full.num_hidden_layers:
+        raise NotImplementedError(
+            f"a full checkpoint prefix supports one to {full.num_hidden_layers} real layers"
+        )
+    values = full.to_dict()
+    values["num_hidden_layers"] = num_layers
+    values["compress_ratios"] = full.compress_ratios[:num_layers]
+    values["kv_source_layer_ids"] = [x for x in full.kv_source_layer_ids if x < num_layers]
+    values["index_source_layer_ids"] = [
+        x for x in full.index_source_layer_ids if x < num_layers
+    ]
+    candidate_source = full.candidate_source_layer_id
+    values["candidate_source_layer_id"] = (
+        candidate_source if 0 <= candidate_source < num_layers else -1
+    )
+    engram = [
+        (layer_id, rows)
+        for layer_id, rows in zip(full.engram_layer_ids, full.engram_num_embeddings)
+        if layer_id < num_layers
+    ]
+    values["engram_layer_ids"] = [layer_id for layer_id, _ in engram]
+    values["engram_num_embeddings"] = [rows for _, rows in engram]
+    return DeepSeekV41Config(**values)
+
+
+def _materialize_rotary(
+    rotary: RotaryEmbedding,
+    config: DeepSeekV41Config,
+    device: torch.device,
+) -> None:
+    materialized = RotaryEmbedding(config).to(device)
+    rotary.main = materialized.main
+    rotary.compressed = materialized.compressed
+
+
+def load_dsv41_backbone_window(
+    folder: str | Path,
+    *,
+    start_layer: int = 0,
+    num_layers: int = 1,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.bfloat16,
+    context_parallel: ContextParallel | None = None,
+    token_dispatcher: TokenDispatcher | None = None,
+    engram_mesh: DeviceMesh | None = None,
+    sparse_engram_gradients: bool = False,
+    layer_loaded: Callable[[DecoderLayer], None] | None = None,
+    lora_config: LoRAConfig | None = None,
+    cache_quantization: str | None = None,
+    adapter_path: str | Path | None = None,
+    load_policy: LoadPolicy | None = None,
+    engram_policy: EngramPolicy | None = None,
+    materializer: ParameterMaterializer | None = None,
+) -> DeepSeekV41ForCausalLM:
+    """Load a trainable prefix or source-anchored layer window."""
+
+    folder = Path(folder)
+    load_policy = load_policy or LoadPolicy()
+    engram_policy = engram_policy or EngramPolicy()
+    direct = load_policy.mode == "direct_shard"
+    if materializer is not None and layer_loaded is not None:
+        raise ValueError("materializer and layer_loaded are mutually exclusive")
+    if direct and materializer is None:
+        raise ValueError("direct_shard requires a ParameterMaterializer")
+    if lora_config is not None and (direct or engram_policy.device == "cpu"
+                                    or getattr(getattr(materializer, "policy", None), "cpu_offload_layers", ())):
+        raise ValueError("LoRA with direct loading or CPU offload is not supported")
+    if adapter_path is not None and lora_config is None:
+        raise ValueError("adapter_path requires lora_config")
+    adapter = read_adapter(adapter_path) if adapter_path is not None else None
+    if start_layer == 0:
+        config = _prefix_config(folder, num_layers)
+        layer_ids = list(range(num_layers))
+    else:
+        config = DeepSeekV41Config.from_json(folder / "config.json")
+        stop_layer = start_layer + num_layers
+        if num_layers < 1 or not 0 < start_layer < stop_layer <= config.num_hidden_layers:
+            raise ValueError("the layer window must be inside the checkpoint backbone")
+        if start_layer not in config.kv_source_layer_ids:
+            raise ValueError(
+                "a non-prefix layer window must start at a KV source layer"
+            )
+        layer_ids = list(range(start_layer, stop_layer))
+    if cache_quantization is not None:
+        config = replace(config, cache_quantization=cache_quantization)
+    dispatcher = token_dispatcher or TokenDispatcher()
+    with torch.device("meta"):
+        model = DeepSeekV41ForCausalLM(
+            config,
+            context_parallel,
+            dispatcher,
+            engram_mesh,
+            layer_ids,
+            sparse_engram_gradients,
+            engram_policy=engram_policy,
+        )
+    if lora_config is not None:
+        model.requires_grad_(False)
+    if adapter is not None:
+        validate_adapter_layout(model, adapter)
+
+    target_device = torch.device(device)
+    if materializer is not None:
+        materializer.prepare(model, dtype=dtype, device=target_device, direct=direct)
+    rotary = model.model.rotary
+    _materialize_rotary(rotary, config, target_device)
+    with ShardedSafeTensorReader(folder) as checkpoint:
+
+        def read(name: str) -> torch.Tensor:
+            return checkpoint.tensor(name, target_device)
+
+        def fp8(name: str) -> torch.Tensor:
+            return dequantize_fp8_blocks(
+                read(f"{name}.weight"), read(f"{name}.scale"), dtype=dtype
+            )
+
+        def assign(module: torch.nn.Module, state: dict[str, torch.Tensor]) -> None:
+            result = module.load_state_dict(state, strict=True, assign=True)
+            if result.missing_keys or result.unexpected_keys:
+                raise RuntimeError(
+                    f"checkpoint mismatch: missing={result.missing_keys[:5]}, "
+                    f"unexpected={result.unexpected_keys[:5]}"
+                )
+
+        if direct:
+            _load_direct(model, checkpoint, load_policy)
+        else:
+            assign(model.model.embedding, {"weight": read("embed.weight").to(dtype)})
+            assign(model.model.norm, {"weight": read("norm.weight").to(dtype)})
+            assign(model.lm_head, {"weight": read("head.weight").to(dtype)})
+            if materializer is not None:
+                materializer.roots_loaded(model)
+
+        def load_layer(layer: DecoderLayer) -> None:
+            layer_id = layer.layer_id
+            source = f"layers.{layer_id}"
+            state: dict[str, torch.Tensor] = {
+                "attention_hc.base": read(f"{source}.hc_attn_base"),
+                "attention_hc.fn": read(f"{source}.hc_attn_fn"),
+                "attention_hc.scale": read(f"{source}.hc_attn_scale"),
+                "moe_hc.base": read(f"{source}.hc_ffn_base"),
+                "moe_hc.fn": read(f"{source}.hc_ffn_fn"),
+                "moe_hc.scale": read(f"{source}.hc_ffn_scale"),
+                "attention.sinks.weight": read(f"{source}.attn.attn_sink"),
+                "attention.q_a.weight": fp8(f"{source}.attn.wq_a"),
+                "attention.q_norm.weight": read(
+                    f"{source}.attn.q_norm.weight"
+                ).to(dtype),
+                "attention.q_b.weight": fp8(f"{source}.attn.wq_b"),
+                "attention.kv_proj.weight": fp8(f"{source}.attn.wkv"),
+                "attention.kv_norm.weight": read(
+                    f"{source}.attn.kv_norm.weight"
+                ).to(dtype),
+                "attention.o_a.weight": fp8(f"{source}.attn.wo_a").view(
+                    config.o_groups, config.o_lora_rank, -1
+                ),
+                "attention.o_b.weight": fp8(f"{source}.attn.wo_b"),
+                "input_norm.weight": read(f"{source}.attn_norm.weight").to(dtype),
+                "post_attention_norm.weight": read(f"{source}.ffn_norm.weight").to(
+                    dtype
+                ),
+                "moe.router.weight": read(f"{source}.ffn.gate.weight").to(dtype),
+                "moe.router.selection_bias": read(f"{source}.ffn.gate.bias"),
+                "moe.shared.gate.weight": fp8(f"{source}.ffn.shared_experts.w1"),
+                "moe.shared.up.weight": fp8(f"{source}.ffn.shared_experts.w3"),
+                "moe.shared.down.weight": fp8(f"{source}.ffn.shared_experts.w2"),
+            }
+
+            routed = layer.moe.routed
+            for local_id, global_id in enumerate(
+                range(routed.expert_start, routed.expert_start + routed.num_experts)
+            ):
+                prefix = f"{source}.ffn.experts.{global_id}"
+                gate = dequantize_fp4_rows(
+                    read(f"{prefix}.w1.weight"),
+                    read(f"{prefix}.w1.scale"),
+                    dtype=dtype,
+                )
+                up = dequantize_fp4_rows(
+                    read(f"{prefix}.w3.weight"),
+                    read(f"{prefix}.w3.scale"),
+                    dtype=dtype,
+                )
+                state[f"moe.routed.gate_up.{local_id}"] = torch.cat(
+                    (gate, up), dim=0
+                )
+                state[f"moe.routed.down.{local_id}"] = dequantize_fp4_rows(
+                    read(f"{prefix}.w2.weight"),
+                    read(f"{prefix}.w2.scale"),
+                    dtype=dtype,
+                )
+
+            compressor = layer.attention.compressor
+            if compressor is not None:
+                state["attention.compressor.kv_proj.weight"] = read(
+                    f"{source}.attn.compressor.wkv.weight"
+                ).to(dtype)
+                if compressor.gate_proj is not None:
+                    state["attention.compressor.gate_proj.weight"] = read(
+                        f"{source}.attn.compressor.wgate.weight"
+                    ).to(dtype)
+                state["attention.compressor.norm.weight"] = read(
+                    f"{source}.attn.compressor.norm.weight"
+                ).to(dtype)
+
+            indexer = layer.attention.indexer
+            if indexer is not None:
+                state["attention.indexer.q_proj.weight"] = fp8(
+                    f"{source}.attn.indexer.wq_b"
+                )
+                state["attention.indexer.weight_proj.weight"] = read(
+                    f"{source}.attn.indexer.weights_proj.weight"
+                ).to(dtype)
+                if indexer.owns_keys:
+                    state["attention.indexer.k_proj.weight"] = read(
+                        f"{source}.attn.indexer.wk.weight"
+                    ).to(dtype)
+                    state["attention.indexer.k_norm.weight"] = read(
+                        f"{source}.attn.indexer.k_norm.weight"
+                    ).to(dtype)
+
+            if layer.engram is not None:
+                table = model.model.engram_tables[str(layer_id)]
+                table_device = torch.device("cpu") if engram_policy.device == "cpu" else target_device
+                table_weight = torch.empty(
+                    table.weight.shape, device=table_device, dtype=dtype
+                )
+                chunk_rows = min(load_policy.chunk_rows, max(1, load_policy.staging_bytes // (16 * config.engram_head_dim * 2)))
+                for chunk_start in range(table.row_start, table.row_stop, chunk_rows):
+                    chunk_stop = min(chunk_start + chunk_rows, table.row_stop)
+                    weight = checkpoint.tensor_rows(
+                        f"{source}.engram.embed.weight",
+                        chunk_start,
+                        chunk_stop,
+                        table_device,
+                    )
+                    scale = checkpoint.tensor_rows(
+                        f"{source}.engram.embed.scale",
+                        chunk_start,
+                        chunk_stop,
+                        table_device,
+                    )
+                    table_weight[chunk_start - table.row_start : chunk_stop - table.row_start].copy_(
+                        dequantize_fp8_rows(weight, scale, dtype=dtype)
+                    )
+                assign(table, {"weight": table_weight})
+                state["engram.q_weight"] = read(f"{source}.engram.q_weight").to(dtype)
+                state["engram.k_weight"] = read(f"{source}.engram.k_weight").to(dtype)
+                state["engram.proj.weight"] = fp8(f"{source}.engram.wkv")
+
+            assign(layer, state)
+
+        for index, layer in enumerate(model.model.layers):
+            if direct:
+                continue
+            # The helper's temporary tensors die before FSDP replaces full weights.
+            load_layer(layer)
+            if lora_config is not None:
+                inject_lora(layer, lora_config)
+                if adapter is not None:
+                    load_adapter_state(layer, adapter, prefix=f"model.layers.{index}")
+            if layer_loaded is not None:
+                layer_loaded(layer)
+            elif materializer is not None:
+                materializer.layer_loaded(layer)
+        model.loading_metrics = {"logical_bytes_read": checkpoint.bytes_read, "mode": load_policy.mode}
+
+    if materializer is not None:
+        materializer.finish(model)
+
+    if model.model.hash is not None:
+        token_map, compressed_vocab_size = build_compressed_token_map(
+            folder / "tokenizer.json"
+        )
+        if compressed_vocab_size != config.engram_compressed_vocab_size:
+            raise ValueError(
+                "tokenizer-derived compressed vocabulary size "
+                f"({compressed_vocab_size}) does not match the model config "
+                f"({config.engram_compressed_vocab_size})"
+            )
+        model.model.hash = NgramHash(
+            config,
+            model.model.engram_layer_ids,
+            token_map=token_map,
+        ).to(target_device)
+    if any(parameter.is_meta for parameter in model.parameters()):
+        raise RuntimeError("checkpoint loading left meta parameters in the model")
+    return model
+
+
+def _load_direct(model, reader, policy):
+    def fill(parameter, source, offset=None, shape=None):
+        offsets, _ = local_slice(parameter)
+        source.fill(reader, local_tensor(parameter), offset or offsets,
+                    shape or tuple(parameter.shape), policy, executor=executor)
+
+    context = (ThreadPoolExecutor(max_workers=1, thread_name_prefix="weights")
+               if policy.pipeline else nullcontext(None))
+    with context as executor:
+        for parameter, name in ((model.model.embedding.weight, "embed.weight"),
+                                (model.model.norm.weight, "norm.weight"),
+                                (model.lm_head.weight, "head.weight")):
+            fill(parameter, WeightSource((name,)))
+        for layer in model.model.layers:
+            parameters = dict(layer.named_parameters())
+            buffers = dict(layer.named_buffers())
+            sources = layer_sources(layer)
+            if set(parameters) - set(sources):
+                raise RuntimeError(f"unmapped checkpoint parameters: {set(parameters) - set(sources)}")
+            for name, source in sources.items():
+                fill(parameters[name] if name in parameters else buffers[name], source)
+            if layer.engram is not None:
+                table = model.model.engram_tables[str(layer.layer_id)]
+                offsets, _ = local_slice(table.weight)
+                fill(table.weight, WeightSource((f"layers.{layer.layer_id}.engram.embed",), "fp8_rows"),
+                     (table.row_start + offsets[0], 0),
+                     (table.global_num_embeddings, table.embedding_dim))
+
+
+def load_dsv41_backbone_prefix(
+    folder: str | Path,
+    *,
+    num_layers: int = 1,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.bfloat16,
+    context_parallel: ContextParallel | None = None,
+    token_dispatcher: TokenDispatcher | None = None,
+    engram_mesh: DeviceMesh | None = None,
+    sparse_engram_gradients: bool = False,
+    layer_loaded: Callable[[DecoderLayer], None] | None = None,
+    lora_config: LoRAConfig | None = None,
+    cache_quantization: str | None = None,
+    adapter_path: str | Path | None = None,
+    load_policy: LoadPolicy | None = None,
+    engram_policy: EngramPolicy | None = None,
+    materializer: ParameterMaterializer | None = None,
+) -> DeepSeekV41ForCausalLM:
+    """Load a trainable prefix directly from the released checkpoint."""
+
+    return load_dsv41_backbone_window(
+        folder,
+        start_layer=0,
+        num_layers=num_layers,
+        device=device,
+        dtype=dtype,
+        context_parallel=context_parallel,
+        token_dispatcher=token_dispatcher,
+        engram_mesh=engram_mesh,
+        sparse_engram_gradients=sparse_engram_gradients,
+        layer_loaded=layer_loaded,
+        lora_config=lora_config,
+        cache_quantization=cache_quantization,
+        adapter_path=adapter_path,
+        load_policy=load_policy,
+        engram_policy=engram_policy,
+        materializer=materializer,
+    )
+
+
+__all__ = [
+    "ShardedSafeTensorReader",
+    "dequantize_fp4_rows",
+    "dequantize_fp8_blocks",
+    "dequantize_fp8_rows",
+    "load_dsv41_backbone_prefix",
+    "load_dsv41_backbone_window",
+]

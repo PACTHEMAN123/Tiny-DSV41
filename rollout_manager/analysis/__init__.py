@@ -1,1 +1,1 @@
-"""Dataset qualification, evidence collection and comparison commands."""
+"""Dataset preparation, qualification and operational stage logging."""

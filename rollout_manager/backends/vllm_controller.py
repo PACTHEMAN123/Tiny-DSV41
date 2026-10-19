@@ -16,7 +16,8 @@ import tempfile
 import time
 
 from .pytorch_controller import PyTorchPolicyController, _REQUEST_ID, _owned_thread
-from .vllm_actor import receive, send
+from .vllm_actor import (receive, send, validated_actor_ttl, actor_lifetime_deadline,
+                         MAX_RPC_BYTES, MAX_LORA_BATCH_RPC_BYTES)
 from .vllm_profile import (VLLM_TRAINING_PROFILE, require_vllm_learner, vllm_policy_identities,
                            VLLM_KV_CACHE_MEMORY_BYTES)
 from ..generation_training import TrainingGenerationContract, evidence_digest
@@ -40,7 +41,7 @@ def check_process(receipt):
 
 class OwnedVLLMActor:
     """One fresh subprocess, private Unix socket, bounded RPC and exact ownership."""
-    def __init__(self, model_dir, config, directory, *, max_model_len):
+    def __init__(self, model_dir, config, directory, *, max_model_len, bootstrap_override=None):
         from dsv41_train.rl.family import load_model_config
         from dsv41_train.rl.rollout import generation_options
         directory.mkdir(mode=0o700, parents=False, exist_ok=False)
@@ -49,34 +50,64 @@ class OwnedVLLMActor:
         self.token_file = directory / "actor-auth.secret"
         self.token_file.write_text(self.token + "\n")
         os.chmod(self.token_file, 0o600)
-        # Linux Unix sockets have a short pathname limit. A fresh task-owned
-        # /tmp directory is used only for this socket, never HOME or caches.
-        self.socket_dir = Path(tempfile.mkdtemp(prefix="rl-vllm-"))
+        # LoRA can keep socket names short independently of compiler TMPDIR.
+        ipc_directory = None
+        if bootstrap_override is None:
+            self.socket_dir = Path(tempfile.mkdtemp(prefix="rl-vllm-"))
+        else:
+            from .vllm_lora_ipc import create_lora_socket_directory
+            self.socket_dir, ipc_directory = create_lora_socket_directory()
         os.chmod(self.socket_dir, 0o700)
         self.socket_path = self.socket_dir / "actor.sock"
-        generation = generation_options(model_dir, load_model_config(model_dir), config)
-        if generation.get("stop_token_sequences"):
-            raise ValueError("vLLM actor does not approximate token stop sequences with text stops")
-        eos = generation["eos_token_id"]
-        eos_ids = [] if eos is None else [eos] if isinstance(eos, int) else list(eos)
-        model_config = load_model_config(model_dir)
-        kv_bytes_per_token = 2 * model_config.num_hidden_layers * model_config.num_key_value_heads * model_config.head_dim * 2
-        if kv_bytes_per_token * max_model_len > VLLM_KV_CACHE_MEMORY_BYTES:
-            raise ValueError("fixed vLLM KV memory cannot preserve the mounted full context")
-        bootstrap = {"model_dir": str(model_dir), "dtype": config.dtype, "seed": config.seed,
-                     "max_model_len": max_model_len, "eos_token_ids": eos_ids, "ttl_seconds": 30000,
-                     "kv_bytes_per_token": kv_bytes_per_token,
-                     "kv_cache_memory_bytes": VLLM_KV_CACHE_MEMORY_BYTES}
+        actor_ttl = 30000
+        if bootstrap_override is None:
+            generation = generation_options(model_dir, load_model_config(model_dir), config)
+            if generation.get("stop_token_sequences"):
+                raise ValueError("vLLM actor does not approximate token stop sequences with text stops")
+            eos = generation["eos_token_id"]
+            eos_ids = [] if eos is None else [eos] if isinstance(eos, int) else list(eos)
+            model_config = load_model_config(model_dir)
+            kv_bytes_per_token = 2 * model_config.num_hidden_layers * model_config.num_key_value_heads * model_config.head_dim * 2
+            if kv_bytes_per_token * max_model_len > VLLM_KV_CACHE_MEMORY_BYTES:
+                raise ValueError("fixed vLLM KV memory cannot preserve the mounted full context")
+            bootstrap = {"model_dir": str(model_dir), "dtype": config.dtype, "seed": config.seed,
+                         "max_model_len": max_model_len, "eos_token_ids": eos_ids, "ttl_seconds": 30000,
+                         "kv_bytes_per_token": kv_bytes_per_token,
+                         "kv_cache_memory_bytes": VLLM_KV_CACHE_MEMORY_BYTES}
+        else:
+            bootstrap = copy.deepcopy(bootstrap_override)
+            if (bootstrap.get("serving_profile") != "deepseek-lora-v1"
+                    or bootstrap.get("model_dir") != str(model_dir)):
+                raise ValueError("invalid explicit LoRA actor bootstrap")
+            actor_ttl = validated_actor_ttl(bootstrap["ttl_seconds"])
+            actor_lifetime_deadline(bootstrap)
         bootstrap_file = directory / "bootstrap.json"
         bootstrap_file.write_text(json.dumps(bootstrap, indent=2) + "\n")
         os.chmod(bootstrap_file, 0o600)
         index = int(config.rollout_devices[0].split(":")[1])
         visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         devices = visible.split(",") if visible else []
-        selected = devices[index] if devices else str(index)
+        if bootstrap_override is None:
+            selected = devices[index] if devices else str(index)
+        else:
+            indices = [int(device.split(":")[1]) for device in config.rollout_devices]
+            if len(indices) != bootstrap["tensor_parallel_size"] or len(set(indices)) != len(indices):
+                raise ValueError("LoRA devices differ from tensor parallel size")
+            selected = ",".join(devices[item] if devices else str(item) for item in indices)
         environment = dict(os.environ, CUDA_VISIBLE_DEVICES=selected,
             HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", VLLM_NO_USAGE_STATS="1", DO_NOT_TRACK="1",
             VLLM_ALLOW_INSECURE_SERIALIZATION="0")
+        if bootstrap_override is not None:
+            # Every spawned worker must import this exact task-owned source copy.
+            source_root = str(Path(__file__).resolve().parents[2])
+            environment["PYTHONPATH"] = source_root + (os.pathsep + environment["PYTHONPATH"]
+                if environment.get("PYTHONPATH") else "")
+            environment["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+            if ipc_directory is not None:
+                environment["VLLM_RPC_BASE_PATH"] = ipc_directory
+                environment["_DSV41_LORA_IPC_ACTIVE"] = "1"
+        else:
+            environment.pop("_DSV41_LORA_IPC_ACTIVE", None)
         self.log = (directory / "actor.log").open("xb")
         self.process = subprocess.Popen([sys.executable, "-u", "-m", "rollout_manager.backends.vllm_actor",
             "--bootstrap", str(bootstrap_file), "--socket", str(self.socket_path),
@@ -87,11 +118,13 @@ class OwnedVLLMActor:
             "start_ticks": int((root / "stat").read_text().rsplit(")", 1)[1].split()[19]),
             "cmdline_sha256": hashlib.sha256((root / "cmdline").read_bytes()).hexdigest()}
         from ..terminal_bench.controller import write_new
-        write_new(directory / "actor-launch.json", {"schema_version": 1, "serving_profile": VLLM_TRAINING_PROFILE,
+        write_new(directory / "actor-launch.json", {"schema_version": 1, "serving_profile": bootstrap.get("serving_profile", VLLM_TRAINING_PROFILE),
             "actor_process": self.identity, "python_executable": sys.executable,
-            "selected_cuda_device": selected, "started_unix": time.time(), "ttl_seconds": 30000,
+            "selected_cuda_device": selected, "started_unix": time.time(), "ttl_seconds": actor_ttl,
+            "ttl_scope": "startup_and_operation_bound" if bootstrap_override is not None and bootstrap["deadline_unix"] is None else "actor_lifetime",
+            "actor_lifetime_unlimited": bootstrap_override is not None and bootstrap["deadline_unix"] is None,
             "automatic_replay": False, "model_dir": str(model_dir)})
-        deadline = time.monotonic() + 900
+        deadline = time.monotonic() + min(1800 if bootstrap_override is not None else 900, actor_ttl)
         try:
             while time.monotonic() < deadline:
                 if self.process.poll() is not None:
@@ -106,13 +139,24 @@ class OwnedVLLMActor:
             self.stop_failed_start()
             raise
 
-    def call(self, operation, *, timeout=600, **values):
+    def call(self, operation, *, timeout=600, tensor_update=None, **values):
+        if operation == "load_lora":
+            if tensor_update is None:
+                raise ValueError("direct LoRA activation requires a manifest and raw tensor payload")
+            from .vllm_lora_transport import validate_update
+            validate_update(*tensor_update)
+        elif tensor_update is not None:
+            raise ValueError("raw tensors are admitted only for direct LoRA activation")
         check_process(self.identity)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(timeout)
             connection.connect(str(self.socket_path))
             send(connection, {"token": self.token, "operation": operation, **values})
-            reply = receive(connection)
+            if tensor_update is not None:
+                from .vllm_lora_transport import send_update
+                send_update(connection, *tensor_update)
+            reply = receive(connection, max_bytes=MAX_LORA_BATCH_RPC_BYTES
+                            if operation == "generate_batch" else MAX_RPC_BYTES)
         if operation != "close":
             check_process(self.identity)
         if reply.get("ok") is not True:

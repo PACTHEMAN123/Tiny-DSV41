@@ -164,7 +164,8 @@ class RLConfig:
             LoRAConfig(self.lora_rank, self.lora_alpha, self.lora_dropout,
                        self.lora_targets if self.lora_targets is not None else LoRAConfig().targets)
             if self.rollout_engine != "native-pytorch" or self.lora_dropout != 0:
-                raise ValueError("LoRA RL requires native-pytorch and lora_dropout=0")
+                raise ValueError("Local-manager LoRA RL requires native-pytorch and lora_dropout=0; "
+                                 "use dsv41_train.rl.distributed_grpo for DeepSeek LoRA with vLLM")
         elif self.initial_adapter is not None:
             raise ValueError("initial_adapter requires trainable_scope=lora")
         if self.initial_adapter is not None and (not isinstance(self.initial_adapter, str) or not self.initial_adapter):

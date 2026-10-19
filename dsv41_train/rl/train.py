@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--rollout-engine", choices=("vllm", "native-pytorch"),
                         help="vllm by default; native-pytorch explicitly selects legacy sampling")
     parser.add_argument("--trainable-scope", choices=("all", "lm_head", "lora"),
-                        help="LoRA requires the native-pytorch rollout engine")
+                        help="local-manager LoRA requires native-pytorch; DeepSeek/vLLM uses distributed_grpo")
     parser.add_argument("--initial-adapter", help="portable SFT adapter; requires trainable-scope=lora")
     parser.add_argument("--optimizer", choices=("adamw", "sgd"), help="native learner optimizer")
     parser.add_argument("--train-engram", action=argparse.BooleanOptionalAction, default=None,

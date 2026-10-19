@@ -106,49 +106,13 @@ The code in this repository is adapted to DSV4's per-token weights and
 `[..., source_stream, target_stream]` residual-matrix layout; it is not copied
 as a dependency from any of these projects.
 
-## Validation
+## Testing
 
-Validation was run on September 30, 2026 with an NVIDIA L20A, PyTorch 2.13,
-Triton 3.7.1, BF16 streams, FP32 mixing weights, 20 Sinkhorn iterations, and
-the production hidden size `H=5120`.
-
-| Path | Maximum absolute error | Relative L2 error |
-|---|---:|---:|
-| Sinkhorn output | `1.19e-7` | `1.13e-7` |
-| Sinkhorn/input gradient | `1.49e-7` | `9.75e-8` |
-| Sinkhorn/base gradient | `5.96e-7` | `1.20e-7` |
-| Collapse output | `0` | `0` |
-| Collapse stream gradient | `0` | `0` |
-| Collapse weight gradient | `3.05e-5` | `1.11e-7` |
-| Expand output | `3.91e-3` | `2.15e-6` |
-| Expand branch gradient | `7.81e-3` | `9.52e-6` |
-| Expand residual gradient | `7.81e-3` | `4.73e-6` |
-| Expand weight gradients | `6.10e-5` | `1.56e-7` |
-
-The nonzero expand differences are BF16 rounding differences after a different
-FP32 accumulation order. A six-layer GPU model comparison produced a loss
-difference of `5.08e-4` and a global parameter-gradient relative L2 error of
-`8.94e-3` across 144 gradient tensors.
-
-The same six-layer Triton model with activation checkpointing enabled matched
-the non-checkpointed loss exactly; its parameter-gradient relative L2 error was
-`3.03e-8`.
-
-The complete L20A unit suite runs 46 tests: 44 pass and two optional
-`safetensors` tests are skipped when that package is unavailable. Run the
-focused test with:
+Compare native outputs and gradients with the reference implementation:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python3 -m unittest -v tests.test_triton_mhc
 ```
 
-## Forward microbenchmark
-
-The following forward-only timings use 4,096 token rows and `H=5120`. They are
-kernel microbenchmarks, not end-to-end training throughput measurements.
-
-| Operation | Triton | PyTorch reference | Speedup |
-|---|---:|---:|---:|
-| Dynamic weights + Sinkhorn | `0.221 ms` | `1.171 ms` | `5.3x` |
-| Collapse | `0.076 ms` | `0.520 ms` | `6.8x` |
-| Expand | `0.117 ms` | `1.843 ms` | `15.7x` |
+Tests require CUDA and Triton. BF16 rounding can differ from the reference
+accumulation order; the regression assertions define the supported tolerances.

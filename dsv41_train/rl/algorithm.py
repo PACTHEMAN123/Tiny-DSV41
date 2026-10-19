@@ -87,6 +87,71 @@ def response_log_probs(
     return log_probs
 
 
+def response_log_probs_batch(
+    model: nn.Module,
+    prompt_ids_batch: Sequence[Sequence[int]],
+    response_ids_batch: Sequence[Sequence[int]],
+    temperature: float = 1.0,
+    *,
+    return_metadata: bool = False,
+) -> list[Tensor] | tuple[list[Tensor], dict[str, Any]]:
+    """Score ordered responses in one physical, right-padded model forward.
+
+    Each row contains prompt + response[:-1]. Explicit masks preserve token zero
+    and select only the aligned response targets, including terminal EOS. Rows
+    remain separate examples; there is no sequence packing or serial fallback.
+    Models with a sampling-prefix replay hook require their own explicit batch
+    implementation rather than silently changing that hook's scoring semantics.
+    """
+    validate_temperature(temperature)
+    size = len(prompt_ids_batch)
+    if not size or len(response_ids_batch) != size:
+        raise ValueError("prompt and response batches require the same nonzero size")
+    prompts = [validate_token_ids(ids, "prompt_ids") for ids in prompt_ids_batch]
+    responses = [validate_token_ids(ids, "response_ids") for ids in response_ids_batch]
+    if getattr(model, "response_log_probs", None) is not None:
+        raise ValueError("a sampling-prefix response hook cannot use the teacher-forced batch path")
+    lengths = [len(prompt) + len(response) - 1 for prompt, response in zip(prompts, responses)]
+    tokens = torch.zeros((size, max(lengths)), dtype=torch.long, device=input_device(model))
+    token_mask = torch.zeros_like(tokens, dtype=torch.bool)
+    targets = torch.full_like(tokens, -100)
+    for row, (prompt, response, length) in enumerate(zip(prompts, responses, lengths)):
+        tokens[row, :length] = torch.tensor(prompt + response[:-1], device=tokens.device)
+        token_mask[row, :length] = True
+        targets[row, len(prompt) - 1:length] = torch.tensor(response, device=tokens.device)
+    target_mask = targets != -100
+    if getattr(model, "supports_token_log_probs", False):
+        scores = model(tokens, attention_mask=token_mask, target_ids=targets,
+                       target_mask=target_mask, temperature=temperature)
+        if not isinstance(scores, Tensor) or scores.shape != tokens.shape:
+            raise ValueError("model must return one log probability per input token")
+        selected = scores[target_mask].float()
+    else:
+        output = model(tokens, attention_mask=token_mask)
+        logits = output if isinstance(output, Tensor) else output.logits
+        if logits.ndim != 3 or logits.shape[:2] != tokens.shape or not logits.shape[-1]:
+            raise ValueError("model logits must have shape [batch, sequence_length, vocabulary_size]")
+        selected_targets = targets[target_mask]
+        if selected_targets.max().item() >= logits.shape[-1]:
+            raise ValueError("response token ID is outside the model vocabulary")
+        selected = (logits[target_mask].float() / temperature).log_softmax(-1).gather(
+            -1, selected_targets[:, None]).squeeze(-1)
+    _finite(selected, "response log probabilities")
+    if bool((selected > 1e-6).any()):
+        raise ValueError("response log probabilities must be nonpositive")
+    values = list(selected.split([len(response) for response in responses]))
+    if not return_metadata:
+        return values
+    metadata = {"source": "one_padded_model_forward", "model_forward_calls": 1,
+        "batch_size": int(tokens.shape[0]), "input_shape": list(tokens.shape),
+        "input_lengths": lengths, "response_lengths": [len(response) for response in responses],
+        "valid_input_tokens": sum(lengths),
+        "padded_input_tokens": tokens.numel() - sum(lengths),
+        "allocated_input_tokens": tokens.numel(), "response_tokens": sum(map(len, responses)),
+        "padding_side": "right"}
+    return values, metadata
+
+
 def group_advantages(rewards: Sequence[float] | Tensor, eps: float = 1e-6) -> Tensor:
     """Normalize within one complete prompt group using population std.
 
@@ -178,4 +243,104 @@ def grpo_loss(
         "clip_fraction": torch.stack(clip_fractions).mean().item(),
         "importance_ratio": torch.stack(ratios).mean().item(),
         "approx_kl": torch.stack(approx_kls).mean().item(),
+    }
+
+
+def decoupled_token_tis_loss(
+    policy_log_probs: Sequence[Tensor],
+    native_old_log_probs: Sequence[Sequence[float] | Tensor],
+    behavior_log_probs: Sequence[Sequence[float] | Tensor],
+    advantages: Sequence[float] | Tensor,
+    clip_eps: float = 0.2,
+    is_cap: float = 2.0,
+) -> tuple[Tensor, dict[str, float]]:
+    """Optional three-policy Token-TIS surrogate, without a reference KL term.
+
+    ``old`` must be frozen native scores at the exact generating adapter version;
+    ``behavior`` remains the actual sampler distribution, at the same temperature.
+    Detached weights min(cap, old/behavior) multiply PPO(current/old), so numerical
+    backend mismatch does not itself consume PPO's update clipping interval.
+    Average tokens within each response, then average responses. There is no lower
+    clipping, weight normalization or rejection. Upper truncation introduces bias;
+    token weighting does not correct the distribution of preceding prefixes.
+    Weight ESS is an algebraic token-weight diagnostic, not independent sample size.
+    The existing ``grpo_loss`` and its strict admission route remain unchanged.
+    """
+    if not math.isfinite(clip_eps) or not 0 <= clip_eps < 1:
+        raise ValueError("clip_eps must be finite and in [0, 1)")
+    if not math.isfinite(is_cap) or is_cap <= 0:
+        raise ValueError("is_cap must be finite and positive")
+    size = len(policy_log_probs)
+    if size == 0 or len(native_old_log_probs) != size or len(behavior_log_probs) != size:
+        raise ValueError("current, native-old and behavior require the same nonzero response count")
+    advantage_values = torch.as_tensor(advantages, dtype=torch.float32).detach()
+    if advantage_values.ndim != 1 or len(advantage_values) != size:
+        raise ValueError("one scalar advantage is required per response")
+    _finite(advantage_values, "advantages")
+    terms, weights_all, raw_weights_all, ratios_all, deltas_all = [], [], [], [], []
+    for index, current in enumerate(policy_log_probs):
+        if not isinstance(current, Tensor) or current.ndim != 1 or current.numel() == 0:
+            raise ValueError("each policy log-probability tensor must be a nonempty vector")
+        current = current.float()
+        old = torch.as_tensor(native_old_log_probs[index], dtype=torch.float32, device=current.device).detach()
+        behavior = torch.as_tensor(behavior_log_probs[index], dtype=torch.float32, device=current.device).detach()
+        if old.shape != current.shape or behavior.shape != current.shape:
+            raise ValueError("native-old, behavior and policy response lengths must match")
+        for name, values in (("policy", current), ("native-old", old), ("behavior", behavior)):
+            _finite(values, name + " log probabilities")
+            if bool((values > 1e-6).any()):
+                raise ValueError(name + " log probabilities must be nonpositive")
+        delta = old - behavior
+        # Float64 diagnostics retain raw tail mass; training weights stay FP32.
+        raw = delta.double().exp()
+        _finite(raw, "raw rollout importance weights")
+        if bool((raw == 0).any()):
+            raise ValueError("raw rollout importance weights underflowed")
+        weights = raw.clamp(max=is_cap).float().detach()
+        _finite(weights, "training rollout importance weights")
+        if bool((weights == 0).any()):
+            raise ValueError("training rollout importance weights underflowed")
+        ratio = (current - old).exp()
+        _finite(ratio, "native PPO ratios")
+        if bool((ratio == 0).any()):
+            raise ValueError("native PPO ratios underflowed")
+        advantage = advantage_values[index].to(current.device)
+        surrogate = torch.minimum(ratio * advantage, ratio.clamp(1 - clip_eps, 1 + clip_eps) * advantage)
+        terms.append(-(weights * surrogate).mean())
+        weights_all.append(raw.clamp(max=is_cap))
+        raw_weights_all.append(raw)
+        ratios_all.append(ratio.detach().double())
+        deltas_all.append(delta.double())
+    loss = torch.stack(terms).mean()
+    _finite(loss, "Token-TIS loss")
+    weights, raw = torch.cat(weights_all), torch.cat(raw_weights_all)
+    ratios, deltas = torch.cat(ratios_all), torch.cat(deltas_all)
+    total, squared, raw_total = weights.sum(), weights.square().sum(), raw.sum()
+    _finite(raw_total, "summed raw rollout importance weights")
+    ess = total.square() / squared
+    _finite(ess, "token weight ESS")
+    return loss, {
+        "loss": loss.detach().item(),
+        "policy_loss": loss.detach().item(),
+        "response_count": float(size),
+        "token_count": float(weights.numel()),
+        "is_cap": float(is_cap),
+        "is_weight_sum": total.item(),
+        "is_weight_square_sum": squared.item(),
+        "is_weight_mean": weights.mean().item(),
+        "is_weight_min": weights.min().item(),
+        "is_weight_max": weights.max().item(),
+        "is_raw_weight_sum": raw_total.item(),
+        "is_raw_weight_min": raw.min().item(),
+        "is_raw_weight_max": raw.max().item(),
+        "is_clipped_tokens": float((raw > is_cap).sum().item()),
+        "is_clipped_fraction": (raw > is_cap).double().mean().item(),
+        "is_dropped_weight_mass": (raw_total - total).clamp(min=0).item(),
+        "is_dropped_weight_mass_fraction": ((raw_total - total).clamp(min=0) / raw_total).item(),
+        "is_token_weight_ess": ess.item(),
+        "is_token_weight_ess_fraction": ess.item() / weights.numel(),
+        "native_old_minus_behavior_mean": deltas.mean().item(),
+        "native_old_minus_behavior_max_abs": deltas.abs().max().item(),
+        "native_ppo_ratio_mean": ratios.mean().item(),
+        "native_ppo_clip_fraction": ((ratios - 1).abs() > clip_eps).double().mean().item(),
     }
