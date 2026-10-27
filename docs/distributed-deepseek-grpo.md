@@ -84,6 +84,9 @@ python3 -m torch.distributed.run \
   --disable-prefetch --kl-beta 0
 ```
 
+The example runs synchronously. Omit `--disable-prefetch` on both learner nodes
+to prefetch one subsequent group during training. The actor launch is unchanged.
+
 ## Adapter configuration
 
 Pass the same adapter flags to the rollout service and both learner launches:
@@ -148,17 +151,26 @@ r = exp(current - native_old)
 loss = -mean_responses(mean_tokens(w * min(r*A, clip(r,1-eps,1+eps)*A)))
 ```
 
-This mode requires `--disable-prefetch --kl-beta 0`. Upper truncation and the
-uncorrected prefix distribution introduce bias; it does not establish numerical
-parity or an unbiased full-trajectory estimator. With `--rollout-correction none`,
-the initial native/vLLM logprob comparison must satisfy the explicit bound and
-GRPO uses actual behavior probabilities directly. Matching model/adapter bytes
-alone does not establish cross-engine probability agreement.
+Token-TIS requires `--kl-beta 0`. With `--disable-prefetch`, every group uses
+the current acknowledged policy. Without it, the runner retains current and
+previous query-LoRA shard snapshots, each bound to its full policy acknowledgment.
+A prefetched group may be at most one learner update old. Its native-old scores
+use that generating snapshot; live adapter shards are restored before current
+scoring and backward. Mixed acknowledgments, missing stale snapshots, different
+lineages and invalid lag fail before optimization. The base and Engram remain
+frozen; this snapshot scheme does not support updating them.
 
-`--kl-beta 0` skips reference scoring. Strict mode permits positive KL, scoring
-the frozen native base with adapters bypassed rather than allocating another
-backbone. Default strict mode can prefetch one subsequent group; Token-TIS
-requires a matching immutable generating version and disables prefetch.
+After the first update, one subsequent group can be sampled during training.
+The runner joins that sampling request before pausing admission and publishing
+the new adapter. This is a bounded one-group pipeline, not an unbounded queue.
+
+Upper truncation and the uncorrected prefix distribution introduce bias;
+Token-TIS does not establish cross-engine numerical parity or an unbiased
+full-trajectory estimator. The strict `--rollout-correction none` path retains
+its initial native/vLLM logprob bound and uses actual behavior probabilities
+directly. Matching model/adapter bytes alone does not establish probability
+agreement. Strict mode also permits positive KL, scoring the frozen native base
+with adapters bypassed instead of loading another backbone.
 
 ## Outputs and limits
 
@@ -168,8 +180,21 @@ an ordered-question-ID hash; matching hashes verify the evaluation cohort.
 Group/update logs retain scalar reward, optimizer, batching and acknowledged-policy
 information. Per-question outputs, token dumps and detailed traces are omitted.
 
+The [two-GPU FSDP regression](../tests/distributed_grpo_async_fsdp.py) passed on
+L20C in FP32 and BF16 with zero maximum gradient/parameter difference against
+separate generating/current models. A 2026-10-27 full-model check used 16 L20C
+learner GPUs and 8 actor GPUs for four updates, including two lag-one updates.
+Across all learner ranks, old-score anchors, adapter gradients and AdamW
+parameter/moment updates matched the captured-score and independent replay
+checks with zero maximum absolute difference. Those checks share the native
+backbone/autograd backend; they do not establish throughput, kernel overlap or
+model-quality gains.
+
 This runner does not save a resumable distributed learner checkpoint or export
 a standalone trained model. Keep the base assets available. Interrupted/unknown
 remote work is not automatically replayed. Use [focused tests](testing.md) and
 validate end-to-end on the intended hardware after changing the runtime or
 serving stack; passing CPU tests does not establish memory capacity or task gains.
+
+See the [Token-TIS prefetch review](token-tis-prefetch-review.md) for the original
+restriction, generating-policy snapshots, validation results and remaining limits.

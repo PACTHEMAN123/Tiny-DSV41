@@ -231,7 +231,8 @@ class NativeProviderTests(unittest.TestCase):
             return GroupRegistration(group_id, plans, policy, token_digest([0, 1]), "c" * 64,
                                      RewardPolicy("kernelbench", "native-final-correctness-v1"))
         config = Namespace(queue_capacity=1, groups_per_step=1, group_size=2, temperature=.7,
-                           worker_timeout_seconds=10, clip_eps=.2, kl_beta=0., max_grad_norm=1.)
+                           worker_timeout_seconds=10, clip_eps=.2, kl_beta=0., max_grad_norm=1.,
+                           weight_decay=0., trainable_scope="all", train_engram=False)
         def provider(recovery_state=None, initial_policy=initial):
             return BenchmarkTrainingProvider(root, None, config, [], coordinator=coordinator,
                 controller=controller, plan_factory=plans, initial_policy=initial_policy, policy_factory=policy_factory,

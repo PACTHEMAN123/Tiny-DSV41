@@ -27,7 +27,7 @@ from .gsm8k import DATASET_REVISION, formatting_correct, prepare_data, wilson_in
 from .learner_batch_planner import parse_learner_batch_shapes, plan_learner_microbatches
 from .lora_config import DistributedLoRAConfig, SUPPORTED_LORA_RANKS, parse_lora_layers
 from .lora_export import export_q_a_update
-from .native_lora import (adapter_snapshot, default_native_source, gradient_norm,
+from .native_lora import (adapter_parameters_at, adapter_snapshot, default_native_source, gradient_norm,
                           load_distributed_learner, reference_base, verify_optimizer_step)
 from .tokenizer import ModelTokenizer
 
@@ -173,8 +173,8 @@ def validate_correction_configuration(args):
     if mode not in {"none", "decoupled-token-tis"}:
         raise ValueError("unknown rollout correction mode")
     if mode == "decoupled-token-tis":
-        if args.kl_beta != 0 or not getattr(args, "disable_prefetch", False):
-            raise ValueError("Token-TIS qualification requires kl_beta=0 and disabled prefetch")
+        if args.kl_beta != 0:
+            raise ValueError("Token-TIS qualification requires kl_beta=0")
         if not math.isfinite(args.rollout_is_cap) or args.rollout_is_cap <= 0:
             raise ValueError("rollout importance cap must be finite and positive")
     return mode
@@ -218,7 +218,8 @@ def aggregate_token_tis_metrics(rows):
         "native_ppo_ratio_mean": sum(row["native_ppo_ratio_mean"] * row["token_count"] for row in rows) / tokens,
         "native_ppo_clip_fraction": sum(row["native_ppo_clip_fraction"] * row["token_count"] for row in rows) / tokens}
 
-def train_group(model, optimizer, gradient_policy, results, advantages, args, update, *, expected_ack=None):
+def train_group(model, optimizer, gradient_policy, results, advantages, args, update, *,
+                expected_ack=None, native_old_snapshot=None):
     """Accumulate response token means / 32, then apply one adapter update."""
     correction = validate_correction_configuration(args)
     microbatch_size = getattr(args, "learner_microbatch_size", 1)
@@ -227,11 +228,32 @@ def train_group(model, optimizer, gradient_policy, results, advantages, args, up
     if (len(results) != 32 or len(advantages) != 32
             or not torch.isfinite(torch.as_tensor(advantages)).all()):
         raise ValueError("a logical learner update requires all 32 responses and finite advantages")
-    if correction == "decoupled-token-tis" and (
-            expected_ack is None or expected_ack.get("version") != update - 1
-            or any(result.get("generation_metrics", {}).get("policy_ack") != expected_ack
-                   for result in results)):
-        raise ValueError("Token-TIS native-old anchor requires 32 responses from the current acknowledged adapter")
+    generating_ack, policy_lag = expected_ack, None
+    if correction == "decoupled-token-tis":
+        generating_ack = (native_old_snapshot["ack"] if native_old_snapshot is not None else expected_ack)
+        if (expected_ack is None or expected_ack.get("version") != update - 1
+                or generating_ack is None
+                or type(generating_ack.get("version")) is not int
+                or any(result.get("generation_metrics", {}).get("policy_ack") != generating_ack
+                       for result in results)):
+            raise ValueError("Token-TIS native-old anchor must match every response's generating policy")
+        policy_lag = expected_ack["version"] - generating_ack["version"]
+        if (not 0 <= policy_lag <= (0 if getattr(args, "disable_prefetch", False) else 1)
+                or generating_ack.get("lineage") != expected_ack.get("lineage")
+                or (policy_lag == 0 and generating_ack != expected_ack)):
+            raise ValueError("Token-TIS generating policy has an invalid lineage or policy lag")
+    elif expected_ack is not None:
+        generating_ack = results[0].get("generation_metrics", {}).get("policy_ack")
+        if (expected_ack.get("version") != update - 1 or generating_ack is None
+                or type(generating_ack.get("version")) is not int
+                or generating_ack.get("lineage") != expected_ack.get("lineage")
+                or any(result.get("generation_metrics", {}).get("policy_ack") != generating_ack
+                       for result in results)):
+            raise ValueError("strict policy lag requires consistent learner and generating ACKs")
+        policy_lag = expected_ack["version"] - generating_ack["version"]
+        if (not 0 <= policy_lag <= (0 if getattr(args, "disable_prefetch", False) else 1)
+                or (policy_lag == 0 and generating_ack != expected_ack)):
+            raise ValueError("strict generating policy has an invalid policy lag or ACK")
     shapes = parse_learner_batch_shapes(getattr(args, "learner_batch_shapes", None))
     input_lengths = [len(result["context_token_ids"]) + len(result["action_token_ids"]) - 1
                      for result in results]
@@ -270,8 +292,12 @@ def train_group(model, optimizer, gradient_policy, results, advantages, args, up
 
         reference, native_old = None, None
         if correction == "decoupled-token-tis":
-            with torch.no_grad():
-                native_old = [value.detach().clone() for value in score("native_old")]
+            if policy_lag:
+                with adapter_parameters_at(model, optimizer, native_old_snapshot["parameters"]):
+                    native_old = [value.detach().clone() for value in score("native_old")]
+            else:
+                with torch.no_grad():
+                    native_old = [value.detach().clone() for value in score("native_old")]
         if args.kl_beta:
             with reference_base(model):
                 reference = score("reference")
@@ -302,7 +328,8 @@ def train_group(model, optimizer, gradient_policy, results, advantages, args, up
     pooled = (aggregate_token_tis_metrics(metrics) if correction == "decoupled-token-tis" else
               {key: sum(row[key] for row in metrics) / 32 for key in metrics[0]})
     return pooled | {"rollout_correction": correction,
-        "native_old_policy_ack": expected_ack if correction == "decoupled-token-tis" else None,
+        "native_old_policy_ack": generating_ack if correction == "decoupled-token-tis" else None,
+        "learner_policy_ack": expected_ack, "policy_lag": policy_lag,
         "learner_batching": {"physical_batch_sizes": physical_batch_sizes,
             "padding_fraction": padded_tokens / (valid_tokens + padded_tokens),
             "model_forward_calls": forward_counts, "backward_calls": len(physical_batch_sizes)},
@@ -393,6 +420,9 @@ def run(args):
             return ack
 
         learner_ack = activate(0)
+        policy_snapshots = {}
+        if correction == "decoupled-token-tis":
+            policy_snapshots[0] = {"ack": dict(learner_ack), "parameters": adapter_snapshot(optimizer)}
         validation = rank_zero_call(lambda: sample_record(client, train[0], count=1,
             phase="initial-validation", index=0, args=args, lineage=lineage))
         with torch.no_grad():
@@ -428,7 +458,8 @@ def run(args):
                 pending = executor.submit(sample_record, client, train[group_index + 1], count=32,
                     phase="train", index=group_index + 1, args=args, lineage=lineage)
             metrics = train_group(model, optimizer, gradients, results, advantages, args, update,
-                                  expected_ack=learner_ack)
+                expected_ack=learner_ack,
+                native_old_snapshot=policy_snapshots.get(group_row["behavior_version"]))
             summary["optimizer_updates"] = update
             def join_prefetch():
                 if pending is not None:
@@ -436,6 +467,10 @@ def run(args):
             rank_zero_call(join_prefetch)
             rank_zero_call(lambda: client.pause())
             learner_ack = activate(update)
+            if correction == "decoupled-token-tis":
+                policy_snapshots[update] = {"ack": dict(learner_ack), "parameters": adapter_snapshot(optimizer)}
+                policy_snapshots = {version: state for version, state in policy_snapshots.items()
+                                    if version >= update - 1}
             proof = rank_zero_call(lambda: sample_record(client, record, count=1,
                 phase="activation-check", index=update, args=args, lineage=lineage))
             if proof[0]["generation_metrics"]["policy_ack"] != learner_ack:
@@ -493,7 +528,7 @@ def main():
     parser.add_argument("--rollout-correction", choices=("none", "decoupled-token-tis"), default="none")
     parser.add_argument("--rollout-is-cap", type=float, default=2.)
     parser.add_argument("--disable-prefetch", action="store_true",
-                        help="required for Token-TIS to keep the native-old generating-policy anchor")
+                        help="sample each group after the preceding learner update and activation")
     parser.add_argument("--updates", type=int, default=3)
     parser.add_argument("--max-groups", type=int, default=64)
     parser.add_argument("--eval-questions", type=int, default=128)
