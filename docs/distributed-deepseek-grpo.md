@@ -195,3 +195,6 @@ a standalone trained model. Keep the base assets available. Interrupted/unknown
 remote work is not automatically replayed. Use [focused tests](testing.md) and
 validate end-to-end on the intended hardware after changing the runtime or
 serving stack; passing CPU tests does not establish memory capacity or task gains.
+
+See the [Token-TIS prefetch review](token-tis-prefetch-review.md) for the original
+restriction, generating-policy snapshots, validation results and remaining limits.
