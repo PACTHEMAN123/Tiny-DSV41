@@ -218,6 +218,42 @@ def adapter_snapshot(optimizer):
     return [local_tensor(p.detach()).clone() for p in optimizer_parameters(optimizer)]
 
 
+@contextmanager
+def adapter_parameters_at(model, optimizer, values):
+    """Score an immutable generating policy, then restore live adapter shards.
+
+    Call only between completed forward/backward pairs. Resharding invalidates
+    any FSDP all-gather cache before changing local shards; parameter objects,
+    accumulated gradients and optimizer state remain untouched.
+    """
+    try:
+        from torch.distributed.fsdp import FSDPModule
+    except ImportError:
+        from torch.distributed._composable.fsdp import FSDPModule
+    modules = [module for module in model.modules() if isinstance(module, FSDPModule)]
+    parameters = optimizer_parameters(optimizer)
+    if len(values) != len(parameters) or any(
+            value.shape != local_tensor(parameter).shape
+            or value.dtype != parameter.dtype or value.device != parameter.device
+            for value, parameter in zip(values, parameters)):
+        raise ValueError("generating-policy adapter shards differ from the learner layout")
+
+    def restore(shards):
+        for module in reversed(modules):
+            module.reshard()
+        with torch.no_grad():
+            for parameter, value in zip(parameters, shards):
+                local_tensor(parameter).copy_(value)
+
+    current = adapter_snapshot(optimizer)
+    try:
+        restore(values)
+        with torch.no_grad():
+            yield
+    finally:
+        restore(current)
+
+
 def gradient_norm(optimizer):
     total = torch.zeros((), device=optimizer_parameters(optimizer)[0].device, dtype=torch.float64)
     invalid = torch.zeros((), device=total.device, dtype=torch.int32)
