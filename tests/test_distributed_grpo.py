@@ -20,7 +20,7 @@ from dsv41_train.rl.native_lora import (adapter_snapshot, gradient_norm,
 class NativeRuntimeTests(unittest.TestCase):
     def test_default_bundle_is_pinned_and_imports_privately(self):
         native, provenance = import_native()
-        self.assertEqual(provenance["python_files"], 30)
+        self.assertEqual(provenance["python_files"], 31)
         self.assertEqual(provenance["manifest_sha256"], PINNED_NATIVE_MANIFEST_SHA256)
         self.assertEqual(provenance["source_kind"], "bundled_pinned_native_runtime")
         self.assertTrue(Path(native("models.dsv4.materialize").__file__).is_relative_to(default_native_source()))

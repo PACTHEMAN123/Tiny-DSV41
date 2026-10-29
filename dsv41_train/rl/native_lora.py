@@ -21,7 +21,7 @@ from torch.utils.checkpoint import checkpoint
 from .lora_config import DistributedLoRAConfig
 
 
-PINNED_NATIVE_MANIFEST_SHA256 = "bc9e596346214196d1210606f93224532567ac2c12a373d23982ecfb85004324"
+PINNED_NATIVE_MANIFEST_SHA256 = "c5da5571731fadaf3cd2719305a3bc81c75b046cc231ef6b2360108a3f9d3dcc"
 
 
 def default_native_source():

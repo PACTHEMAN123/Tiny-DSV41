@@ -22,8 +22,9 @@
     "dsv41_train/models/dsv4/engram/storage.py": "7ea2e4da1e00cde4aaa6be00e5c7f9d5272a4ecedf13a6f0cfbfcd2ab696f460",
     "dsv41_train/models/dsv4/engram/table.py": "c22113b2c8cff4d8d3ec8f140c76ff2af1f2a3583b7b7c279d3fe9a2279fbc2b",
     "dsv41_train/models/dsv4/materialize.py": "bd7d98080258c76c1ba3dd3e8f2895d55657080ccad348420e71aca125df692d",
-    "dsv41_train/models/dsv4/model.py": "81077c8ad0538788d6027a92eb5798756a9e073df7fe9633f749eb61e0286065",
+    "dsv41_train/models/dsv4/model.py": "5ab3b5edcea40cfddecce9b83a3b0b6461cfe7a490ab7ec5ca8d6c23d6a0df88",
     "dsv41_train/models/dsv4/moe.py": "22a022b06c5d2ec3b90e80dd5ded7dd5ff36cc48aa04ed1e0e17402efcf2a6f3",
+    "dsv41_train/models/dsv4/ordered_gather.py": "38cd9e5a25235eeaa15b1a5025d19109824d78fcd0ee8c29c6b4eeb042d27f47",
     "dsv41_train/models/dsv4/parallel.py": "651887f5eeb5f8378cb01509ab808157b8f9eb749560677b8d6dc640ae1ce886",
     "dsv41_train/models/dsv4/policies.py": "dda89fa7ce3e1de5d8909884a3183cd5144d580ec16efee50baefa609282e1ab",
     "dsv41_train/models/dsv4/quantization.py": "f5379f08a90f5c13e57b7304a7df51f3555f98da6e73e1394df34d1cba6759fe",
@@ -33,6 +34,9 @@
   },
   "head": "3868011979caaa3358bfd779ec78367df1d01205",
   "kind": "deepseek-grpo-native-compatibility-runtime",
+  "local_patches": [
+    "Compressed-KV gather returns zero for invalid slots and uses fixed-order FP32 gradient accumulation; first-order CUDA BF16/FP32 kernel derived from main attention/ordered_kv.py, with native PyTorch fallback."
+  ],
   "schema_version": 1,
   "scope": "Transitive Python import closure for full40 CP1/EP16/FSDP16 frozen-base query LoRA; no Qwen, SFT, optimizer, profiling, model assets or adapter checkpoints.",
   "upstream_manifest_sha256": "3a9cc6510df02b5b97ecfa68a9ae64e863c825a3ec935ff5e2a0c510bea355da"

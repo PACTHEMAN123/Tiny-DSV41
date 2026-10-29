@@ -1,6 +1,6 @@
 # Portions Copyright 2026 The HuggingFace Inc. team.
 # Licensed under the Apache License, Version 2.0. See https://www.apache.org/licenses/LICENSE-2.0
-"""A compact, training-only DeepSeek V4.1 model implemented with PyTorch alone.
+"""A compact, training-only DeepSeek V4.1 model with an optional Triton gather.
 
 This keeps the architecture used by the tiny trainer: mHC residual streams, CSA2
 compressed attention, sparse MoE layers, and optional Engram memory. Generation
@@ -27,6 +27,7 @@ from .engram.hash import NgramHash, build_compressed_token_map
 from .engram.table import RowShardedEmbedding
 from .engram.policy import EngramPolicy
 from .moe import RoutedExperts, SparseMoE, TopKRouter
+from .ordered_gather import gather_compressed_kv
 from .quantization import quantize_activation
 from ...activation import ActivationCheckpointConfig, recompute
 from ...dispatch import TokenDispatcher
@@ -386,8 +387,7 @@ class CompressedAttention(nn.Module):
             if compressed_kv is not None and topk_indices is not None and topk_indices.shape[-1]:
                 entries = compressed_kv[:, 0]
                 selected_valid = topk_indices >= 0
-                rows = torch.arange(batch, device=x.device).view(batch, 1, 1)
-                selected = entries[rows, topk_indices.clamp_min(0)]
+                selected = gather_compressed_kv(entries, topk_indices)
 
         output = recompute(
             self.checkpoint_enabled and self.training,

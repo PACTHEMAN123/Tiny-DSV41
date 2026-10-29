@@ -1,7 +1,11 @@
 # Distributed DeepSeek compatibility runtime
 
-`c3868011979ca` is the 30-file native import closure from commit
-`3868011979caaa3358bfd779ec78367df1d01205`. Its manifest pins every Python file;
+`c3868011979ca` is based on the 30-file native import closure from commit
+`3868011979caaa3358bfd779ec78367df1d01205`, plus a local compressed-KV gather
+correction. The added helper returns zero for masked slots and uses the main
+attention's stable edge ordering and FP32 reduction for first-order CUDA BF16/FP32
+gradients, with a native PyTorch fallback. It does not import the current model
+from outside this snapshot. The manifest records the local patch and pins all 31 Python files;
 the learner verifies that inventory before importing it as `_dsv41_grpo_native`.
 It contains source code, without model weights or checkpoints.
 
