@@ -14,8 +14,11 @@ class FSDPPolicy:
     cpu_offload_targets: tuple[str, ...] = ("dense", "experts")
     reshard_after_forward: bool = True
     pin_memory: bool = True
+    reduce_dtype: torch.dtype | None = None
 
     def __post_init__(self):
+        if self.reduce_dtype not in (None, torch.float32):
+            raise ValueError("optional gradient reduction dtype must be float32")
         if any(layer < 0 for layer in self.cpu_offload_layers):
             raise ValueError("offload layer IDs must be non-negative")
         if not self.cpu_offload_targets or set(self.cpu_offload_targets) - {"dense", "experts"}:

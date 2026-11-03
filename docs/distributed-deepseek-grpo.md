@@ -86,6 +86,8 @@ python3 -m torch.distributed.run \
 
 The example runs synchronously. Omit `--disable-prefetch` on both learner nodes
 to prefetch one subsequent group during training. The actor launch is unchanged.
+For three learner nodes, use `--nnodes=3`, node ranks 0..2 and
+`--learner-ep-size 24` on every learner. The eight-GPU actor stays separate.
 
 ## Adapter configuration
 
@@ -137,6 +139,22 @@ model input length, excluding the final next-token target. For example,
 validated for the deployed full model. Uncovered lengths fail before optimization;
 there is no automatic OOM retry or inferred memory capacity.
 
+`--learner-response-ownership sharded --learner-math-mode bf16-no-split-k`
+assigns the original eight B4 groups to unique owners. It requires microbatch 4,
+no shape cells, and equal LM-head collective counts across ranks. Shorter groups
+add one-token, zero-loss head calls; real head chunk sizes and response lengths
+are unchanged. Other ranks execute a zero-loss
+copy of group 0; their responses are excluded from objective statistics.
+Global G32 advantages, response weights and the single optimizer step are unchanged.
+
+This optional math mode uses cuBLASLt without BF16 reduced-precision or split-K
+reductions, a fixed FP32 routing-weight backward reduction, and FP32 FSDP
+accumulation with synchronization only on the final microbatch. Each response
+retains a 1/32 backward coefficient: replicated ranks use AVG and owners use SUM.
+Use the same mode in both comparison arms; it changes rounding relative to the
+default backend. It requires the PyTorch 2.11 controls used by this deployment.
+The default replicated path retains its previous math settings.
+
 Group advantages use population standard deviation. The loss is a mean of
 response token means, including terminal EOS. Constant-reward groups are skipped
 without incrementing optimizer steps. A committed update requires finite loss,
@@ -163,6 +181,8 @@ frozen; this snapshot scheme does not support updating them.
 After the first update, one subsequent group can be sampled during training.
 The runner joins that sampling request before pausing admission and publishing
 the new adapter. This is a bounded one-group pipeline, not an unbounded queue.
+After publication, a one-token inference checks the acknowledged policy version;
+training rollout lengths and held-out evaluation remain unchanged.
 
 Upper truncation and the uncorrected prefix distribution introduce bias;
 Token-TIS does not establish cross-engine numerical parity or an unbiased

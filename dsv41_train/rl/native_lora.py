@@ -7,6 +7,7 @@ manifest is verified before importing any of its code or constructing a model.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 import hashlib
 import importlib
 import importlib.util
@@ -21,7 +22,7 @@ from torch.utils.checkpoint import checkpoint
 from .lora_config import DistributedLoRAConfig
 
 
-PINNED_NATIVE_MANIFEST_SHA256 = "c5da5571731fadaf3cd2719305a3bc81c75b046cc231ef6b2360108a3f9d3dcc"
+PINNED_NATIVE_MANIFEST_SHA256 = "0afe122c19e88d8ce5e2fbcbb2cd7baf9e7ea0f0d4aa4d6ad32a4a87c3b01a96"
 
 
 def default_native_source():
@@ -74,6 +75,7 @@ def scoring_model_class(base_class):
     class ResponseScoringModel(base_class):
         supports_token_log_probs = True
         scoring_head_chunk_tokens = 2048
+        scoring_head_min_chunks = 1
 
         def _score_targets(self, hidden, targets, temperature):
             logits = self.lm_head(hidden).float() / temperature
@@ -106,20 +108,46 @@ def scoring_model_class(base_class):
                 raise ValueError("scoring head chunk size must be a positive integer")
             # Only the vocabulary head is chunked: every row already shared one
             # backbone forward. Bound FP32 logits instead of retaining [B*T,V].
-            chunks = []
-            for current, targets in zip(hidden[mask].split(chunk_tokens), selected.split(chunk_tokens)):
+            minimum = self.scoring_head_min_chunks
+            if type(minimum) is not int or minimum < 1:
+                raise ValueError("minimum scoring-head chunks must be a positive integer")
+            hidden_chunks, target_chunks = hidden[mask].split(chunk_tokens), selected.split(chunk_tokens)
+            chunks, padding = [], 0
+            for index in range(max(len(target_chunks), minimum)):
+                extra = index >= len(target_chunks)
+                current, targets = ((hidden_chunks[0][:1], target_chunks[0][:1]) if extra else
+                                    (hidden_chunks[index], target_chunks[index]))
                 if torch.is_grad_enabled():
                     scores = checkpoint(self._score_targets, current, targets, temperature,
                                         use_reentrant=False)
                 else:
                     scores = self._score_targets(current, targets, temperature)
-                chunks.append(scores)
+                if extra:
+                    # Match FSDP forward/backward calls without changing real
+                    # chunk shapes, response lengths, or their loss weights.
+                    padding = padding + scores.sum() * 0
+                else:
+                    chunks.append(scores)
             scores = torch.cat(chunks)
+            if minimum > len(target_chunks):
+                scores = scores + padding
             return scores.new_zeros(mask.shape).masked_scatter(mask, scores)
     return ResponseScoringModel
 
 
-def query_lora_materializer(materializer_class, meshes, native_lora, lora_config, num_layers):
+@contextmanager
+def minimum_scoring_head_chunks(model, count):
+    """Keep all scoring phases collective-aligned; recomputation uses its graph."""
+    previous = getattr(model, "scoring_head_min_chunks", 1)
+    model.scoring_head_min_chunks = count
+    try:
+        yield
+    finally:
+        model.scoring_head_min_chunks = previous
+
+
+def query_lora_materializer(materializer_class, meshes, native_lora, lora_config, num_layers,
+                            *, stable_gradients=False):
     """Install chosen adapters after loading each layer, before its FSDP wrap.
 
     The pinned checkpoint reader calls this boundary for every complete layer.
@@ -138,26 +166,33 @@ def query_lora_materializer(materializer_class, meshes, native_lora, lora_config
         def layer_loaded(self, layer):
             if layer.layer_id in selected:
                 native_lora.inject_lora(layer, config)
+            if stable_gradients:
+                layer.moe.routed.stable_weight_gradients = True
             super().layer_loaded(layer)
 
-    return QueryLoRAMaterializer(meshes)
+    materializer = QueryLoRAMaterializer(meshes)
+    if stable_gradients:
+        materializer.policy = replace(materializer.policy, reduce_dtype=torch.float32)
+    return materializer
 
 
 def load_distributed_learner(model_dir, source_root=None, *, seed=42, ep_size=16,
-                             lora_config=None):
+                             lora_config=None, stable_gradients=False):
     lora_config = DistributedLoRAConfig() if lora_config is None else lora_config
     if not isinstance(lora_config, DistributedLoRAConfig):
         raise ValueError("learner LoRA configuration must be DistributedLoRAConfig")
     lora_config.selected_layers(40)
     native, provenance = import_native(source_root)
     runtime = native("runtime").initialize_runtime("cuda", require_distributed=True)
-    if runtime.world_size != 16 or ep_size != 16:
-        raise ValueError("this reviewed deployment requires CP1/EP16/FSDP16 on exactly 16 ranks")
+    if ep_size not in (16, 24) or runtime.world_size != ep_size:
+        raise ValueError("native query LoRA requires CP1 and matching EP/FSDP worlds of 16 or 24 ranks")
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     config = native("models.dsv4.config").DeepSeekV41Config.from_json(Path(model_dir) / "config.json")
     if (config.num_hidden_layers, config.hidden_size, config.q_lora_rank) != (40, 5120, 1280):
         raise ValueError("the learner must load the full mounted DeepSeek V4.1 backbone")
+    if config.n_routed_experts % ep_size:
+        raise ValueError("routed experts must divide evenly across learner EP ranks")
     if config.attention_dropout:
         raise ValueError("GRPO requires attention dropout zero")
     selected_layers = lora_config.selected_layers(config.num_hidden_layers)
@@ -173,12 +208,13 @@ def load_distributed_learner(model_dir, source_root=None, *, seed=42, ep_size=16
             cache_quantization="hf",
             load_policy=native("loading").LoadPolicy("layerwise", staging_bytes=128 * 1024**2),
             materializer=query_lora_materializer(materializer_class, meshes, native("lora"),
-                lora_config, config.num_hidden_layers))
+                lora_config, config.num_hidden_layers, stable_gradients=stable_gradients))
     finally:
         loader.DeepSeekV41ForCausalLM = original_class
     model.gradient_checkpointing_enable()
     model.train()
     model.distributed_lora_config = lora_config
+    model.stable_gradients = stable_gradients
     adapters = list(native("lora").adapter_parameters(model))
     expected_count = lora_config.parameter_count(config.hidden_size, config.q_lora_rank,
                                                 config.num_hidden_layers)

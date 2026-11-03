@@ -1,12 +1,13 @@
 """Batched native query-LoRA GRPO with a persistent remote vLLM rollout service.
 
-All EP16/FSDP16 learner ranks score the same response microbatch. One logical
-G32 group contributes equal response weights and produces one optimizer step.
+Learners may replicate scoring or own distinct responses with matched collective
+rounds. One G32 group contributes equal response weights and one optimizer step.
 """
 from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import ExitStack
 from datetime import timedelta
 import hashlib
 import json
@@ -24,11 +25,13 @@ from rollout_manager.backends.vllm_lora_transport import policy_ack
 from .algorithm import (decoupled_token_tis_loss, group_advantages, grpo_loss,
                         response_log_probs, response_log_probs_batch)
 from .gsm8k import DATASET_REVISION, formatting_correct, prepare_data, wilson_interval
-from .learner_batch_planner import parse_learner_batch_shapes, plan_learner_microbatches
+from .learner_batch_planner import (parse_learner_batch_shapes, plan_learner_microbatches,
+                                  plan_response_ownership)
+from .learner_math import configure_learner_math, require_bf16_no_split_k
 from .lora_config import DistributedLoRAConfig, SUPPORTED_LORA_RANKS, parse_lora_layers
 from .lora_export import export_q_a_update
 from .native_lora import (adapter_parameters_at, adapter_snapshot, default_native_source, gradient_norm,
-                          load_distributed_learner, reference_base, verify_optimizer_step)
+                          load_distributed_learner, minimum_scoring_head_chunks, reference_base, verify_optimizer_step)
 from .tokenizer import ModelTokenizer
 
 
@@ -101,10 +104,10 @@ def validate_results(results, record, expected_ack, expected_count):
             raise ValueError("rollout tokens, sampled probabilities, or immutable policy identity differ")
     return results
 
-def sample_record(client, record, *, count, phase, index, args, lineage, temperature=None):
+def sample_record(client, record, *, count, phase, index, args, lineage, temperature=None, max_tokens=None):
     expected = dict(client.ack)
     specs = request_specs(record, count=count, phase=phase, index=index, seed=args.seed,
-        max_tokens=args.max_new_tokens,
+        max_tokens=args.max_new_tokens if max_tokens is None else max_tokens,
         temperature=args.temperature if temperature is None else temperature, lineage=lineage)
     results = validate_results(client.sample_group(specs), record, expected, count)
     for spec, result in zip(specs, results):
@@ -218,6 +221,19 @@ def aggregate_token_tis_metrics(rows):
         "native_ppo_ratio_mean": sum(row["native_ppo_ratio_mean"] * row["token_count"] for row in rows) / tokens,
         "native_ppo_clip_fraction": sum(row["native_ppo_clip_fraction"] * row["token_count"] for row in rows) / tokens}
 
+
+def merge_response_metrics(parts, count=32):
+    """Gather unique response statistics, never placeholder or replica counts."""
+    rows = [None] * count
+    for part in parts:
+        for index, row in part:
+            if type(index) is not int or not 0 <= index < count or rows[index] is not None or row is None:
+                raise ValueError("response metrics require unique in-range owners")
+            rows[index] = row
+    if any(row is None for row in rows):
+        raise ValueError("response metrics require every logical response exactly once")
+    return rows
+
 def train_group(model, optimizer, gradient_policy, results, advantages, args, update, *,
                 expected_ack=None, native_old_snapshot=None):
     """Accumulate response token means / 32, then apply one adapter update."""
@@ -257,14 +273,45 @@ def train_group(model, optimizer, gradient_policy, results, advantages, args, up
     shapes = parse_learner_batch_shapes(getattr(args, "learner_batch_shapes", None))
     input_lengths = [len(result["context_token_ids"]) + len(result["action_token_ids"]) - 1
                      for result in results]
-    plan = plan_learner_microbatches(input_lengths, microbatch_size, shapes)
+    ownership = getattr(args, "learner_response_ownership", "replicated")
+    if ownership not in {"replicated", "sharded"}:
+        raise ValueError("learner response ownership must be replicated or sharded")
+    world_size, head_chunks = 1, 1
+    stable_gradients = getattr(args, "learner_math_mode", "default") == "bf16-no-split-k"
+    if ownership == "sharded":
+        if not dist.is_initialized():
+            raise ValueError("sharded response ownership requires initialized distributed ranks")
+        if microbatch_size != 4 or shapes is not None:
+            raise ValueError("sharded response ownership requires physical B4 and no shape cells")
+        # Preserve each B4's natural chunks; add zero-loss head calls on shorter
+        # groups so every rank enters the same FSDP collectives.
+        head_limit = getattr(model, "scoring_head_chunk_tokens", 0)
+        if type(head_limit) is not int or head_limit < 1:
+            raise ValueError("scoring head chunk size must be a positive integer")
+        head_chunks = max(math.ceil(sum(len(result["action_token_ids"])
+            for result in results[start:start + 4]) / head_limit) for start in range(0, 32, 4))
+        if not stable_gradients:
+            raise ValueError("sharded response ownership requires explicit bf16-no-split-k learner math")
+        world_size = dist.get_world_size()
+        plan = plan_response_ownership(input_lengths, dist.get_rank(), world_size)
+    else:
+        plan = plan_learner_microbatches(input_lengths, microbatch_size, shapes)
+    if stable_gradients:
+        require_bf16_no_split_k()
+        if not getattr(model, "stable_gradients", False):
+            raise ValueError("stable learner math requires fixed routing gradients and FP32 FSDP accumulation")
+        from torch.distributed.fsdp import FSDPModule
+        for module in model.modules():
+            if isinstance(module, FSDPModule):
+                module.set_gradient_divide_factor(1.0 if ownership == "sharded" else float(dist.get_world_size()))
+                module.set_force_sum_reduction_for_comms(ownership == "sharded")
     before = adapter_snapshot(optimizer)
     optimizer.zero_grad(set_to_none=True)
     gradient_policy.begin_step()
     metrics, physical_batch_sizes = [None] * 32, []
     valid_tokens = padded_tokens = 0
     forward_counts = {"native_old": 0, "current": 0, "reference": 0}
-    for planned in plan:
+    for ordinal, planned in enumerate(plan):
         indices = planned["response_indices"]
         batch = [results[index] for index in indices]
         prompts = [result["context_token_ids"] for result in batch]
@@ -272,14 +319,15 @@ def train_group(model, optimizer, gradient_policy, results, advantages, args, up
         lengths = [len(prompt) + len(response) - 1 for prompt, response in zip(prompts, responses)]
 
         def score(phase):
-            if len(batch) == 1:
-                values = [response_log_probs(model, prompts[0], responses[0], args.temperature)]
-                layout = {"input_shape": [1, lengths[0]], "valid_input_tokens": lengths[0],
-                    "padded_input_tokens": 0, "response_tokens": len(responses[0]),
-                    "model_forward_calls": 1, "padding_side": "right"}
-            else:
-                values, layout = response_log_probs_batch(model, prompts, responses, args.temperature,
-                                                          return_metadata=True)
+            with minimum_scoring_head_chunks(model, head_chunks):
+                if len(batch) == 1:
+                    values = [response_log_probs(model, prompts[0], responses[0], args.temperature)]
+                    layout = {"input_shape": [1, lengths[0]], "valid_input_tokens": lengths[0],
+                        "padded_input_tokens": 0, "response_tokens": len(responses[0]),
+                        "model_forward_calls": 1, "padding_side": "right"}
+                else:
+                    values, layout = response_log_probs_batch(model, prompts, responses, args.temperature,
+                                                              return_metadata=True)
             if (len(values) != len(batch) or layout.get("input_shape") != [len(batch), max(lengths)]
                     or layout.get("valid_input_tokens") != sum(lengths)
                     or layout.get("padded_input_tokens") != len(batch) * max(lengths) - sum(lengths)
@@ -305,6 +353,9 @@ def train_group(model, optimizer, gradient_policy, results, advantages, args, up
         losses = []
         for offset, index in enumerate(indices):
             behavior, advantage = batch[offset]["behavior_log_probs"], advantages[index]
+            placeholder = planned.get("is_placeholder", False)
+            if placeholder:
+                advantage = 0.
             if correction == "decoupled-token-tis":
                 loss, row = decoupled_token_tis_loss([current[offset]], [native_old[offset]],
                     [behavior], [advantage], clip_eps=args.clip_eps, is_cap=args.rollout_is_cap)
@@ -312,13 +363,26 @@ def train_group(model, optimizer, gradient_policy, results, advantages, args, up
                 loss, row = grpo_loss([current[offset]], [behavior], [advantage],
                     clip_eps=args.clip_eps, kl_beta=args.kl_beta,
                     ref_log_probs=[reference[offset]] if reference is not None else None)
-            losses.append(loss)
-            metrics[index] = row
+            losses.append(loss * 0 if placeholder else loss)
+            if not placeholder:
+                metrics[index] = row
         # Length sorting and ragged batches must not alter response weights.
-        (torch.stack(losses).sum() / 32).backward()
+        # Keep the backward coefficient identical. Unique owners use FSDP SUM;
+        # replicas use AVG. Accumulate in FP32 before the final reduction.
+        if stable_gradients:
+            model.set_requires_gradient_sync(ordinal == len(plan) - 1)
+        try:
+            (torch.stack(losses).sum() / 32).backward()
+        finally:
+            if stable_gradients:
+                model.set_requires_gradient_sync(True)
         physical_batch_sizes.append(len(batch))
         valid_tokens += sum(lengths)
         padded_tokens += len(batch) * max(lengths) - sum(lengths)
+    if ownership == "sharded":
+        parts = [None] * world_size
+        dist.all_gather_object(parts, [(index, row) for index, row in enumerate(metrics) if row is not None])
+        metrics = merge_response_metrics(parts)
     gradient_policy.normalize()
     norm = gradient_norm(optimizer)
     if not math.isfinite(norm) or norm <= 0:
@@ -331,6 +395,11 @@ def train_group(model, optimizer, gradient_policy, results, advantages, args, up
         "native_old_policy_ack": generating_ack if correction == "decoupled-token-tis" else None,
         "learner_policy_ack": expected_ack, "policy_lag": policy_lag,
         "learner_batching": {"physical_batch_sizes": physical_batch_sizes,
+            "response_ownership": ownership, "loss_scale": 1 / 32,
+            "owned_response_indices": [index for item in plan if not item.get("is_placeholder", False)
+                                       for index in item["response_indices"]],
+            "placeholder_responses": sum(len(item["response_indices"]) for item in plan
+                                         if item.get("is_placeholder", False)),
             "padding_fraction": padded_tokens / (valid_tokens + padded_tokens),
             "model_forward_calls": forward_counts, "backward_calls": len(physical_batch_sizes)},
         "gradient_norm": norm, "changed_adapter_elements": changed}
@@ -339,6 +408,15 @@ def train_group(model, optimizer, gradient_policy, results, advantages, args, up
 def run(args):
     """Train query adapters, synchronize every update, and compare held-out scores."""
     parse_learner_batch_shapes(args.learner_batch_shapes)
+    ownership = getattr(args, "learner_response_ownership", "replicated")
+    math_mode = getattr(args, "learner_math_mode", "default")
+    if math_mode not in {"default", "bf16-no-split-k"} or (ownership == "sharded" and math_mode != "bf16-no-split-k"):
+        raise ValueError("sharded response ownership requires explicit bf16-no-split-k learner math")
+    if (ownership not in {"replicated", "sharded"}
+            or (ownership == "sharded" and (args.learner_microbatch_size != 4
+                                            or args.learner_batch_shapes is not None))
+            or getattr(args, "learner_ep_size", 16) not in (16, 24)):
+        raise ValueError("sharded ownership requires B4/no shape cells; learner EP must be 16 or 24")
     layers = getattr(args, "lora_layers", None)
     if isinstance(layers, str):
         layers = parse_lora_layers(layers)
@@ -369,7 +447,9 @@ def run(args):
                "adapter_configuration": lora_config.to_dict()}
     client = model = executor = None
     output_created = False
+    math_context = ExitStack()
     try:
+        summary["learner_math"] = math_context.enter_context(configure_learner_math(math_mode))
         tokenizer = ModelTokenizer(args.model_dir)
         train, test, reward, data = prepare_data(args.train_jsonl, args.test_jsonl, tokenizer,
             revision=args.dataset_revision, seed=args.seed, max_prompt_tokens=args.max_prompt_tokens,
@@ -397,7 +477,8 @@ def run(args):
         if DistributedLoRAConfig.from_dict(startup["lora_config"]) != lora_config:
             raise ValueError("rollout and learner LoRA configurations differ")
         model, optimizer, gradients, runtime, native = load_distributed_learner(
-            args.model_dir, args.native_source, seed=args.seed, lora_config=lora_config)
+            args.model_dir, args.native_source, seed=args.seed, lora_config=lora_config,
+            ep_size=getattr(args, "learner_ep_size", 16), stable_gradients=math_mode == "bf16-no-split-k")
         sources = [None] * dist.get_world_size()
         dist.all_gather_object(sources, native)
         if any(item != sources[0] for item in sources):
@@ -472,7 +553,7 @@ def run(args):
                 policy_snapshots = {version: state for version, state in policy_snapshots.items()
                                     if version >= update - 1}
             proof = rank_zero_call(lambda: sample_record(client, record, count=1,
-                phase="activation-check", index=update, args=args, lineage=lineage))
+                phase="activation-check", index=update, args=args, lineage=lineage, max_tokens=1))
             if proof[0]["generation_metrics"]["policy_ack"] != learner_ack:
                 raise ValueError("subsequent rollout did not use the acknowledged adapter")
             summary["acknowledged_updates"] = update
@@ -499,6 +580,7 @@ def run(args):
             operations.append(model.close)
         if dist.is_initialized():
             operations.append(dist.destroy_process_group)
+        operations.append(math_context.close)
         for close in operations:
             try:
                 close()
@@ -534,6 +616,12 @@ def main():
     parser.add_argument("--eval-questions", type=int, default=128)
     parser.add_argument("--group-size", type=int, choices=(32,), default=32)
     parser.add_argument("--learner-microbatch-size", type=int, choices=range(1, 33), default=4)
+    parser.add_argument("--learner-response-ownership", choices=("replicated", "sharded"), default="replicated",
+                        help="sharded: assign original B4 groups to unique ranks; requires microbatch4")
+    parser.add_argument("--learner-ep-size", type=int, choices=(16, 24), default=16,
+                        help="CP1 learner world/EP/FSDP size, separate from the eight-GPU actor")
+    parser.add_argument("--learner-math-mode", choices=("default", "bf16-no-split-k"), default="default",
+                        help="cuBLASLt without BF16 split-K, fixed routing gradients and FP32 FSDP accumulation")
     parser.add_argument("--learner-batch-shapes", default=None,
                         help="explicit capacity-qualified B:T cells, e.g. 4:2047,8:1023; no OOM fallback")
     parser.add_argument("--lora-rank", type=int, choices=SUPPORTED_LORA_RANKS, default=8)

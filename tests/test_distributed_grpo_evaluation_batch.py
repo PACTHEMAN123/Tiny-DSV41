@@ -18,9 +18,10 @@ class Client:
 
     def sample_group(self, specs):
         self.calls.append(copy.deepcopy(specs))
-        results = [{"context_token_ids": spec["prompt_ids"], "action_token_ids": [7, 2],
-            "behavior_log_probs": [-.3, -.2], "logprob_convention": "sampled_distribution",
-            "finish_reason": "eos", "stop_token_count": 1,
+        results = [{"context_token_ids": spec["prompt_ids"], "action_token_ids": [7, 2][:spec["max_tokens"]],
+            "behavior_log_probs": [-.3, -.2][:spec["max_tokens"]], "logprob_convention": "sampled_distribution",
+            "finish_reason": "length" if spec["max_tokens"] == 1 else "eos",
+            "stop_token_count": 0 if spec["max_tokens"] == 1 else 1,
             "generation_metrics": {"policy_ack": dict(self.ack),
                 "sampling_seed": spec["sampling_seed"], "request_id": spec["request_id"]}}
             for spec in specs]
@@ -96,6 +97,35 @@ class EvaluationBatchTests(unittest.TestCase):
             with self.subTest(corrupt=corrupt), self.assertRaisesRegex(ValueError, "sampling identity"):
                 sample_record(Client(corrupt), record, count=32, phase="train", index=0,
                               args=args, lineage="test")
+
+    def test_short_activation_proof_preserves_training_requests_and_seed_schedule(self):
+        record = types.SimpleNamespace(prompt_ids=[0, 1])
+        args = types.SimpleNamespace(seed=42, max_new_tokens=1792, temperature=.8)
+        clients = [Client(), Client()]
+        for client, budget in zip(clients, (None, 1)):
+            sample_record(client, record, count=32, phase="train", index=1, args=args, lineage="test")
+            proof = sample_record(client, record, count=1, phase="activation-check", index=1,
+                                  args=args, lineage="test", max_tokens=budget)
+            self.assertEqual(proof[0]["generation_metrics"]["policy_ack"], ACK)
+            sample_record(client, record, count=32, phase="train", index=2, args=args, lineage="test")
+        full, short = [client.calls for client in clients]
+        self.assertEqual(full[0], short[0])
+        self.assertEqual(full[2], short[2])
+        self.assertEqual(short[1], [dict(full[1][0], max_tokens=1)])
+        self.assertEqual(full[1][0]["max_tokens"], 1792)
+        self.assertEqual(short[1][0]["sampling_seed"], 42 + 32)
+        self.assertNotEqual(short[1][0]["request_id"], short[0][0]["request_id"])
+        self.assertEqual(len(proof[0]["action_token_ids"]), 1)
+        self.assertEqual(args.max_new_tokens, 1792)
+
+    def test_one_token_proof_still_rejects_wrong_ack_or_nonfinite_probability(self):
+        record = types.SimpleNamespace(prompt_ids=[0, 1])
+        args = types.SimpleNamespace(seed=42, max_new_tokens=1792, temperature=.8)
+        for corrupt in (lambda client, rows: rows[0]["generation_metrics"]["policy_ack"].update(version=1),
+                        lambda client, rows: rows[0].update(behavior_log_probs=[float("nan")])):
+            with self.subTest(corrupt=corrupt), self.assertRaisesRegex(ValueError, "identity"):
+                sample_record(Client(corrupt), record, count=1, phase="activation-check", index=1,
+                              args=args, lineage="test", max_tokens=1)
 
 
 if __name__ == "__main__":

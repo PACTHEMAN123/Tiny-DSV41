@@ -10,6 +10,7 @@ from torch import nn
 from ...dispatch import TokenDispatcher
 from ...activation import recompute
 from .config import DeepSeekV41Config
+from .routing_weight import multiply_routing_weight
 
 
 def _activation(name: str, x: torch.Tensor) -> torch.Tensor:
@@ -69,6 +70,7 @@ class RoutedExperts(nn.Module):
         )
         self.gradient_group = None
         self.checkpoint_enabled = False
+        self.stable_weight_gradients = False
 
     @property
     def local_parameter_count(self) -> int:
@@ -109,7 +111,8 @@ class RoutedExperts(nn.Module):
             gate = F.linear(current, weight[: self.intermediate])
             up = F.linear(current, weight[self.intermediate :])
             current = _clamped_swiglu(gate, up, self.limit)
-            current = current * weights[token_ids, None]
+            current = (multiply_routing_weight(current, weights[token_ids])
+                       if self.stable_weight_gradients else current * weights[token_ids, None])
             current = F.linear(current.to(x.dtype), self.down[expert_id])
             output.index_add_(0, token_ids, current.float())
         return output
