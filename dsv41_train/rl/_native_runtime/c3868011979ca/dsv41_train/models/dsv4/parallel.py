@@ -74,6 +74,9 @@ def apply_fsdp2_layer(
 
 def _options(policy, layer_id, role):
     options = {"reshard_after_forward": policy.reshard_after_forward}
+    if policy.reduce_dtype is not None:
+        from torch.distributed.fsdp import MixedPrecisionPolicy
+        options["mp_policy"] = MixedPrecisionPolicy(reduce_dtype=policy.reduce_dtype)
     if policy.offloads(layer_id, role):
         from torch.distributed.fsdp import CPUOffloadPolicy
         options["offload_policy"] = CPUOffloadPolicy(pin_memory=policy.pin_memory)

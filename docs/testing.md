@@ -155,3 +155,51 @@ All 100 scalar training losses matched step by step across the four runs; this
 adds no gradient/update equality or answer-quality claim. There are two fresh
 runs per placement, not 160 independent experiments. These results replace
 probe-instrumented timings as the performance comparison for this frozen recipe.
+
+## Cross-node GRPO response ownership
+
+The 2026-11-04 qualification used four eight-GPU NVIDIA L20C nodes: 24 native
+learner ranks and a separate eight-GPU vLLM actor. The full 40-layer
+DeepSeek-V4.1-Flash-1017 ran query-LoRA r8/alpha8, CP1/EP24/FSDP24, global G32,
+original B4 groups, context 2048, generation budget 1792, temperature 0.8,
+learning rate `1e-4`, KL 0, Token-TIS cap 2 and one-group asynchronous prefetch.
+The base model and resident Engram remained frozen.
+
+Both arms used the same optional `bf16-no-split-k` math mode and the existing
+compressed-KV gather optimization. The candidate assigned each original B4 to
+one owner, with zero-loss collective placeholders on other ranks, and shortened
+the activation proof to one token. Training/evaluation generation budgets did
+not change. Frozen production source manifest: `95747a5aa418bb35f812b23ff6e8b19ed2c48b68cd186e2ec536da18b7193a9e`.
+
+Full-model lag0/lag1 checks passed on all 24 ranks. Cross-arm relative L2
+gradient/update differences were **0.02305%/0.03961%** at lag0 and
+**0.04327%/0.47050%** at lag1, within the predeclared 1% L2, cosine and norm-ratio
+limits. Each arm exactly matched its independent AdamW calculation. Focused CPU
+regressions and actual two-GPU FSDP gradient/head-chunk checks also passed.
+This preserves the objective, not bitwise equivalence to the old default math.
+
+Fixed-input training replay used the same lag1 G32 with 34,487 response tokens:
+one warmup per arm, then ABBA, without diagnostic hooks inside the timed calls.
+Maximum-rank mean time fell **180.8342 -> 24.4236 s (7.4041x)**. There were only
+two measured calls per arm; resets, actor sampling and publication were excluded.
+
+Two fresh end-to-end runs each completed eight effective updates. After two
+warmup updates, the commit2-to-commit8 results were:
+
+| Metric | Replicated | Owned B4 |
+| --- | ---: | ---: |
+| Unique response tokens | 161,453 | 145,993 |
+| Mean commit cycle (s) | 167.1328 | 23.7787 |
+| Effective response tokens/s | 161.0027 | 1,023.2758 |
+| Mean activation proof (s) | 7.6146 | 0.1547 |
+| Maximum single learner GPU sampled NVML (GiB) | 143.7864 | 140.1360 |
+
+The observed throughput ratio was **6.3556x**. Generated workloads differed:
+the baseline consumed nine groups with three constant-reward skips in the window;
+the candidate consumed six with no skips. Both windows began with one prefetched
+group and ended empty, so this is neither an identical-input causal speedup nor
+a balanced steady-state measurement. Use the fixed replay for the training claim.
+Stage timing and 1 Hz NVML samples remained enabled; gradient/operator probes
+were disabled. NVML can miss short peaks and is not a Torch allocator peak.
+All ranks passed update/ACK audits, and all four nodes exited without remaining
+GPU processes. This does not qualify full-parameter RL, CP or longer contexts.

@@ -65,3 +65,21 @@ def plan_learner_microbatches(input_lengths, fixed_size, shapes=None):
                         "qualified_shape_cell": dict(cell)})
         cursor += count
     return planned
+
+
+def plan_response_ownership(input_lengths, rank, world_size):
+    """Distribute original B4 groups; inactive owners execute a zero-loss copy.
+
+    Preserve each group's padding and token reduction shape. All ranks execute
+    the same number of collectives; placeholders contribute no loss or metrics.
+    """
+    batches = plan_learner_microbatches(input_lengths, 4)
+    if len(input_lengths) != 32:
+        raise ValueError("response ownership requires the complete G32 group")
+    if (type(world_size) is not int or not 1 <= world_size <= 32
+            or type(rank) is not int or not 0 <= rank < world_size):
+        raise ValueError("response ownership requires rank within world size 1..32")
+    return [dict(batches[index if index < len(batches) else 0],
+                 is_placeholder=index >= len(batches))
+            for index in range(rank, ((len(batches) + world_size - 1) // world_size) * world_size,
+                               world_size)]
